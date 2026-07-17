@@ -1,0 +1,6 @@
+node_modules/
+data/runs/
+data/.scratch/
+.env
+.env.example
+*.tsbuildinfo

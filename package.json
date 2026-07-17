@@ -1,0 +1,18 @@
+{
+  "name": "campaign-codegen-pr-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone service: generates a campaign landing page inside an EXTERNAL frontend repo via an agentic coding loop, verifies the build, and opens a PR. Independent of the parent project's own rendering system.",
+  "scripts": {
+    "start": "node --env-file=.env src/server.mjs",
+    "dev": "node --env-file=.env --watch src/server.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@langchain/core": "^1.0.4",
+    "@langchain/langgraph": "^1.4.7",
+    "express": "^5.2.1",
+    "zod": "^4.3.2"
+  }
+}

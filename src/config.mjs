@@ -1,0 +1,143 @@
+import { z } from "zod";
+
+/* Loads and validates every env var this service needs, once, at import
+ * time — fail loudly on startup rather than lazily mid-run (mirrors the
+ * parent project's dbClient() "throw early on missing DATABASE_URL" habit).
+ * Every other module reads config from here, never from process.env directly. */
+
+const boolFromEnv = z
+  .string()
+  .optional()
+  .transform((v) => v === "true" || v === "1");
+
+const intFromEnv = (def) =>
+  z
+    .string()
+    .optional()
+    .transform((v) => (v ? parseInt(v, 10) : def));
+
+const envSchema = z
+  .object({
+    PORT: intFromEnv(4300),
+    API_SHARED_SECRET: z.string().min(16, "API_SHARED_SECRET must be set to a real secret (>=16 chars)"),
+
+    // One-shot stages (research/guide/file-manifest)
+    AI_PROVIDER: z.enum(["gemini", "claude"]).default("gemini"),
+    // The agentic coding loop — independent of AI_PROVIDER so you can e.g.
+    // run research on Gemini and coding on Claude, or both on Gemini while
+    // no Anthropic key is available. Swap back to "claude" any time.
+    CODING_AGENT_PROVIDER: z.enum(["gemini", "claude"]).default("claude"),
+
+    GEMINI_API_KEY: z.string().optional(),
+    GEMINI_MODEL: z.string().default("gemini-2.5-flash"),
+    ANTHROPIC_API_KEY: z.string().optional(),
+    CLAUDE_MODEL: z.string().default("claude-sonnet-5"),
+    CODING_AGENT_MODEL: z.string().optional(),
+
+    MAX_AGENT_ITERATIONS: intFromEnv(25),
+    MAX_CODE_ATTEMPTS: intFromEnv(2),
+    VERIFY_INSTALL_TIMEOUT_MS: intFromEnv(300_000),
+    VERIFY_BUILD_TIMEOUT_MS: intFromEnv(600_000),
+
+    // --- Target repo ---
+    GITHUB_TOKEN: z.string().optional(),
+    GITHUB_TARGET_OWNER: z.string().min(1, "GITHUB_TARGET_OWNER is required"),
+    GITHUB_TARGET_REPO: z.string().min(1, "GITHUB_TARGET_REPO is required"),
+    GITHUB_BASE_BRANCH: z.string().default("main"),
+    GITHUB_API_URL: z.string().url().default("https://api.github.com"),
+    // Overrides the constructed https://github.com/{owner}/{repo}.git URL —
+    // for pointing at a local `git init --bare` fixture during safe testing.
+    TARGET_REPO_CLONE_URL: z.string().optional(),
+    // Skips the real GitHub PR API call (clone/code/verify/commit/push still
+    // run for real) — lets the whole pipeline run against a local fixture
+    // without touching any real repository's main branch.
+    DRY_RUN_NO_PR: boolFromEnv,
+
+    WRITE_PATH_ALLOWLIST: z.string().min(1, "WRITE_PATH_ALLOWLIST is required — set it after reviewing the target repo's structure"),
+
+    GIT_AUTHOR_NAME: z.string().default("Landing Page Codegen Bot"),
+    GIT_AUTHOR_EMAIL: z.string().default("codegen-bot@example.com"),
+
+    RUN_STATE_DIR: z.string().default("./data/runs"),
+    WORKDIR_ROOT: z.string().default("./data/.scratch"),
+    KEEP_WORKDIR_ON_FAILURE: boolFromEnv,
+
+    SKIP_RESEARCH: boolFromEnv,
+  })
+  .superRefine((env, ctx) => {
+    if (env.AI_PROVIDER === "gemini" && !env.GEMINI_API_KEY) {
+      ctx.addIssue({ code: "custom", path: ["GEMINI_API_KEY"], message: "required when AI_PROVIDER=gemini" });
+    }
+    if (env.AI_PROVIDER === "claude" && !env.ANTHROPIC_API_KEY) {
+      ctx.addIssue({ code: "custom", path: ["ANTHROPIC_API_KEY"], message: "required when AI_PROVIDER=claude" });
+    }
+    if (env.CODING_AGENT_PROVIDER === "gemini" && !env.GEMINI_API_KEY) {
+      ctx.addIssue({ code: "custom", path: ["GEMINI_API_KEY"], message: "required when CODING_AGENT_PROVIDER=gemini" });
+    }
+    if (env.CODING_AGENT_PROVIDER === "claude" && !env.ANTHROPIC_API_KEY) {
+      ctx.addIssue({ code: "custom", path: ["ANTHROPIC_API_KEY"], message: "required when CODING_AGENT_PROVIDER=claude" });
+    }
+    if (!env.DRY_RUN_NO_PR && !env.GITHUB_TOKEN) {
+      ctx.addIssue({ code: "custom", path: ["GITHUB_TOKEN"], message: "required unless DRY_RUN_NO_PR=true" });
+    }
+  });
+
+function loadConfig() {
+  const result = envSchema.safeParse(process.env);
+  if (!result.success) {
+    const issues = result.error.issues.map((i) => `  - ${i.path.join(".")}: ${i.message}`).join("\n");
+    // eslint-disable-next-line no-console
+    console.error(`Invalid configuration — fix .env:\n${issues}`);
+    process.exit(1);
+  }
+  const env = result.data;
+  const codingAgentModel =
+    env.CODING_AGENT_MODEL || (env.CODING_AGENT_PROVIDER === "gemini" ? env.GEMINI_MODEL : env.CLAUDE_MODEL);
+
+  return {
+    port: env.PORT,
+    apiSharedSecret: env.API_SHARED_SECRET,
+
+    aiProvider: env.AI_PROVIDER,
+    codingAgentProvider: env.CODING_AGENT_PROVIDER,
+    geminiApiKey: env.GEMINI_API_KEY,
+    geminiModel: env.GEMINI_MODEL,
+    anthropicApiKey: env.ANTHROPIC_API_KEY,
+    claudeModel: env.CLAUDE_MODEL,
+    codingAgentModel,
+
+    maxAgentIterations: env.MAX_AGENT_ITERATIONS,
+    maxCodeAttempts: env.MAX_CODE_ATTEMPTS,
+    verifyInstallTimeoutMs: env.VERIFY_INSTALL_TIMEOUT_MS,
+    verifyBuildTimeoutMs: env.VERIFY_BUILD_TIMEOUT_MS,
+
+    github: {
+      token: env.GITHUB_TOKEN,
+      owner: env.GITHUB_TARGET_OWNER,
+      repo: env.GITHUB_TARGET_REPO,
+      baseBranch: env.GITHUB_BASE_BRANCH,
+      apiUrl: env.GITHUB_API_URL,
+      cloneUrl: env.TARGET_REPO_CLONE_URL || `https://github.com/${env.GITHUB_TARGET_OWNER}/${env.GITHUB_TARGET_REPO}.git`,
+    },
+    dryRunNoPr: env.DRY_RUN_NO_PR,
+
+    // ["app/campaigns/{slug}/", "components/campaigns/{slug}/"]
+    writePathAllowlistTemplates: env.WRITE_PATH_ALLOWLIST.split(",").map((s) => s.trim()).filter(Boolean),
+
+    gitAuthorName: env.GIT_AUTHOR_NAME,
+    gitAuthorEmail: env.GIT_AUTHOR_EMAIL,
+
+    runStateDir: env.RUN_STATE_DIR,
+    workdirRoot: env.WORKDIR_ROOT,
+    keepWorkdirOnFailure: env.KEEP_WORKDIR_ON_FAILURE,
+
+    skipResearch: env.SKIP_RESEARCH,
+  };
+}
+
+/** Resolve the allowlist templates for one run's slug, e.g. "{slug}" -> "spring-sale". */
+export function resolveAllowlist(templates, slug) {
+  return templates.map((t) => t.replaceAll("{slug}", slug));
+}
+
+export const config = loadConfig();
