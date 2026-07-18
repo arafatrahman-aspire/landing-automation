@@ -13,6 +13,7 @@ export const briefSchema = z.object({
   audience: z.string().min(5).max(500),
   cta: z.string().min(2).max(60),
   brief: z.string().max(4000).default(""),
+  videoUrl: z.string().url().optional(),
   deadline: z.string().date().optional(),
 });
 

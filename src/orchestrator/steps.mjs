@@ -1,5 +1,5 @@
 import path from "node:path";
-import { rm, mkdir, writeFile } from "node:fs/promises";
+import { rm, mkdir, writeFile, readFile, readdir, access } from "node:fs/promises";
 import { config, resolveAllowlist } from "../config.mjs";
 import * as runStore from "../state/run-store.mjs";
 import { generateText, extractJson } from "../ai/text.mjs";
@@ -12,9 +12,12 @@ import {
   commitPaths,
   push as gitPush,
 } from "../git/ops.mjs";
-import { verifyBuild } from "../verify/build.mjs";
+import { runFullVerifySuite } from "../verify/index.mjs";
 import { createPullRequest } from "../github/api.mjs";
 import { validateFileManifest } from "../schemas/file-manifest-schema.mjs";
+import { validateGuide, truncateGuideFields } from "../schemas/guide-schema.mjs";
+import { SECTION_TYPES } from "../design/schema.mjs";
+import { resolveSectionReferences, formatReferencesForPrompt } from "../design/resolve.mjs";
 
 /* Pure-ish stage functions the LangGraph nodes call (orchestrator/graph.mjs).
  * Each takes/returns a partial CodegenState for LangGraph's internal flow
@@ -27,14 +30,45 @@ function log(runId, message) {
   return runStore.appendLog(runId, "info", message);
 }
 
-/* Python package directories must be valid import identifiers, so a kebab-case
- * slug (enforced by the brief schema, e.g. "spring-security-sale") can't be a
- * dashed directory the agent would import from. Resolve the write-path
- * allowlist with an underscored form so the plan, the coding-agent guardrail,
- * and what the model naturally writes all agree. (For a dash-free slug this is
- * a no-op, so it's harmless for non-Python targets too.) */
-function packageSlug(slug) {
-  return slug.replaceAll("-", "_");
+/* The target repo's stack isn't fixed (Next.js today, Laravel or something
+ * else tomorrow) — a lightweight scan right after clone, BEFORE guide/
+ * file_manifest lock in any file paths, so those stages describe the plan
+ * in terms of what this repo actually is instead of assuming React. This is
+ * deliberately shallow (no full dependency-tree walk): just enough signal
+ * for the LLM to stop guessing. */
+async function detectRepoConventions(workdir) {
+  const notes = [];
+
+  try {
+    const pkg = JSON.parse(await readFile(path.join(workdir, "package.json"), "utf8"));
+    const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+    const framework = deps.next ? "Next.js" : deps.react ? "React" : deps.vue ? "Vue" : "a Node-based frontend";
+    notes.push(`package.json found (${framework} — key deps: ${Object.keys(deps).slice(0, 15).join(", ") || "none"}).`);
+  } catch {
+    /* no package.json at root — fine, could be PHP or a monorepo subfolder */
+  }
+
+  const hasComposer = await access(path.join(workdir, "composer.json")).then(() => true, () => false);
+  if (hasComposer) {
+    notes.push(
+      "composer.json found — likely a PHP/Laravel repo. New pages are probably Blade templates " +
+        "(.blade.php); routing is normally registered in an existing routes file, which must NOT be " +
+        "modified (pristine-file guard) — leave the new page unwired and note in the PR that a human " +
+        "needs to add the route manually."
+    );
+  }
+
+  try {
+    const entries = await readdir(workdir, { withFileTypes: true });
+    const dirs = entries
+      .filter((e) => e.isDirectory() && !["node_modules", ".git", "vendor", "dist", "build", ".next"].includes(e.name))
+      .map((e) => e.name);
+    notes.push(`Top-level directories: ${dirs.join(", ") || "(none)"}`);
+  } catch {
+    /* ignore — best-effort signal only */
+  }
+
+  return notes.join("\n") || "(repo structure could not be inspected — explore it directly once coding starts)";
 }
 
 export async function intake(state) {
@@ -52,8 +86,8 @@ export async function research(state) {
   await log(state.runId, "research: querying LLM (web search)");
   const { request } = state;
   const text = await generateText({
-    system: "You are a research assistant for a software feature. Return ONLY valid JSON, no prose.",
-    prompt: `Research this marketing campaign so a backend engineer can model it as a small API feature. Return JSON: {"keywords": string[], "painPoints": string[], "faqQuestions": string[], "notes": string}.
+    system: "You are a research assistant for a marketing landing page. Return ONLY valid JSON, no prose.",
+    prompt: `Research this marketing campaign so a copywriter/designer can build a high-converting landing page for it. Return JSON: {"keywords": string[], "painPoints": string[], "faqQuestions": string[], "notes": string}.
 
 Campaign: ${request.campaignName}
 Offer: ${request.offer}
@@ -69,50 +103,113 @@ Brief notes: ${request.brief}`,
   return { researchNotes };
 }
 
-export async function guide(state) {
+export async function guide(state, { attempt = 1 } = {}) {
   await runStore.heartbeat(state.runId, "guide");
-  await log(state.runId, "guide: generating a technical spec for the feature module");
+  await log(state.runId, `guide: generating a structured content/section plan (attempt ${attempt})`);
   const { request, researchNotes } = state;
-  const guideText = await generateText({
+  const repoConventions = await detectRepoConventions(state.workdir);
+  // Resolve examples for EVERY catalog section type (not just chosen ones yet —
+  // sections haven't been chosen until this very call returns) so the model
+  // picks its section list having actually seen real code, not a blank page.
+  const catalogExamples = await resolveSectionReferences({ workdir: state.workdir, sectionTypes: SECTION_TYPES });
+
+  const text = await generateText({
     system:
-      "You write concise technical specs for a coding agent to implement a small, self-contained backend feature in an existing FastAPI (Python) service. Plain text, no code.",
-    prompt: `Write a short technical spec for a new, self-contained FastAPI feature module that represents this marketing campaign as a backend feature.
+      "You plan content and section composition for a marketing landing page, for a coding agent to implement inside an existing frontend repository. Return ONLY a fenced ```json block, no prose outside it.",
+    prompt: `Plan a new, self-contained campaign landing page.
 
 Campaign: ${request.campaignName}
 Offer: ${request.offer}
 Audience: ${request.audience}
 CTA: ${request.cta}
+Video URL: ${request.videoUrl ?? "(none provided)"}
 Brief notes: ${request.brief}
 ${researchNotes ? `Research: ${JSON.stringify(researchNotes)}` : ""}
 
-The module is ADDITIVE and ISOLATED — it must not modify any existing file and nothing else in the repo imports it yet. Cover:
-- an APIRouter with 2-3 endpoints (e.g. GET campaign details/offer, POST a lead-capture matching the CTA),
-- Pydantic request/response schemas,
-- a small service/logic layer (in-memory or clearly stubbed persistence — do NOT assume access to the app's existing DB session),
-- the campaign copy (headline, offer summary, ${request.cta}) surfaced via the endpoints.
-List the Python files the module needs. Keep it under 400 words.`,
+TARGET REPO (just cloned):
+${repoConventions}
+
+AVAILABLE SECTION TYPES (choose ONLY from this fixed list — you cannot invent a new one), with real examples from this repo's design catalog where available:
+${formatReferencesForPrompt(catalogExamples)}
+
+Rules — STRICT length limits, every field is required, do not exceed them:
+- heroTitle: 40-60 characters MAX.
+- seoTitle: 70 characters MAX.
+- seoMetaDescription: 200 characters MAX.
+- "sections" is an ordered array drawn ONLY from: ${SECTION_TYPES.join(", ")}. Always include exactly one "hero", first. Only include other sections that genuinely make sense for this campaign (2-5 sections total is typical, not all 9).
+- EVERY section object MUST have BOTH a "type" and a "summary" key — never omit "summary". Each summary is ONE short sentence, 100 characters MAX.
+- heroHasVideo: true only because a Video URL was provided above; false means the hero shows a compact "what / when / who" details summary instead.
+- seoTitle/seoMetaDescription: concise and accurate, not generic or keyword-stuffed.
+- Output ONLY this exact JSON shape in a \`\`\`json fence, nothing else, no comments, no trailing text:
+{"heroTitle": "...", "heroHasVideo": ${Boolean(request.videoUrl)}, "seoTitle": "...", "seoMetaDescription": "...", "sections": [{"type": "hero", "summary": "..."}, {"type": "faq", "summary": "..."}]}`,
   });
-  await log(state.runId, "guide: done");
-  return { guide: guideText };
+
+  let parsed;
+  try {
+    parsed = truncateGuideFields(extractJson(text));
+  } catch (err) {
+    if (attempt < 2) {
+      await log(state.runId, `guide: JSON parse failed, retrying — ${err.message}`);
+      return guide(state, { attempt: attempt + 1 });
+    }
+    throw new Error(`guide: could not parse JSON after retry — ${err.message}`);
+  }
+
+  const result = validateGuide(parsed);
+  if (!result.ok) {
+    if (attempt < 2) {
+      await log(state.runId, `guide: schema invalid, retrying — ${result.errors}`);
+      return guide(state, { attempt: attempt + 1 });
+    }
+    throw new Error(`guide: schema invalid after retry —\n${result.errors}`);
+  }
+
+  await runStore.updateRun(state.runId, { guide: result.value });
+  await log(
+    state.runId,
+    `guide: done — ${result.value.sections.length} section(s): ${result.value.sections.map((s) => s.type).join(", ")}`
+  );
+  return { guide: result.value };
 }
 
 export async function fileManifest(state, { attempt = 1 } = {}) {
   await runStore.heartbeat(state.runId, "file_manifest");
   await log(state.runId, `file_manifest: generating (attempt ${attempt})`);
-  const { request, guide: guideText } = state;
-  const allowlist = resolveAllowlist(config.writePathAllowlistTemplates, packageSlug(request.slug));
+  const { request, guide: guideData } = state;
+  const allowlist = resolveAllowlist(config.writePathAllowlistTemplates, request.slug);
+  const repoConventions = await detectRepoConventions(state.workdir);
+  const chosenSections = guideData.sections.map((s) => s.type);
+  const resolved = await resolveSectionReferences({ workdir: state.workdir, sectionTypes: chosenSections });
+
+  if (attempt === 1) {
+    // Persisted (not just in-process LangGraph state) so GET /campaigns/:runId
+    // can show a human which reference files actually grounded this plan.
+    await runStore.updateRun(state.runId, {
+      sectionReferences: resolved.map((r) => ({
+        sectionType: r.sectionType,
+        note: r.note,
+        files: r.files.map((f) => ({ path: f.path, found: f.content !== null })),
+      })),
+    });
+  }
 
   const text = await generateText({
     system: "You plan file structures for a coding agent. Return ONLY a fenced ```json block, no prose outside it.",
-    prompt: `Given this technical spec, declare which NEW Python files should be created for this campaign's self-contained FastAPI feature module.
+    prompt: `Given this content/section plan, declare which NEW frontend files should be created for this campaign's self-contained landing page.
 
-Spec:
-${guideText}
+Plan:
+${JSON.stringify(guideData, null, 2)}
+
+Target repo:
+${repoConventions}
+
+Section reference examples (real code from this repo, where available):
+${formatReferencesForPrompt(resolved)}
 
 Rules:
 - Every path MUST start with one of these allowed prefixes: ${allowlist.join(" or ")}
-- All files must be Python (.py). Include an "__init__.py" for the package, plus files such as router.py, schemas.py, service.py as needed.
-- Propose 2-6 files. Do NOT reference or modify any existing file.
+- File types/extensions MUST match whatever this specific target repo actually uses — do not assume a framework. It could be React/Next.js (.tsx/.jsx), Vue (.vue), a Laravel app (.blade.php templates, PHP is only used for markup/logic that stays inside the new files), or plain HTML/CSS. Look at the target repo notes and reference examples above.
+- Propose 2-8 files (a page/route entry plus its section components/partials). Do NOT reference or modify any existing file.
 - Output ONLY this JSON shape in a \`\`\`json fence:
 {"slug": "${request.slug}", "summary": "...", "designNotes": "...", "filesToCreate": [{"path": "...", "purpose": "..."}]}`,
   });
@@ -189,10 +286,10 @@ export async function code(state) {
   await runStore.updateRun(state.runId, { codeAttempts: attempt });
   await log(state.runId, `code: agentic loop starting (attempt ${attempt})`);
 
-  const allowlist = resolveAllowlist(config.writePathAllowlistTemplates, packageSlug(state.request.slug));
+  const allowlist = resolveAllowlist(config.writePathAllowlistTemplates, state.request.slug);
   const manifestPaths = new Set(state.fileManifest.filesToCreate.map((f) => f.path));
 
-  const systemPrompt = `You are a coding agent adding a new, self-contained feature module to an existing FastAPI (Python) backend repository.
+  const systemPrompt = `You are a coding agent adding a new campaign landing page to an existing frontend repository, matching its existing design system and shared component library.
 
 GUARDRAILS (enforced in code, not just instructions):
 - You may ONLY create files under: ${allowlist.join(", ")}
@@ -200,15 +297,17 @@ GUARDRAILS (enforced in code, not just instructions):
 - You can NEVER modify or overwrite a file that already existed in this repository.
 - You have no shell access. Explore with list_files/read_file, write with write_file, and call finish_coding when done.
 
-Explore the repository first (pyproject.toml, app/main.py, an existing router under app/api, app/schemas, app/services) so your new code matches its real conventions (FastAPI APIRouter, Pydantic v2 models, import style), THEN create the planned files.
+Explore the repository first — this could be a Next.js/React repo, a Laravel/PHP repo (Blade templates), a Vue repo, or something else entirely. Check for package.json vs. composer.json, the routing/page convention, an existing page or component similar to a landing page, and the styling approach (Tailwind config, CSS modules, Blade + plain CSS, whatever it actually uses), so your new code matches its REAL conventions (framework, component/template patterns, import style, design tokens/colors, spacing), THEN create the planned files.
 
-The module MUST be self-contained: it must import ONLY from the Python standard library, third-party packages already declared in pyproject.toml, and files you create in this same module. Do NOT import the app's existing DB session/config or modify any existing file — nothing else imports your module yet. Every file must be valid, ruff-clean Python (the repo's ruff config gates the PR: sorted imports, no unused imports/names).
+HERO REQUIREMENT (above the fold, no scrolling, at BOTH desktop and mobile widths): one block containing the shortened campaign title, a video-or-details block, and the lead-capture form (name, phone, email, CTA button). Video-or-details and the form sit side by side on desktop, stacked vertically on mobile. Use responsive sizing (e.g. CSS clamp() or the repo's existing type scale) so the title shrinks gracefully rather than overflowing. Mark these three elements with these EXACT attributes (an automated check looks for them to verify placement — plain HTML attributes, not classes): \`data-hero-title\` on the title element, \`data-hero-media\` on the video-or-details block, \`data-hero-form\` on the lead form. These attributes are invisible to visitors and don't affect styling.
+
+The page MUST be self-contained: import/include ONLY from packages or PHP classes already declared in package.json/composer.json, the target repo's own existing shared components/partials (read them first, don't guess), and files you create in this same page. Do NOT modify any existing file — if the repo needs an existing routes file edited to make this page reachable (e.g. Laravel's routes/web.php), do NOT do it; leave the page unwired and say so in your finish_coding summary so the PR can flag it for a human to wire up. Every file must be valid and clean per the repo's own conventions.
 
 FILE PLAN:
 ${JSON.stringify(state.fileManifest, null, 2)}
 
-TECHNICAL SPEC:
-${state.guide}
+CONTENT/SECTION PLAN:
+${JSON.stringify(state.guide, null, 2)}
 ${state.verifyReport ? `\nPREVIOUS ATTEMPT FAILED VERIFICATION — fix this before finishing:\n${state.verifyReport}\n` : ""}`;
 
   const result = await runCodingAgent({
@@ -245,20 +344,25 @@ export async function verify(state) {
     return {};
   }
   await runStore.heartbeat(state.runId, "verify");
-  await log(state.runId, "verify: validating the new files (build/lint, ecosystem-aware)");
+  await log(state.runId, "verify: validating the new files (build/lint + hero-fit/seo/a11y, ecosystem-aware)");
   const changedPaths =
     state.writtenByAgent && state.writtenByAgent.size > 0
       ? [...state.writtenByAgent]
       : state.fileManifest.filesToCreate.map((f) => f.path);
-  const result = await verifyBuild({
+  const pageUrlPath = config.pageUrlPathTemplate
+    ? config.pageUrlPathTemplate.replaceAll("{slug}", state.request.slug)
+    : null;
+  const result = await runFullVerifySuite({
     workdir: state.workdir,
     installTimeoutMs: config.verifyInstallTimeoutMs,
     buildTimeoutMs: config.verifyBuildTimeoutMs,
     changedPaths,
+    pageUrlPath,
+    serverTimeoutMs: config.verifyServerTimeoutMs,
   });
   const verifyAttempts = state.verifyAttempts + 1;
-  await runStore.updateRun(state.runId, { verifyAttempts });
-  await log(state.runId, `verify: ${result.ok ? "PASSED" : "FAILED"} — ${result.report.slice(0, 300)}`);
+  await runStore.updateRun(state.runId, { verifyAttempts, verifyChecks: result.checks });
+  await log(state.runId, `verify: ${result.ok ? "PASSED" : "FAILED"} — ${result.report.slice(0, 500)}`);
   return { verifyPassed: result.ok, verifyReport: result.ok ? null : result.report, verifyAttempts };
 }
 
@@ -338,15 +442,19 @@ ${state.agentSummary ?? "(none)"}
 
 ## Reviewer checklist
 - [ ] Diff touches ONLY the files listed above (no unexpected changes)
-- [ ] Module is self-contained (imports only stdlib / declared deps / its own files)
-- [ ] Endpoints + schemas behave as expected once wired into the app router
+- [ ] Page is self-contained (imports only declared deps / the repo's own shared components / its own files)
+- [ ] Hero (title + video-or-details + lead form) is visible without scrolling, on both desktop and mobile
 - [ ] Copy/claims are accurate
+- [ ] If this repo needs an explicit route registered to make the page reachable (e.g. Laravel's \`routes/web.php\`), add that manually — the agent never edits existing files, so it isn't wired in yet
 `;
 }
 
 async function writeCodegenLog(state, filePath) {
   const fullLog = await runStore.getFullLog(state.runId);
   const content = `# Codegen run ${state.runId}
+
+## Content/section plan
+${JSON.stringify(state.guide, null, 2)}
 
 ## File plan
 ${JSON.stringify(state.fileManifest, null, 2)}

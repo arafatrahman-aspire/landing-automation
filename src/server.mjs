@@ -1,11 +1,17 @@
 import express from "express";
+import cors from "cors";
 import { randomUUID } from "node:crypto";
+import path from "node:path";
+import { rm } from "node:fs/promises";
 import { config } from "./config.mjs";
 import { validateBrief } from "./schemas/brief-schema.mjs";
 import * as runStore from "./state/run-store.mjs";
 import { runCodegen } from "./orchestrator/graph.mjs";
 
 const app = express();
+// The UI (Vite dev server on a different origin) needs to send the
+// Authorization header cross-origin — reflect the origin, allow that header.
+app.use(cors({ origin: true, allowedHeaders: ["Content-Type", "Authorization"] }));
 app.use(express.json());
 
 app.use((req, _res, next) => {
@@ -26,6 +32,12 @@ app.get("/healthz", (_req, res) => {
   res.json({ ok: true });
 });
 
+app.get("/campaigns", isAuthorized, async (_req, res) => {
+  const runs = await runStore.listRuns();
+  runs.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  res.json(runs);
+});
+
 app.post("/campaigns", isAuthorized, async (req, res) => {
   const result = validateBrief(req.body);
   if (!result.ok) {
@@ -36,7 +48,7 @@ app.post("/campaigns", isAuthorized, async (req, res) => {
   const runId = randomUUID();
   const { slug, campaignName } = result.value;
   console.log(`POST /campaigns — run ${runId}  slug=${slug}  name="${campaignName}"`);
-  await runStore.createRun({ runId, slug });
+  await runStore.createRun({ runId, slug, campaignName });
 
   runCodegen({ runId, request: result.value }).catch((err) => {
     console.error(`[run ${runId}] unhandled failure:`, err.message);
@@ -55,6 +67,27 @@ app.get("/campaigns/:runId", isAuthorized, async (req, res) => {
   const run = await runStore.getRun(req.params.runId);
   if (!run) return res.status(404).json({ error: "not_found" });
   res.json(run);
+});
+
+app.delete("/campaigns/:runId", isAuthorized, async (req, res) => {
+  const result = await runStore.deleteRun(req.params.runId);
+  if (!result.ok && result.reason === "not_found") {
+    return res.status(404).json({ error: "not_found" });
+  }
+  if (!result.ok && result.reason === "not_terminal") {
+    return res.status(409).json({
+      error: "not_terminal",
+      status: result.status,
+      message: "Only a completed or failed run can be deleted — this one is still in progress.",
+    });
+  }
+  // Best-effort: the scratch workdir is normally already removed by the time
+  // a run reaches completed/failed*, but KEEP_WORKDIR_ON_FAILURE=true (or a
+  // crash mid-cleanup) can leave it behind — clear it out on delete too.
+  const workdir = path.join(path.resolve(config.workdirRoot), req.params.runId);
+  await rm(workdir, { recursive: true, force: true }).catch(() => {});
+  console.log(`DELETE /campaigns/${req.params.runId} — removed`);
+  res.status(204).send();
 });
 
 app.use((err, _req, res, _next) => {

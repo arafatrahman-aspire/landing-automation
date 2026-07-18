@@ -7,11 +7,18 @@ import * as runStore from "../state/run-store.mjs";
  * scripts/campaign/lib/graph.mjs pattern — StateGraph + a single
  * "retry once, then halt, never proceed on a failed gate" conditional edge):
  *
- *   intake -> research -> generate_guide -> file_manifest -> clone -> code -> verify
- *                                                        ▲       │
- *                                                        └retry──┘ (codeAttempts < MAX_CODE_ATTEMPTS)
- *                                                                │ pass
- *                                                    commit -> push -> open_pr -> END
+ *   intake -> research -> clone -> generate_guide -> file_manifest -> code -> verify
+ *                                                                  ▲       │
+ *                                                                  └retry──┘ (codeAttempts < MAX_CODE_ATTEMPTS)
+ *                                                                          │ pass
+ *                                                              commit -> push -> open_pr -> END
+ *
+ * `clone` happens BEFORE guide/file_manifest (not after, as you might expect)
+ * because the target repo's actual stack isn't fixed — it could be Next.js,
+ * Laravel, Vue, plain HTML, whatever — and guide/file_manifest need to see
+ * the real repo (via a lightweight scan, steps.detectRepoConventions) to
+ * choose real file extensions/conventions, instead of guessing blind and
+ * having file_manifest lock in paths the coding agent then can't match.
  *
  * A verify failure that exhausts retries routes straight to END without
  * ever reaching commit/push/open_pr — no broken PR can ever be opened. */
@@ -48,10 +55,10 @@ export function createCodegenGraph() {
   return new StateGraph(CodegenState)
     .addNode("intake", steps.intake)
     .addNode("research", steps.research)
+    .addNode("clone", steps.clone)
     // node can't share a name with the "guide" state channel
     .addNode("generate_guide", steps.guide)
     .addNode("file_manifest", steps.fileManifest)
-    .addNode("clone", steps.clone)
     .addNode("code", steps.code)
     .addNode("verify", steps.verify)
     .addNode("commit", steps.commit)
@@ -59,10 +66,10 @@ export function createCodegenGraph() {
     .addNode("open_pr", steps.openPr)
     .addEdge(START, "intake")
     .addEdge("intake", "research")
-    .addEdge("research", "generate_guide")
+    .addEdge("research", "clone")
+    .addEdge("clone", "generate_guide")
     .addEdge("generate_guide", "file_manifest")
-    .addEdge("file_manifest", "clone")
-    .addEdge("clone", "code")
+    .addEdge("file_manifest", "code")
     .addEdge("code", "verify")
     .addConditionalEdges("verify", routeAfterVerify)
     .addEdge("commit", "push")

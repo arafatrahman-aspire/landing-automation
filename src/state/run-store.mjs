@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile, appendFile, readdir } from "node:fs/promises";
+import { mkdir, readFile, writeFile, appendFile, readdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import { config } from "../config.mjs";
 
@@ -28,12 +28,13 @@ async function withRunLock(runId, fn) {
   return next;
 }
 
-export async function createRun({ runId, slug }) {
+export async function createRun({ runId, slug, campaignName }) {
   await mkdir(config.runStateDir, { recursive: true });
   const now = new Date().toISOString();
   const record = {
     runId,
     slug,
+    campaignName: campaignName ?? null,
     status: "queued",
     stage: "intake",
     createdAt: now,
@@ -108,6 +109,21 @@ export async function listRuns() {
 
 export function isTerminal(status) {
   return TERMINAL_STATUSES.has(status);
+}
+
+/** Deletes a run's record + log. Only permitted once the run has reached a
+ *  terminal status — deleting mid-run would pull the JSON file out from
+ *  under the in-flight graph.invoke(), which calls updateRun/heartbeat
+ *  throughout and would throw ("no such run") the moment it did. This never
+ *  touches anything already pushed to git/GitHub — it only removes this
+ *  service's own local bookkeeping for the run. */
+export async function deleteRun(runId) {
+  const current = await getRun(runId);
+  if (!current) return { ok: false, reason: "not_found" };
+  if (!isTerminal(current.status)) return { ok: false, reason: "not_terminal", status: current.status };
+  await Promise.all([unlink(jsonPath(runId)).catch(() => {}), unlink(logPath(runId)).catch(() => {})]);
+  writeChains.delete(runId);
+  return { ok: true };
 }
 
 /** Startup crash recovery (§8): any run still non-terminal from a previous

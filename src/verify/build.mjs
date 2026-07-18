@@ -1,20 +1,22 @@
 import { spawn } from "node:child_process";
-import { access, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { has, findPackageJsonDir, detectPackageManager, INSTALL_CMD, RUN_SCRIPT_CMD } from "./package-manager.mjs";
 
 /* Deterministic, non-AI verification of whatever the coding agent wrote —
- * this IS the QA gate (mirrors the parent project's "QA = validation, not
- * AI opinion" philosophy). The LLM never runs commands itself (ai/tools.mjs
- * has no shell-exec tool); this module is the only thing that does.
+ * this IS the QA gate. The LLM never runs commands itself (ai/tools.mjs has
+ * no shell-exec tool); this module is the only thing that does.
  *
- * The gate is ECOSYSTEM-AWARE:
- *   - Node repo  (package.json)  -> the repo's own install + build (+ lint).
- *   - Python repo (pyproject.toml/setup.py) -> byte-compile + ruff-lint the
- *     NEWLY created files. We deliberately do NOT run the target repo's full
- *     pytest/uvicorn here: the service only ever adds new, isolated files that
- *     nothing else imports, so a self-contained syntax+lint gate on exactly
- *     those files is the meaningful check — and it can't be defeated by the
- *     repo's own pre-existing test env/config requirements. */
+ * The specific TARGET REPO this service points at is not fixed — different
+ * campaigns may land in a Next.js repo today and a Laravel/PHP repo
+ * tomorrow, so this gate is ECOSYSTEM-AWARE rather than Node-only:
+ *   - Node repo   (package.json, at root or one level down for a monorepo/
+ *     asset subdirectory) -> the repo's own install + build (+ lint).
+ *   - PHP/Laravel repo (composer.json, no package.json anywhere reachable)
+ *     -> `php -l` syntax-lint exactly the newly created .php files. We don't
+ *     boot a full Laravel app (routes/service providers/DB) here — the
+ *     agent's page is additive and isolated, so a syntax gate on exactly
+ *     what it wrote is the meaningful, dependency-free check. */
 
 const REPORT_LINE_LIMIT = 200;
 
@@ -48,50 +50,33 @@ function truncateReport(text) {
   return `... (truncated, showing last ${REPORT_LINE_LIMIT} lines)\n` + lines.slice(-REPORT_LINE_LIMIT).join("\n");
 }
 
-const has = (workdir, f) => access(path.join(workdir, f)).then(() => true, () => false);
-
 /**
- * Dispatches to the right ecosystem gate.
  * @param {object} p
  * @param {string} p.workdir
  * @param {number} p.installTimeoutMs
  * @param {number} p.buildTimeoutMs
- * @param {string[]} [p.changedPaths] relative paths the agent created (for the Python gate)
+ * @param {string[]} [p.changedPaths] relative paths the agent created (used by the PHP gate)
  * @returns {Promise<{ok: boolean, report: string}>}
  */
 export async function verifyBuild({ workdir, installTimeoutMs, buildTimeoutMs, changedPaths = [] }) {
-  if (await has(workdir, "package.json")) {
-    return verifyNode({ workdir, installTimeoutMs, buildTimeoutMs });
+  const pkgDir = await findPackageJsonDir(workdir);
+  if (pkgDir) {
+    return verifyNode({ workdir: pkgDir, installTimeoutMs, buildTimeoutMs });
   }
-  if ((await has(workdir, "pyproject.toml")) || (await has(workdir, "setup.py")) || (await has(workdir, "setup.cfg"))) {
-    return verifyPython({ workdir, buildTimeoutMs, changedPaths });
+  if (await has(workdir, "composer.json")) {
+    return verifyPhp({ workdir, buildTimeoutMs, changedPaths });
   }
   return {
     ok: false,
     report:
-      `No recognizable project manifest at repo root (looked for package.json / pyproject.toml / setup.py). ` +
-      `This is a configuration problem, not something a code retry can fix.`,
+      `No package.json (root or one level down) and no composer.json found — this repo's ` +
+      `stack isn't recognized. This is a configuration problem, not something a code retry can fix.`,
   };
 }
 
 /* ------------------------------- Node ------------------------------- */
 
-export async function detectPackageManager(workdir) {
-  if (await has(workdir, "pnpm-lock.yaml")) return "pnpm";
-  if (await has(workdir, "yarn.lock")) return "yarn";
-  return "npm";
-}
-
-const INSTALL_CMD = {
-  npm: ["npm", ["ci"]],
-  yarn: ["yarn", ["install", "--frozen-lockfile"]],
-  pnpm: ["pnpm", ["install", "--frozen-lockfile"]],
-};
-const RUN_SCRIPT_CMD = {
-  npm: (script) => ["npm", ["run", script]],
-  yarn: (script) => ["yarn", [script]],
-  pnpm: (script) => ["pnpm", [script]],
-};
+export { detectPackageManager };
 
 async function verifyNode({ workdir, installTimeoutMs, buildTimeoutMs }) {
   const pkgPath = path.join(workdir, "package.json");
@@ -143,69 +128,40 @@ async function verifyNode({ workdir, installTimeoutMs, buildTimeoutMs }) {
   return { ok: true, report: `${pm} install + build${scripts.lint ? " + lint" : ""} passed.` };
 }
 
-/* ------------------------------ Python ------------------------------ */
+/* ------------------------------ PHP / Laravel ------------------------------ */
 
-async function detectPython() {
-  for (const cmd of ["python3", "python"]) {
-    const r = await runCommand(cmd, ["--version"], { cwd: process.cwd(), timeoutMs: 10_000 });
-    if (r.ok) return cmd;
-  }
-  return null;
-}
-
-/** Is `python -m ruff` importable? (installed to user/site or a venv). */
-async function ruffAvailable(python, workdir) {
-  const r = await runCommand(python, ["-m", "ruff", "--version"], { cwd: workdir, timeoutMs: 15_000 });
+async function detectPhp() {
+  const r = await runCommand("php", ["-v"], { cwd: process.cwd(), timeoutMs: 10_000 });
   return r.ok;
 }
 
-async function verifyPython({ workdir, buildTimeoutMs, changedPaths }) {
-  const python = await detectPython();
-  if (!python) {
-    return { ok: false, report: "No python3/python interpreter found on PATH — cannot verify a Python repo." };
-  }
-
-  const pyFiles = (changedPaths ?? []).filter((p) => p.endsWith(".py"));
-  if (pyFiles.length === 0) {
+async function verifyPhp({ workdir, buildTimeoutMs, changedPaths }) {
+  // .blade.php files are Blade templates, not plain PHP (directives like @extends/{{ }}
+  // aren't valid PHP syntax on their own — Laravel compiles them at runtime) — only
+  // lint genuine .php files (controllers/classes), never .blade.php templates.
+  const phpFiles = (changedPaths ?? []).filter((p) => p.endsWith(".php") && !p.endsWith(".blade.php"));
+  if (phpFiles.length === 0) {
     return {
-      ok: false,
+      ok: true,
       report:
-        "No .py files were created — a Python feature module must contain at least one Python file " +
-        "(the agent should create the router/module under the allowed package path).",
+        "No plain .php files were created — nothing for the PHP syntax gate to check " +
+        "(the page may be entirely Blade templates/assets, which this gate doesn't lint).",
     };
   }
 
-  // 1. Byte-compile — catches syntax errors in exactly the new files (no deps needed).
-  const compile = await runCommand(python, ["-m", "py_compile", ...pyFiles], { cwd: workdir, timeoutMs: buildTimeoutMs });
-  if (!compile.ok) {
-    return {
-      ok: false,
-      report: `python -m py_compile ${compile.timedOut ? "timed out" : "failed"} (syntax error in a new file):\n${truncateReport(
-        compile.stdout + compile.stderr
-      )}`,
-    };
+  if (!(await detectPhp())) {
+    return { ok: false, report: "No `php` interpreter found on PATH — cannot verify a PHP/Laravel repo." };
   }
 
-  // 2. Lint the new files with the target repo's own ruff config (auto-discovered
-  //    from its pyproject.toml). Catches undefined names, bad imports, style, etc.
-  if (await ruffAvailable(python, workdir)) {
-    const lint = await runCommand(python, ["-m", "ruff", "check", ...pyFiles], { cwd: workdir, timeoutMs: buildTimeoutMs });
-    if (!lint.ok && !lint.timedOut) {
+  for (const file of phpFiles) {
+    const lint = await runCommand("php", ["-l", file], { cwd: workdir, timeoutMs: buildTimeoutMs });
+    if (!lint.ok) {
       return {
         ok: false,
-        report: `ruff check failed on the new files (target repo's own lint rules apply):\n${truncateReport(
-          lint.stdout + lint.stderr
-        )}`,
+        report: `php -l failed on "${file}" (syntax error):\n${truncateReport(lint.stdout + lint.stderr)}`,
       };
     }
-    if (lint.timedOut) {
-      return { ok: false, report: "ruff check timed out." };
-    }
-    return { ok: true, report: `py_compile + ruff check passed on ${pyFiles.length} new file(s).` };
   }
 
-  return {
-    ok: true,
-    report: `py_compile passed on ${pyFiles.length} new file(s). (ruff not available — lint skipped.)`,
-  };
+  return { ok: true, report: `php -l passed on ${phpFiles.length} new file(s).` };
 }

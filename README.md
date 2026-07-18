@@ -34,6 +34,7 @@ touches, the parent project's code or database.
 ```bash
 cd new_approach
 npm install
+npx playwright install chromium   # needed for hero-fit/seo-lint/a11y-lint checks
 cp .env.example .env
 ```
 
@@ -47,6 +48,7 @@ Fill in `.env`:
 | `GITHUB_TOKEN` | a token scoped to the **target** repo only (fine-grained PAT: contents + pull-requests, that one repo). Not required if `DRY_RUN_NO_PR=true` |
 | `GITHUB_TARGET_OWNER` / `GITHUB_TARGET_REPO` / `GITHUB_BASE_BRANCH` | the external repo this service pushes into |
 | `WRITE_PATH_ALLOWLIST` | **set this by hand** after looking at the target repo's real structure, e.g. `app/campaigns/{slug}/,components/campaigns/{slug}/` — deliberately not auto-derived from what the AI discovers |
+| `PAGE_URL_PATH_TEMPLATE` | **set this by hand** too, e.g. `/campaigns/{slug}` — how to reach the new page once served, for the hero-fit/SEO/accessibility checks. Leave unset to skip those checks (build/lint still runs) |
 | `TARGET_REPO_CLONE_URL` / `DRY_RUN_NO_PR` | see "Safe local dry run" below |
 
 ```bash
@@ -60,13 +62,21 @@ All `/campaigns*` routes require `Authorization: Bearer <API_SHARED_SECRET>`.
 ```
 POST /campaigns
   { "slug": "spring-sale", "campaignName": "...", "offer": "...",
-    "audience": "...", "cta": "...", "brief": "free-form notes" }
+    "audience": "...", "cta": "...", "brief": "free-form notes",
+    "videoUrl": "https://... (optional)" }
   -> 202 { runId, status: "queued", statusUrl }
 
+GET /campaigns              -> list of all runs (status, stage, PR url, ...)
 GET /campaigns/:runId       -> status, stage, branchName, prUrl, log tail
 GET /campaigns/:runId/log   -> full plain-text log
 GET /healthz                -> unauthenticated liveness check
 ```
+
+## Browser UI
+
+There's also a small React + Vite SPA in `ui/` that drives the API above —
+create campaigns and watch runs progress without curl. See
+`documentation.md` for how to run it alongside the API.
 
 ## Safety model
 

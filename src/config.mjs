@@ -38,6 +38,15 @@ const envSchema = z
     MAX_CODE_ATTEMPTS: intFromEnv(2),
     VERIFY_INSTALL_TIMEOUT_MS: intFromEnv(300_000),
     VERIFY_BUILD_TIMEOUT_MS: intFromEnv(600_000),
+    // How the layout/SEO/a11y checks reach the new page once it's served —
+    // e.g. "/campaigns/{slug}" for Next.js app-router. Framework routing
+    // conventions vary too much to derive this automatically (and for a
+    // repo like Laravel, where the page isn't wired into routing at all
+    // yet, there's nothing to derive) — same "human sets the boundary"
+    // philosophy as WRITE_PATH_ALLOWLIST. Leave unset to skip these checks
+    // entirely (build/lint still runs) until it's been configured.
+    PAGE_URL_PATH_TEMPLATE: z.string().optional(),
+    VERIFY_SERVER_TIMEOUT_MS: intFromEnv(30_000),
 
     // --- Target repo ---
     GITHUB_TOKEN: z.string().optional(),
@@ -110,6 +119,8 @@ function loadConfig() {
     maxCodeAttempts: env.MAX_CODE_ATTEMPTS,
     verifyInstallTimeoutMs: env.VERIFY_INSTALL_TIMEOUT_MS,
     verifyBuildTimeoutMs: env.VERIFY_BUILD_TIMEOUT_MS,
+    pageUrlPathTemplate: env.PAGE_URL_PATH_TEMPLATE || null,
+    verifyServerTimeoutMs: env.VERIFY_SERVER_TIMEOUT_MS,
 
     github: {
       token: env.GITHUB_TOKEN,
