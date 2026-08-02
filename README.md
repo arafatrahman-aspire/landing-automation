@@ -5,19 +5,26 @@ project. Given a campaign brief, it:
 
 1. researches the topic and writes a short content guide (one-shot LLM calls),
 2. declares a small, explicit **file plan** (which new files it intends to create),
-3. clones an **external** frontend repository (not this one, not the parent project),
+3. clones an **external** frontend repository (not this one, not the parent
+   project) — only once; every run after that reuses the cached clone
+   (`data/.scratch/_base/`) via a `git worktree`, syncing it to the latest
+   base branch first instead of re-cloning from scratch,
 4. runs an **agentic coding loop** (Gemini or Claude — switchable with one
    env var) that explores that repo's real conventions and writes the new
    landing page — strictly inside a human-configured, code-enforced path
    allowlist, and only files declared in the plan,
 5. runs the target repo's **own** build/lint scripts to verify the change,
-6. commits, pushes a new branch, and **opens a pull request** — a human
+6. stages the generated files as a versioned draft in a local SQLite
+   database (`data/campaigns.db`),
+7. commits, pushes a new branch, and **opens a pull request** — a human
    always reviews and merges it. This service never merges anything.
 
-There is no database. GitHub itself — the PR, its commits, and a
-`CODEGEN_LOG.md` committed alongside the new page — is the durable record of
-what happened and why. A per-run JSON file under `data/runs/` exists only for
-the HTTP status API while the service is alive.
+GitHub itself — the PR, its commits, and a `CODEGEN_LOG.md` committed
+alongside the new page — is the durable record of what happened and why.
+The local SQLite database (`src/state/schema.mjs`) tracks campaign briefs,
+run status/logs, and staged draft file versions for the HTTP status API and
+UI while the service is alive; nothing in it is required to understand a
+merged PR after the fact.
 
 ## Why this is a separate project
 
@@ -69,6 +76,9 @@ POST /campaigns
 GET /campaigns              -> list of all runs (status, stage, PR url, ...)
 GET /campaigns/:runId       -> status, stage, branchName, prUrl, log tail
 GET /campaigns/:runId/log   -> full plain-text log
+GET /campaigns/:runId/draft -> latest staged draft version's file paths + content (404 before verify first passes)
+GET /campaigns/:runId/preview      -> active preview {kind, port, url, status, expiresAt} (404 if none)
+POST /campaigns/:runId/preview/stop -> stop the active preview now, instead of waiting for its idle timeout
 GET /healthz                -> unauthenticated liveness check
 ```
 
@@ -95,8 +105,24 @@ deterministic step the orchestrator runs itself, using the target repo's own
 
 Git/GitHub sequencing guarantees a PR is never opened for code that doesn't
 build: clone → branch (local only) → code → verify (retry once, else halt) →
-**only then** commit → push → open PR. Nothing is ever pushed to the base
-branch, and this service never calls the merge endpoint.
+stage draft → **preview** → **only then** commit → push → open PR. Nothing
+is ever pushed to the base branch, and this service never calls the merge
+endpoint.
+
+## Preview
+
+Once verify passes, a real server for the generated page starts automatically
+— `GET /campaigns/:runId/preview` for its URL, `POST .../preview/stop` to
+tear it down early. It runs inside a Docker container using the target
+repo's own `Dockerfile` (its declared Node version) when the repo has one
+and Docker is reachable; otherwise it falls back to spawning the repo's own
+serve script directly. Previews are torn down by an idle timeout
+(`PREVIEW_TTL_MS`, default 30 min), an explicit stop, or a soft cap on
+concurrent previews (`MAX_CONCURRENT_PREVIEWS`) evicting the oldest —
+whichever comes first, or on service restart (previews never resume across
+a process lifetime). Its scratch worktree isn't cleaned up until the
+preview itself is — that's the one exception to "commit/push/open_pr always
+runs right after verify passes."
 
 ## Testing — no real target repo needed for most of this
 

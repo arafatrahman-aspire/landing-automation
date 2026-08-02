@@ -18,6 +18,19 @@ import { TOOL_DEFINITIONS, createToolExecutor } from "./tools.mjs";
 
 const MAX_TOKENS = 8192;
 
+const FINISH_NUDGE =
+  "Every file in the file plan has now been written. Call finish_coding now with a short summary — do not create or rewrite any more files.";
+
+/* Once every declared manifest path has actually been written, keep nudging
+ * the model to call finish_coding immediately rather than relying purely on
+ * maxIterations as the only thing preventing pointless extra turns (e.g.
+ * rewriting an already-written file again) — this matters more, not less,
+ * on a large real repo where exploration alone can eat a big chunk of the
+ * iteration budget before any file gets written at all. */
+function allManifestFilesWritten(manifestPaths, writtenFiles) {
+  return Boolean(manifestPaths) && manifestPaths.size > 0 && [...manifestPaths].every((p) => writtenFiles.has(p));
+}
+
 /* ---------------- Claude (Anthropic Messages API, tool_use) ---------------- */
 
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
@@ -73,10 +86,11 @@ async function runClaudeCodingAgent({ workdir, allowedPrefixes, pristineFiles, m
     }
 
     messages.push({ role: "assistant", content: blocks });
-    messages.push({
-      role: "user",
-      content: results.map(({ block, result }) => ({ type: "tool_result", tool_use_id: block.id, content: JSON.stringify(result) })),
-    });
+    const toolResultContent = results.map(({ block, result }) => ({ type: "tool_result", tool_use_id: block.id, content: JSON.stringify(result) }));
+    if (allManifestFilesWritten(manifestPaths, executor.getWrittenFiles())) {
+      toolResultContent.push({ type: "text", text: FINISH_NUDGE });
+    }
+    messages.push({ role: "user", content: toolResultContent });
   }
 
   logger(`max iterations (${maxIterations}) reached without finish_coding`);
@@ -161,10 +175,11 @@ async function runGeminiCodingAgent({ workdir, allowedPrefixes, pristineFiles, m
     }
 
     contents.push({ role: "model", parts });
-    contents.push({
-      role: "user",
-      parts: results.map(({ call, result }) => ({ functionResponse: { name: call.name, response: result } })),
-    });
+    const functionResponseParts = results.map(({ call, result }) => ({ functionResponse: { name: call.name, response: result } }));
+    if (allManifestFilesWritten(manifestPaths, executor.getWrittenFiles())) {
+      functionResponseParts.push({ text: FINISH_NUDGE });
+    }
+    contents.push({ role: "user", parts: functionResponseParts });
   }
 
   logger(`max iterations (${maxIterations}) reached without finish_coding`);

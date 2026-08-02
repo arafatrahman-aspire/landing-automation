@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { has, findPackageJsonDir, detectPackageManager, INSTALL_CMD, RUN_SCRIPT_CMD } from "./package-manager.mjs";
+import { hasDocker, parseDockerBuildStage, verifyBuildInDocker } from "./docker-build.mjs";
 
 /* Deterministic, non-AI verification of whatever the coding agent wrote —
  * this IS the QA gate. The LLM never runs commands itself (ai/tools.mjs has
@@ -56,12 +57,27 @@ function truncateReport(text) {
  * @param {number} p.installTimeoutMs
  * @param {number} p.buildTimeoutMs
  * @param {string[]} [p.changedPaths] relative paths the agent created (used by the PHP gate)
+ * @param {string|null} [p.packageManagerOverride] see package-manager.mjs's detectPackageManager
+ * @param {boolean} [p.disableDocker] skip the Docker path even if the repo has a usable Dockerfile
  * @returns {Promise<{ok: boolean, report: string}>}
  */
-export async function verifyBuild({ workdir, installTimeoutMs, buildTimeoutMs, changedPaths = [] }) {
+export async function verifyBuild({
+  workdir,
+  installTimeoutMs,
+  buildTimeoutMs,
+  changedPaths = [],
+  packageManagerOverride = null,
+  disableDocker = false,
+}) {
   const pkgDir = await findPackageJsonDir(workdir);
   if (pkgDir) {
-    return verifyNode({ workdir: pkgDir, installTimeoutMs, buildTimeoutMs });
+    if (!disableDocker) {
+      const dockerStage = await parseDockerBuildStage(pkgDir);
+      if (dockerStage && (await hasDocker())) {
+        return verifyNodeInDocker({ pkgDir, dockerStage, installTimeoutMs, buildTimeoutMs });
+      }
+    }
+    return verifyNode({ workdir: pkgDir, installTimeoutMs, buildTimeoutMs, packageManagerOverride });
   }
   if (await has(workdir, "composer.json")) {
     return verifyPhp({ workdir, buildTimeoutMs, changedPaths });
@@ -78,7 +94,52 @@ export async function verifyBuild({ workdir, installTimeoutMs, buildTimeoutMs, c
 
 export { detectPackageManager };
 
-async function verifyNode({ workdir, installTimeoutMs, buildTimeoutMs }) {
+async function readPackageScripts(pkgDir) {
+  try {
+    const pkg = JSON.parse(await readFile(path.join(pkgDir, "package.json"), "utf8"));
+    return pkg.scripts ?? {};
+  } catch {
+    return null;
+  }
+}
+
+/** Reuses the target repo's OWN Dockerfile (its declared Node base image +
+ *  first-stage RUN commands, e.g. `npm install --force && npm run build`)
+ *  instead of guessing a package manager and install flags — see
+ *  docker-build.mjs for why. Runs an additional `npm run lint` inside the
+ *  same image afterward if package.json declares one and the Dockerfile
+ *  itself didn't already run it, so Docker-verified repos get the same
+ *  lint gate as host-verified ones. */
+async function verifyNodeInDocker({ pkgDir, dockerStage, installTimeoutMs, buildTimeoutMs }) {
+  const scripts = await readPackageScripts(pkgDir);
+  if (!scripts?.build) {
+    return {
+      ok: false,
+      report: `Target repo's package.json has no "build" script — this is a configuration problem, not something a code retry can fix.`,
+    };
+  }
+
+  const build = await verifyBuildInDocker({ workdir: pkgDir, ...dockerStage, installTimeoutMs, buildTimeoutMs });
+  if (!build.ok) return build;
+
+  const dockerfileAlreadyLints = dockerStage.commands.some((cmd) => /\bnpm\s+run\s+lint\b/.test(cmd));
+  if (scripts.lint && !dockerfileAlreadyLints) {
+    const lint = await verifyBuildInDocker({
+      workdir: pkgDir,
+      nodeImage: dockerStage.nodeImage,
+      commands: ["npm run lint"],
+      installTimeoutMs: 0,
+      buildTimeoutMs,
+    });
+    if (!lint.ok) {
+      return { ok: false, report: `${build.report}\n\nlint failed (gates the PR — target repo's own lint rules apply):\n${lint.report}` };
+    }
+  }
+
+  return { ok: true, report: `${build.report}${scripts.lint ? " (+ lint passed)" : ""}` };
+}
+
+async function verifyNode({ workdir, installTimeoutMs, buildTimeoutMs, packageManagerOverride = null }) {
   const pkgPath = path.join(workdir, "package.json");
   let pkg;
   try {
@@ -94,7 +155,7 @@ async function verifyNode({ workdir, installTimeoutMs, buildTimeoutMs }) {
     };
   }
 
-  const pm = await detectPackageManager(workdir);
+  const pm = await detectPackageManager(workdir, packageManagerOverride);
   const [installCmd, installArgs] = INSTALL_CMD[pm];
 
   const install = await runCommand(installCmd, installArgs, { cwd: workdir, timeoutMs: installTimeoutMs });

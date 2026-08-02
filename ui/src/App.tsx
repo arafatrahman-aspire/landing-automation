@@ -1,7 +1,11 @@
 import { useState } from "react";
-import { Link, Outlet } from "react-router-dom";
+import { NavLink, Outlet } from "react-router-dom";
 import { hasSecret, setSecret } from "./api";
 import "./App.css";
+
+function BrandMark() {
+  return <span className="brand-mark">CC</span>;
+}
 
 function SecretPrompt({ onSaved }: { onSaved: () => void }) {
   const [value, setValue] = useState("");
@@ -15,18 +19,26 @@ function SecretPrompt({ onSaved }: { onSaved: () => void }) {
 
   return (
     <div className="secret-gate">
-      <form onSubmit={submit} className="secret-form">
-        <h1>Campaign Codegen</h1>
-        <p>Enter the API shared secret (matches <code>API_SHARED_SECRET</code> in the server's <code>.env</code>).</p>
-        <input
-          type="password"
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          placeholder="Shared secret"
-          autoFocus
-        />
-        <button type="submit">Continue</button>
-      </form>
+      <div className="secret-card">
+        <div className="brand">
+          <BrandMark />
+          <h1>Campaign Codegen</h1>
+        </div>
+        <p>
+          Enter the API shared secret (matches <code>API_SHARED_SECRET</code> in the server's <code>.env</code>) to
+          continue.
+        </p>
+        <form onSubmit={submit} className="secret-form">
+          <input
+            type="password"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            placeholder="Shared secret"
+            autoFocus
+          />
+          <button type="submit">Continue</button>
+        </form>
+      </div>
     </div>
   );
 }
@@ -41,10 +53,17 @@ export default function App() {
   return (
     <div className="shell">
       <header className="topbar">
-        <Link to="/" className="brand">Campaign Codegen</Link>
+        <NavLink to="/" className="brand" end>
+          <BrandMark />
+          Campaign Codegen
+        </NavLink>
         <nav>
-          <Link to="/">Campaigns</Link>
-          <Link to="/new">New campaign</Link>
+          <NavLink to="/" end className={({ isActive }) => (isActive ? "active" : "")}>
+            Campaigns
+          </NavLink>
+          <NavLink to="/new" className={({ isActive }) => (isActive ? "active" : "")}>
+            New campaign
+          </NavLink>
         </nav>
       </header>
       <main className="content">

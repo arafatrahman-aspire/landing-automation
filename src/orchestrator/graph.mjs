@@ -1,40 +1,60 @@
 import { StateGraph, Annotation, START, END } from "@langchain/langgraph";
 import { config } from "../config.mjs";
 import * as steps from "./steps.mjs";
-import * as runStore from "../state/run-store.mjs";
+import * as runStore from "../state/repository.mjs";
 
 /* LangGraph state machine (mirrors the parent project's
  * scripts/campaign/lib/graph.mjs pattern — StateGraph + a single
  * "retry once, then halt, never proceed on a failed gate" conditional edge):
  *
- *   intake -> research -> clone -> generate_guide -> file_manifest -> code -> verify
- *                                                                  ▲       │
- *                                                                  └retry──┘ (codeAttempts < MAX_CODE_ATTEMPTS)
- *                                                                          │ pass
- *                                                              commit -> push -> open_pr -> END
+ *   intake -> research -> clone -> generate_guide -> classify_sections -> generate_sections -> verify
+ *                                                                                            ▲       │
+ *                                                                                            └retry──┘ (codeAttempts < MAX_CODE_ATTEMPTS)
+ *                                                                                                    │ pass
+ *                                                          stage_draft -> preview_build -> END (status: staged_for_review)
  *
- * `clone` happens BEFORE guide/file_manifest (not after, as you might expect)
- * because the target repo's actual stack isn't fixed — it could be Next.js,
- * Laravel, Vue, plain HTML, whatever — and guide/file_manifest need to see
- * the real repo (via a lightweight scan, steps.detectRepoConventions) to
- * choose real file extensions/conventions, instead of guessing blind and
- * having file_manifest lock in paths the coding agent then can't match.
+ * `clone` happens BEFORE guide (not after, as you might expect) because the
+ * target repo's actual stack isn't fixed — it could be Next.js, Laravel,
+ * Vue, plain HTML, whatever — and guide needs to see the real repo (via a
+ * lightweight scan, steps.detectRepoConventions) to choose real file
+ * extensions/conventions, instead of guessing blind.
  *
- * A verify failure that exhausts retries routes straight to END without
- * ever reaching commit/push/open_pr — no broken PR can ever be opened. */
+ * new_plan.md §9 (Hybrid Section Assembly) replaced the old single whole-page
+ * `file_manifest` -> `code` pair with `classify_sections` (pure, no LLM —
+ * sections/classify.mjs decides static vs. ai-required per section) ->
+ * `generate_sections` (the fan-out: static sections templated directly,
+ * each ai-required section its own independent coding-agent run, all
+ * concurrent — sections/generate-sections.mjs). Every file's path is now
+ * deterministic, so there's nothing left for an upfront file_manifest LLM
+ * call to plan. A verify retry re-enters at `generate_sections`, not
+ * `classify_sections` — mode/frameId don't change because a build broke.
+ *
+ * Phase 7 (new_plan.md §6/§9.9): commit/push/open_pr are NO LONGER graph
+ * nodes. The graph's only job is to get a verified, previewable draft
+ * staged — it now ends at `preview_build` either way (success or a verify
+ * failure that exhausts retries), and runCodegen() below sets the run's
+ * final status from `state.verifyPassed` alone, not from reaching a
+ * particular node. commit/push/open_pr moved to plain async functions
+ * (orchestrator/review-actions.mjs: approveRun/abandonRun), invoked by a
+ * SEPARATE, LATER API request once a human approves — this graph's
+ * in-process state is long gone by then (no checkpointer in v1), so
+ * approveRun reconstructs what it needs from run-store + the staged draft
+ * instead of from LangGraph state. Nothing reaches git until that happens:
+ * no commit, no branch, no push, ever, from this graph alone. */
 
 const CodegenState = Annotation.Root({
   runId: Annotation(),
   request: Annotation(), // validated brief (schemas/brief-schema.mjs)
   researchNotes: Annotation(),
   guide: Annotation(),
-  fileManifest: Annotation(), // validated (schemas/file-manifest-schema.mjs)
+  classifiedSections: Annotation(), // sections/classify.mjs output
+  sectionResults: Annotation(), // sections/generate-sections.mjs per-section results
   workdir: Annotation(),
+  baseDir: Annotation(),
   branchName: Annotation(),
   pristineFiles: Annotation(), // Set<string> — snapshot right after clone
   writtenByAgent: Annotation(),
   agentSummary: Annotation(),
-  agentIterations: Annotation(),
   codeFinished: Annotation(),
   verifyPassed: Annotation(),
   verifyReport: Annotation(),
@@ -43,11 +63,12 @@ const CodegenState = Annotation.Root({
   prUrl: Annotation(),
   prNumber: Annotation(),
   status: Annotation(),
+  previewStarted: Annotation(),
 });
 
 function routeAfterVerify(state) {
-  if (state.verifyPassed) return "commit";
-  if (state.codeAttempts < config.maxCodeAttempts) return "code";
+  if (state.verifyPassed) return "stage_draft";
+  if (state.codeAttempts < config.maxCodeAttempts) return "generate_sections";
   return END;
 }
 
@@ -58,50 +79,59 @@ export function createCodegenGraph() {
     .addNode("clone", steps.clone)
     // node can't share a name with the "guide" state channel
     .addNode("generate_guide", steps.guide)
-    .addNode("file_manifest", steps.fileManifest)
-    .addNode("code", steps.code)
+    .addNode("classify_sections", steps.classifySectionsStep)
+    .addNode("generate_sections", steps.generateSectionsStep)
     .addNode("verify", steps.verify)
-    .addNode("commit", steps.commit)
-    .addNode("push", steps.push)
-    .addNode("open_pr", steps.openPr)
+    .addNode("stage_draft", steps.stageDraft)
+    .addNode("preview_build", steps.previewBuild)
     .addEdge(START, "intake")
     .addEdge("intake", "research")
     .addEdge("research", "clone")
     .addEdge("clone", "generate_guide")
-    .addEdge("generate_guide", "file_manifest")
-    .addEdge("file_manifest", "code")
-    .addEdge("code", "verify")
+    .addEdge("generate_guide", "classify_sections")
+    .addEdge("classify_sections", "generate_sections")
+    .addEdge("generate_sections", "verify")
     .addConditionalEdges("verify", routeAfterVerify)
-    .addEdge("commit", "push")
-    .addEdge("push", "open_pr")
-    .addEdge("open_pr", END)
+    .addEdge("stage_draft", "preview_build")
+    .addEdge("preview_build", END)
     .compile();
 }
 
 // Node name -> the run-store status to record if an exception is thrown
 // while that node was active (heartbeat's `stage` field, set by every node
-// in steps.mjs, tells us which one was running).
+// in steps.mjs, tells us which one was running). committing/pushing/
+// opening_pr aren't reachable from THIS graph anymore (Phase 7) — they're
+// covered by review-actions.mjs's own try/catch instead.
 const STAGE_FAILURE_STATUS = {
   clone: "failed_clone",
-  code: "failed",
+  classify_sections: "failed",
+  generate_sections: "failed",
   verify: "failed_verification",
-  committing: "failed",
-  pushing: "failed_push",
-  opening_pr: "failed_push", // branch is already pushed at this point
+  stage_draft: "failed",
+  preview_build: "failed", // shouldn't fire — previewBuild() catches its own failures and never throws
 };
 
 /**
  * Runs the graph for one campaign request and guarantees the run-store
- * record ends in a terminal, informative status even for exceptions no
- * explicit halt path covers (e.g. an unexpected GitHub 500).
+ * record ends in an informative status even for exceptions no explicit halt
+ * path covers (e.g. an unexpected error mid-verify). The graph itself now
+ * always ends at `preview_build` on the success path or END directly on a
+ * retry-exhausted verify failure (Phase 7 — see the header comment above) —
+ * `state.verifyPassed` is what actually distinguishes those two, not which
+ * node was reached, since both paths reach END/return the same way.
  */
 export async function runCodegen(initialState) {
   const graph = createCodegenGraph();
   await runStore.updateRun(initialState.runId, { status: "running" });
   try {
     const final = await graph.invoke(initialState);
-    if (final.status !== "completed") {
-      // Reached END via the retry-exhausted path in routeAfterVerify, not open_pr
+    if (final.verifyPassed) {
+      // Success path: generate_sections -> verify(pass) -> stage_draft ->
+      // preview_build -> END. Nothing has been committed/pushed — the run
+      // now waits for a human (approveRun/abandonRun in review-actions.mjs).
+      await runStore.updateRun(initialState.runId, { status: "staged_for_review" });
+    } else {
+      // Reached END via the retry-exhausted path in routeAfterVerify.
       await runStore.updateRun(initialState.runId, {
         status: "failed_verification",
         error: final.verifyReport ?? "Verification failed and retries were exhausted.",

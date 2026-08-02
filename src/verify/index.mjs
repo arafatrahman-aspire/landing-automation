@@ -20,6 +20,8 @@ import { checkAccessibility } from "./a11y-lint.mjs";
  * @param {string[]} [p.changedPaths]
  * @param {string|null} [p.pageUrlPath] - e.g. "/campaigns/spring-sale" (already slug-resolved)
  * @param {number} [p.serverTimeoutMs]
+ * @param {string|null} [p.packageManagerOverride] see package-manager.mjs's detectPackageManager
+ * @param {boolean} [p.disableDocker] skip the Docker-based build path even if usable — see build.mjs
  * @returns {Promise<{ok: boolean, report: string, checks: {build: boolean, hero: boolean|null, seo: boolean|null, a11y: boolean|null}}>}
  */
 export async function runFullVerifySuite({
@@ -29,8 +31,10 @@ export async function runFullVerifySuite({
   changedPaths = [],
   pageUrlPath = null,
   serverTimeoutMs = 30_000,
+  packageManagerOverride = null,
+  disableDocker = false,
 }) {
-  const base = await verifyBuild({ workdir, installTimeoutMs, buildTimeoutMs, changedPaths });
+  const base = await verifyBuild({ workdir, installTimeoutMs, buildTimeoutMs, changedPaths, packageManagerOverride, disableDocker });
   if (!base.ok) {
     return { ok: false, report: base.report, checks: { build: false, hero: null, seo: null, a11y: null } };
   }
@@ -45,7 +49,7 @@ export async function runFullVerifySuite({
     };
   }
 
-  const server = await startEphemeral({ workdir: pkgDir, timeoutMs: serverTimeoutMs });
+  const server = await startEphemeral({ workdir: pkgDir, timeoutMs: serverTimeoutMs, packageManagerOverride });
   if (!server.ok) {
     return {
       ok: false,

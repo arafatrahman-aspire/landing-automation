@@ -41,6 +41,37 @@ export async function cloneShallow({ remoteUrl, branch, dir, token, timeoutMs })
   await runGit(["clone", "--depth", "1", "--branch", branch, url, dir], { timeoutMs });
 }
 
+/** Brings an existing persistent base clone's local base-branch ref up to
+ *  date with origin, without re-cloning. Safe to call every run — worktrees
+ *  already checked out on their own per-run branches are untouched by this. */
+export async function syncBaseToLatest({ dir, branch, timeoutMs = 60_000 }) {
+  await runGit(["-C", dir, "fetch", "--depth", "1", "origin", branch], { cwd: dir, timeoutMs });
+  await runGit(["-C", dir, "checkout", branch], { cwd: dir });
+  await runGit(["-C", dir, "reset", "--hard", `origin/${branch}`], { cwd: dir });
+}
+
+/** Creates a new per-run working directory as a git worktree off the shared
+ *  base clone's object store — no network clone, just a new branch + checkout.
+ *  This is what lets repeated runs reuse an already-cloned repo instead of
+ *  cloning it fresh every time. */
+export async function addWorktree({ baseDir, workdir, branchName, baseBranch }) {
+  if (branchName === baseBranch) {
+    throw new Error(`Refusing to create a branch named the same as the base branch ("${baseBranch}")`);
+  }
+  await runGit(["-C", baseDir, "worktree", "add", "-b", branchName, workdir, baseBranch], { cwd: baseDir });
+}
+
+/** Tears down a per-run worktree + its local branch. Best-effort by design —
+ *  called during cleanup paths where a half-removed workdir shouldn't block
+ *  the rest of the flow. */
+export async function removeWorktree({ baseDir, workdir, branchName }) {
+  await runGit(["-C", baseDir, "worktree", "remove", "--force", workdir], { cwd: baseDir }).catch(() => {});
+  await runGit(["-C", baseDir, "worktree", "prune"], { cwd: baseDir }).catch(() => {});
+  if (branchName) {
+    await runGit(["-C", baseDir, "branch", "-D", branchName], { cwd: baseDir }).catch(() => {});
+  }
+}
+
 export async function listTrackedFiles({ dir }) {
   const { stdout } = await runGit(["-C", dir, "ls-files"], { cwd: dir });
   return new Set(stdout.split("\n").map((l) => l.trim()).filter(Boolean));

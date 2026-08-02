@@ -1,6 +1,26 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
-import { getRun, getRunLog, deleteCampaign, type RunSummary } from "../api";
+import {
+  getRun,
+  getRunLog,
+  getRunDraft,
+  getPreview,
+  stopPreview,
+  deleteCampaign,
+  approveCampaign,
+  abandonCampaign,
+  getSections,
+  refineSection,
+  type RunSummary,
+  type Draft,
+  type Preview,
+  type SectionSummary,
+  type RefineAction,
+} from "../api";
+
+// Must stay in sync with src/design/schema.mjs's SECTION_TYPES — duplicated
+// here since the UI can't import a backend .mjs module directly.
+const SECTION_TYPES = ["hero", "details", "timeline", "testimonials", "faq", "curriculum", "pricing", "instructor", "footer-cta"];
 
 const TERMINAL = new Set([
   "completed",
@@ -12,11 +32,417 @@ const TERMINAL = new Set([
   "abandoned",
 ]);
 
+const STATUS_CLASS: Record<string, string> = {
+  completed: "status-ok",
+  failed: "status-bad",
+  failed_clone: "status-bad",
+  failed_verification: "status-bad",
+  failed_push: "status-bad",
+  failed_push_incomplete: "status-warn",
+  abandoned: "status-warn",
+  staged_for_review: "status-warn",
+};
+
+const STAGES: { key: string; label: string }[] = [
+  { key: "intake", label: "Intake" },
+  { key: "research", label: "Research" },
+  { key: "clone", label: "Clone" },
+  { key: "guide", label: "Plan" },
+  { key: "classify_sections", label: "Classify" },
+  { key: "generate_sections", label: "Generate" },
+  { key: "verify", label: "Verify" },
+  { key: "stage_draft", label: "Stage" },
+  { key: "preview_build", label: "Preview" },
+  { key: "committing", label: "Commit" },
+  { key: "pushing", label: "Push" },
+  { key: "opening_pr", label: "Open PR" },
+];
+
+function statusLabel(status: string): string {
+  return status.replaceAll("_", " ");
+}
+
+function Stepper({ run }: { run: RunSummary }) {
+  const currentIndex = STAGES.findIndex((s) => s.key === run.stage);
+  const isTerminal = TERMINAL.has(run.status);
+  const isFailure = isTerminal && run.status !== "completed";
+
+  return (
+    <ol className="stepper">
+      {STAGES.map((s, i) => {
+        let cls = "";
+        if (run.status === "completed") cls = "done";
+        else if (isFailure && i === currentIndex) cls = "failed";
+        else if (i < currentIndex || (isFailure && i < currentIndex)) cls = "done";
+        else if (!isTerminal && i === currentIndex) cls = "current";
+        return (
+          <li key={s.key} className={`stepper-step ${cls}`}>
+            <span className="stepper-dot">{cls === "done" ? "✓" : cls === "failed" ? "!" : ""}</span>
+            {s.label}
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+function timeUntil(iso: string): string {
+  const ms = new Date(iso).getTime() - Date.now();
+  if (ms <= 0) return "expired";
+  const mins = Math.round(ms / 60_000);
+  if (mins < 1) return "<1m";
+  if (mins < 60) return `${mins}m`;
+  return `${Math.round(mins / 60)}h ${mins % 60}m`;
+}
+
+function PreviewPanel({ runId, preview, onStopped }: { runId: string; preview: Preview; onStopped: () => void }) {
+  const [stopping, setStopping] = useState(false);
+
+  async function handleStop() {
+    setStopping(true);
+    try {
+      await stopPreview(runId);
+      onStopped();
+    } finally {
+      setStopping(false);
+    }
+  }
+
+  const isRunning = preview.status === "running";
+
+  return (
+    <div className="section-block card">
+      <div className="card-header">
+        <h3>Preview</h3>
+        <span className={`status-pill ${isRunning ? "status-live" : "status-warn"}`}>{preview.status}</span>
+      </div>
+      <div className="card-body">
+        <dl className="plan-meta" style={{ marginBottom: isRunning ? 16 : 0 }}>
+          <dt>URL</dt>
+          <dd>
+            <a href={preview.url} target="_blank" rel="noreferrer">
+              {preview.url}
+            </a>
+          </dd>
+          <dt>Runs via</dt>
+          <dd>{preview.kind === "docker" ? "Docker (repo's own Dockerfile)" : "host process"}</dd>
+          {isRunning && (
+            <>
+              <dt>Expires in</dt>
+              <dd>{timeUntil(preview.expiresAt)}</dd>
+            </>
+          )}
+        </dl>
+        {isRunning && (
+          <div className="form-actions">
+            <a href={preview.url} target="_blank" rel="noreferrer" className="button button-secondary">
+              Open in new tab
+            </a>
+            <button type="button" className="button-ghost" disabled={stopping} onClick={handleStop}>
+              {stopping ? "stopping…" : "Stop preview"}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Phase 9 / module.md Module 4 (new_plan.md §9.7) — per-section
+ *  refinement IS the review step. Scoped to exactly one slot: never
+ *  touches the original frame file or any other section's rows. */
+function RefineModal({
+  runId,
+  section,
+  onClose,
+  onRefined,
+}: {
+  runId: string;
+  section: SectionSummary;
+  onClose: () => void;
+  onRefined: () => void;
+}) {
+  const [pendingAction, setPendingAction] = useState<RefineAction | null>(null);
+  const [frameId, setFrameId] = useState(section.frameId ?? section.candidates[0]?.id ?? "");
+  const [instructions, setInstructions] = useState("");
+  const [newType, setNewType] = useState(SECTION_TYPES.find((t) => t !== section.type && t !== "hero") ?? "details");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(action: RefineAction) {
+    setBusy(true);
+    setError(null);
+    try {
+      const params =
+        action === "use-different-frame"
+          ? { frameId }
+          : action === "new"
+            ? { sectionType: newType, instructions: instructions.trim() || undefined }
+            : { instructions: instructions.trim() || undefined };
+      await refineSection(runId, section.slot, action, params);
+      onRefined();
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal card" onClick={(e) => e.stopPropagation()}>
+        <div className="card-header">
+          <h3>
+            Refine <code>{section.type}</code>
+          </h3>
+          <button type="button" className="button-ghost" onClick={onClose} disabled={busy}>
+            Close
+          </button>
+        </div>
+        <div className="card-body">
+          <p className="empty" style={{ marginTop: 0 }}>
+            Slot <code>{section.slot}</code> — currently {section.mode}
+            {section.frameId ? ` (${section.frameId})` : ""}. Every action here replaces only this section — the rest of
+            the page is untouched — then re-verifies the whole assembled page before refreshing the preview.
+          </p>
+          {error && <div className="error">{error}</div>}
+
+          {!pendingAction && (
+            <div className="form-actions" style={{ flexWrap: "wrap" }}>
+              {section.mode === "static" && section.candidates.length > 0 && (
+                <button type="button" className="button-secondary" onClick={() => setPendingAction("use-different-frame")}>
+                  Use a different frame
+                </button>
+              )}
+              {section.mode === "static" && (
+                <button type="button" className="button-secondary" onClick={() => setPendingAction("redesign")}>
+                  Redesign with AI
+                </button>
+              )}
+              {section.mode === "ai-required" && (
+                <button type="button" className="button-secondary" onClick={() => setPendingAction("modify")}>
+                  Modify with AI
+                </button>
+              )}
+              <button type="button" className="button-secondary" onClick={() => setPendingAction("new")}>
+                Change section type
+              </button>
+            </div>
+          )}
+
+          {pendingAction === "use-different-frame" && (
+            <div className="form-section">
+              <label>
+                Frame
+                <select value={frameId} onChange={(e) => setFrameId(e.target.value)}>
+                  {section.candidates.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.id} — {c.description}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="form-actions">
+                <button type="button" className="button" disabled={busy} onClick={() => submit("use-different-frame")}>
+                  {busy ? "applying…" : "Apply"}
+                </button>
+                <button type="button" className="button-ghost" disabled={busy} onClick={() => setPendingAction(null)}>
+                  Back
+                </button>
+              </div>
+            </div>
+          )}
+
+          {(pendingAction === "modify" || pendingAction === "redesign") && (
+            <div className="form-section">
+              <label>
+                Instructions <span className="optional">(what should change)</span>
+                <textarea value={instructions} onChange={(e) => setInstructions(e.target.value)} rows={3} />
+              </label>
+              <div className="form-actions">
+                <button type="button" className="button" disabled={busy} onClick={() => submit(pendingAction)}>
+                  {busy ? "generating…" : "Apply"}
+                </button>
+                <button type="button" className="button-ghost" disabled={busy} onClick={() => setPendingAction(null)}>
+                  Back
+                </button>
+              </div>
+            </div>
+          )}
+
+          {pendingAction === "new" && (
+            <div className="form-section">
+              <label>
+                New section type
+                <select value={newType} onChange={(e) => setNewType(e.target.value)}>
+                  {SECTION_TYPES.filter((t) => t !== "hero").map((t) => (
+                    <option key={t} value={t}>
+                      {t}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Instructions <span className="optional">(optional, only used if this type needs AI generation)</span>
+                <textarea value={instructions} onChange={(e) => setInstructions(e.target.value)} rows={3} />
+              </label>
+              <div className="form-actions">
+                <button type="button" className="button" disabled={busy} onClick={() => submit("new")}>
+                  {busy ? "applying…" : "Apply"}
+                </button>
+                <button type="button" className="button-ghost" disabled={busy} onClick={() => setPendingAction(null)}>
+                  Back
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** The gallery — every section is a row you can open a scoped refine modal
+ *  from. Only meaningful during review (status === "staged_for_review");
+ *  the backend rejects a refine attempt outside that status anyway. */
+function SectionsPanel({ runId, onRefined }: { runId: string; onRefined: () => void }) {
+  const [sections, setSections] = useState<SectionSummary[] | null>(null);
+  const [openSlot, setOpenSlot] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function load() {
+    try {
+      setSections(await getSections(runId));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runId]);
+
+  if (error) return <div className="error">{error}</div>;
+  if (!sections || sections.length === 0) return null;
+
+  const openSection = sections.find((s) => s.slot === openSlot) ?? null;
+
+  return (
+    <div className="section-block card">
+      <div className="card-header">
+        <h3>Sections</h3>
+      </div>
+      <div className="card-body">
+        <ul className="ref-file-list">
+          {sections.map((s) => (
+            <li key={s.slot}>
+              <code>{s.type}</code> — {s.mode}
+              {s.frameId ? ` (${s.frameId})` : ""}
+              <button type="button" className="button-ghost" style={{ marginLeft: 12 }} onClick={() => setOpenSlot(s.slot)}>
+                Refine
+              </button>
+            </li>
+          ))}
+        </ul>
+      </div>
+      {openSection && (
+        <RefineModal
+          runId={runId}
+          section={openSection}
+          onClose={() => setOpenSlot(null)}
+          onRefined={() => {
+            load();
+            onRefined();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Phase 7 — the human approval gate. Only rendered while
+ *  status === "staged_for_review"; nothing this service generates reaches
+ *  git before Approve is clicked. */
+function ReviewPanel({ runId, onDecided }: { runId: string; onDecided: () => void }) {
+  const [busy, setBusy] = useState<"approve" | "abandon" | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  async function handleApprove() {
+    if (!confirm("Approve this campaign? This commits the staged files, pushes a branch, and opens a pull request.")) return;
+    setBusy("approve");
+    setActionError(null);
+    try {
+      await approveCampaign(runId);
+      onDecided();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleAbandon() {
+    if (!confirm("Abandon this campaign? Nothing gets committed or pushed — this just ends the run.")) return;
+    setBusy("abandon");
+    setActionError(null);
+    try {
+      await abandonCampaign(runId);
+      onDecided();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="section-block card">
+      <div className="card-header">
+        <h3>Review</h3>
+        <span className="status-pill status-warn">awaiting your decision</span>
+      </div>
+      <div className="card-body">
+        <p style={{ marginTop: 0 }}>
+          Verification passed and a preview is staged above. Nothing has been committed or pushed yet — approve to open a
+          pull request, or abandon to end this run without touching git.
+        </p>
+        {actionError && (
+          <div className="error" style={{ marginBottom: 16 }}>
+            {actionError}
+          </div>
+        )}
+        <div className="form-actions">
+          <button type="button" className="button" disabled={busy !== null} onClick={handleApprove}>
+            {busy === "approve" ? "approving…" : "Approve & open PR"}
+          </button>
+          <button type="button" className="button-ghost" disabled={busy !== null} onClick={handleAbandon}>
+            {busy === "abandon" ? "abandoning…" : "Abandon"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CheckBadge({ label, value }: { label: string; value: boolean | null }) {
+  const cls = value === null ? "badge-skipped" : value ? "badge-pass" : "badge-fail";
+  const text = value === null ? "skipped" : value ? "pass" : "fail";
+  return (
+    <span className={`check-badge ${cls}`}>
+      {label}: {text}
+    </span>
+  );
+}
+
 export default function RunDetailPage() {
   const { runId } = useParams<{ runId: string }>();
   const navigate = useNavigate();
   const [run, setRun] = useState<RunSummary | null>(null);
   const [log, setLog] = useState("");
+  const [draft, setDraft] = useState<Draft | null>(null);
+  const [preview, setPreview] = useState<Preview | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const logRef = useRef<HTMLPreElement>(null);
@@ -28,11 +454,23 @@ export default function RunDetailPage() {
 
     async function poll() {
       try {
-        const [runData, logData] = await Promise.all([getRun(runId!), getRunLog(runId!)]);
+        const [runData, logData, draftData, previewData] = await Promise.all([
+          getRun(runId!),
+          getRunLog(runId!),
+          getRunDraft(runId!),
+          getPreview(runId!),
+        ]);
         if (cancelled) return;
         setRun(runData);
         setLog(logData);
-        if (!TERMINAL.has(runData.status)) {
+        setDraft(draftData);
+        setPreview(previewData);
+        // A preview can still be alive well after the run itself finishes
+        // (that's the point) — keep polling until both the run AND any
+        // preview are done, not just the run.
+        const runActive = !TERMINAL.has(runData.status);
+        const previewActive = previewData?.status === "running";
+        if (runActive || previewActive) {
           timer = setTimeout(poll, 2000);
         }
       } catch (err) {
@@ -50,8 +488,33 @@ export default function RunDetailPage() {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
   }, [log]);
 
+  async function refetchRun() {
+    if (!runId) return;
+    try {
+      setRun(await getRun(runId));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // A refine action re-stages the draft and restarts the preview — refresh
+  // everything that could have changed, not just the run status, so the
+  // reviewer sees the new content immediately instead of waiting for the
+  // next 2s poll tick.
+  async function refetchAfterRefine() {
+    if (!runId) return;
+    try {
+      const [runData, draftData, previewData] = await Promise.all([getRun(runId), getRunDraft(runId), getPreview(runId)]);
+      setRun(runData);
+      setDraft(draftData);
+      setPreview(previewData);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   if (error) return <p className="error">{error}</p>;
-  if (!run) return <p>Loading…</p>;
+  if (!run) return <p className="empty">Loading…</p>;
 
   const isTerminal = TERMINAL.has(run.status);
 
@@ -71,34 +534,45 @@ export default function RunDetailPage() {
 
   return (
     <div>
-      <div className="page-header">
+      <p style={{ marginBottom: 16 }}>
         <Link to="/">&larr; Campaigns</Link>
-        {isTerminal && (
-          <button type="button" className="danger-link" disabled={deleting} onClick={handleDelete}>
-            {deleting ? "deleting…" : "Delete campaign"}
-          </button>
-        )}
-      </div>
-      <h2>{run.campaignName ?? run.slug}</h2>
-      <div className="run-meta">
-        <div>
-          <strong>Status:</strong> {run.status}
+      </p>
+
+      <div className="card run-header-card">
+        <div className="run-title-row">
+          <div>
+            <h2>{run.campaignName ?? run.slug}</h2>
+            <span className="run-slug">
+              <code>{run.slug}</code>
+            </span>
+          </div>
+          {isTerminal && (
+            <button type="button" className="danger-link" disabled={deleting} onClick={handleDelete}>
+              {deleting ? "deleting…" : "Delete campaign"}
+            </button>
+          )}
         </div>
-        <div>
-          <strong>Stage:</strong> {run.stage ?? "—"}
+
+        <div className="run-meta">
+          <span className={`status-pill ${STATUS_CLASS[run.status] ?? "status-live"}`}>{statusLabel(run.status)}</span>
+          {!isTerminal && <span className="live-indicator">updating…</span>}
         </div>
-        {!isTerminal && <div className="live-indicator">● updating…</div>}
+
+        <Stepper run={run} />
       </div>
 
       {run.status === "completed" && (
         <div className="pr-banner">
           {run.prUrl ? (
             <p>
-              PR opened: <a href={run.prUrl} target="_blank" rel="noreferrer">{run.prUrl}</a>
+              PR opened:{" "}
+              <a href={run.prUrl} target="_blank" rel="noreferrer">
+                {run.prUrl}
+              </a>
             </p>
           ) : (
             <p>
-              Dry run completed — branch <code>{run.branchName}</code> was pushed locally (no real PR opened,
+              Dry run completed — branch <code>{run.branchName}</code> was pushed locally (no real PR opened,{" "}
               <code>DRY_RUN_NO_PR=true</code>).
             </p>
           )}
@@ -111,8 +585,8 @@ export default function RunDetailPage() {
       )}
 
       {run.verifyChecks && (
-        <div className="verify-panel">
-          <h3>Verify {run.verifyAttempts ? `(attempt ${run.verifyAttempts})` : ""}</h3>
+        <div className="section-block">
+          <h3>Verify {run.verifyAttempts ? `— attempt ${run.verifyAttempts}` : ""}</h3>
           <div className="check-badges">
             <CheckBadge label="Build/lint" value={run.verifyChecks.build} />
             <CheckBadge label="Hero fit" value={run.verifyChecks.hero} />
@@ -123,70 +597,96 @@ export default function RunDetailPage() {
       )}
 
       {run.guide && (
-        <div className="plan-panel">
-          <h3>Plan</h3>
-          <dl className="plan-meta">
-            <dt>Hero title</dt>
-            <dd>{run.guide.heroTitle}</dd>
-            <dt>Hero video</dt>
-            <dd>{run.guide.heroHasVideo ? "yes — video embed" : "no — details summary instead"}</dd>
-            <dt>SEO title</dt>
-            <dd>{run.guide.seoTitle}</dd>
-            <dt>Meta description</dt>
-            <dd>{run.guide.seoMetaDescription}</dd>
-          </dl>
-          <table className="section-table">
-            <thead>
-              <tr>
-                <th>Section</th>
-                <th>Summary</th>
-                <th>Reference files</th>
-              </tr>
-            </thead>
-            <tbody>
-              {run.guide.sections.map((section) => {
-                const ref = run.sectionReferences?.find((r) => r.sectionType === section.type);
-                return (
-                  <tr key={section.type}>
-                    <td>
-                      <code>{section.type}</code>
-                    </td>
-                    <td>{section.summary}</td>
-                    <td>
-                      {ref ? (
-                        <ul className="ref-file-list">
-                          {ref.files.map((f) => (
-                            <li key={f.path} className={f.found ? "ref-found" : "ref-missing"}>
-                              {f.found ? "✓" : "✗"} <code>{f.path}</code>
-                            </li>
-                          ))}
-                        </ul>
-                      ) : (
-                        <span className="empty">(not yet resolved)</span>
-                      )}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+        <div className="section-block card">
+          <div className="card-header">
+            <h3>Plan</h3>
+          </div>
+          <div className="card-body">
+            <dl className="plan-meta">
+              <dt>Hero title</dt>
+              <dd>{run.guide.heroTitle}</dd>
+              <dt>Hero video</dt>
+              <dd>{run.guide.heroHasVideo ? "yes — video embed" : "no — details summary instead"}</dd>
+              <dt>SEO title</dt>
+              <dd>{run.guide.seoTitle}</dd>
+              <dt>Meta description</dt>
+              <dd>{run.guide.seoMetaDescription}</dd>
+            </dl>
+            <table className="section-table">
+              <thead>
+                <tr>
+                  <th>Section</th>
+                  <th>Summary</th>
+                  <th>Reference files</th>
+                </tr>
+              </thead>
+              <tbody>
+                {run.guide.sections.map((section) => {
+                  const ref = run.sectionReferences?.find((r) => r.sectionType === section.type);
+                  return (
+                    <tr key={section.type}>
+                      <td>
+                        <code>{section.type}</code>
+                      </td>
+                      <td>{section.summary}</td>
+                      <td>
+                        {ref ? (
+                          <ul className="ref-file-list">
+                            {ref.files.map((f) => (
+                              <li key={f.path} className={f.found ? "ref-found" : "ref-missing"}>
+                                {f.found ? "✓" : "✗"} <code>{f.path}</code>
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <span className="empty">(not yet resolved)</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 
-      <h3>Log</h3>
-      <pre className="log-tail" ref={logRef}>
-        {log || "(no log yet)"}
-      </pre>
-    </div>
-  );
-}
+      {preview && (
+        <PreviewPanel
+          runId={run.runId}
+          preview={preview}
+          onStopped={() => setPreview((p) => (p ? { ...p, status: "stopped" } : p))}
+        />
+      )}
 
-function CheckBadge({ label, value }: { label: string; value: boolean | null }) {
-  const cls = value === null ? "badge-skipped" : value ? "badge-pass" : "badge-fail";
-  const text = value === null ? "skipped" : value ? "pass" : "fail";
-  return (
-    <span className={`check-badge ${cls}`}>
-      {label}: {text}
-    </span>
+      {run.status === "staged_for_review" && <SectionsPanel runId={run.runId} onRefined={refetchAfterRefine} />}
+
+      {run.status === "staged_for_review" && <ReviewPanel runId={run.runId} onDecided={refetchRun} />}
+
+      {draft && (
+        <div className="section-block card">
+          <div className="card-header">
+            <h3>Files</h3>
+            <span className="empty">version {draft.version}</span>
+          </div>
+          <div className="card-body">
+            <ul className="ref-file-list">
+              {draft.files.map((f) => (
+                <li key={f.path}>
+                  <code>{f.path}</code> <span className="empty">({f.content.length.toLocaleString()} chars)</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
+
+      <div className="section-block">
+        <h3>Log</h3>
+        <pre className="log-tail" ref={logRef}>
+          {log || "(no log yet)"}
+        </pre>
+      </div>
+    </div>
   );
 }

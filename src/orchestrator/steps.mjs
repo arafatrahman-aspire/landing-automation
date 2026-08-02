@@ -1,23 +1,29 @@
 import path from "node:path";
-import { rm, mkdir, writeFile, readFile, readdir, access } from "node:fs/promises";
+import { mkdir, writeFile, readFile, readdir, access } from "node:fs/promises";
 import { config, resolveAllowlist } from "../config.mjs";
-import * as runStore from "../state/run-store.mjs";
+import * as runStore from "../state/repository.mjs";
+import * as draftStore from "../staging/draft-store.mjs";
 import { generateText, extractJson } from "../ai/text.mjs";
 import { runCodingAgent } from "../ai/coding-agent.mjs";
 import {
   cloneShallow,
+  syncBaseToLatest,
+  addWorktree,
+  removeWorktree,
   listTrackedFiles,
-  createLocalBranch,
   setRemoteAuth,
   commitPaths,
   push as gitPush,
 } from "../git/ops.mjs";
 import { runFullVerifySuite } from "../verify/index.mjs";
+import { startPreview } from "../preview/sandbox.mjs";
 import { createPullRequest } from "../github/api.mjs";
-import { validateFileManifest } from "../schemas/file-manifest-schema.mjs";
 import { validateGuide, truncateGuideFields } from "../schemas/guide-schema.mjs";
 import { SECTION_TYPES } from "../design/schema.mjs";
 import { resolveSectionReferences, formatReferencesForPrompt } from "../design/resolve.mjs";
+import { classifySections } from "../sections/classify.mjs";
+import { generateSections } from "../sections/generate-sections.mjs";
+import { PREVIEW_LEAD_SINK_PATH } from "../leadform/contract.mjs";
 
 /* Pure-ish stage functions the LangGraph nodes call (orchestrator/graph.mjs).
  * Each takes/returns a partial CodegenState for LangGraph's internal flow
@@ -172,169 +178,211 @@ Rules — STRICT length limits, every field is required, do not exceed them:
   return { guide: result.value };
 }
 
-export async function fileManifest(state, { attempt = 1 } = {}) {
-  await runStore.heartbeat(state.runId, "file_manifest");
-  await log(state.runId, `file_manifest: generating (attempt ${attempt})`);
-  const { request, guide: guideData } = state;
-  const allowlist = resolveAllowlist(config.writePathAllowlistTemplates, request.slug);
-  const repoConventions = await detectRepoConventions(state.workdir);
-  const chosenSections = guideData.sections.map((s) => s.type);
+/* Section classification (new_plan.md §9.2, module.md Module 2). Pure
+ * decision over the guide's already-chosen section list — no LLM call.
+ * Runs once; a verify-failure retry re-runs generateSectionsStep, not this
+ * (mode/frameId don't change because a build broke). Replaces the old
+ * file_manifest LLM-planning step: every file's path is now deterministic
+ * (sections/classify.mjs + sections/generate-sections.mjs's path
+ * convention) instead of guessed by an LLM call. */
+export async function classifySectionsStep(state) {
+  await runStore.heartbeat(state.runId, "classify_sections");
+  const classified = classifySections(state.guide.sections, { aiRequiredSections: state.request.aiRequiredSections ?? [] });
+  const staticCount = classified.filter((s) => s.mode === "static").length;
+  const aiCount = classified.length - staticCount;
+  await log(state.runId, `classify_sections: ${staticCount} static, ${aiCount} ai-required — ${classified.map((s) => `${s.type}:${s.mode}`).join(", ")}`);
+
+  // Persisted (not just in-process LangGraph state) so GET /campaigns/:runId
+  // can show a human which reference files actually grounded the guide's
+  // section choices — same behavior the old file_manifest step used to
+  // provide, just moved here since this is now its natural successor.
+  const chosenSections = state.guide.sections.map((s) => s.type);
   const resolved = await resolveSectionReferences({ workdir: state.workdir, sectionTypes: chosenSections });
-
-  if (attempt === 1) {
-    // Persisted (not just in-process LangGraph state) so GET /campaigns/:runId
-    // can show a human which reference files actually grounded this plan.
-    await runStore.updateRun(state.runId, {
-      sectionReferences: resolved.map((r) => ({
-        sectionType: r.sectionType,
-        note: r.note,
-        files: r.files.map((f) => ({ path: f.path, found: f.content !== null })),
-      })),
-    });
-  }
-
-  const text = await generateText({
-    system: "You plan file structures for a coding agent. Return ONLY a fenced ```json block, no prose outside it.",
-    prompt: `Given this content/section plan, declare which NEW frontend files should be created for this campaign's self-contained landing page.
-
-Plan:
-${JSON.stringify(guideData, null, 2)}
-
-Target repo:
-${repoConventions}
-
-Section reference examples (real code from this repo, where available):
-${formatReferencesForPrompt(resolved)}
-
-Rules:
-- Every path MUST start with one of these allowed prefixes: ${allowlist.join(" or ")}
-- File types/extensions MUST match whatever this specific target repo actually uses — do not assume a framework. It could be React/Next.js (.tsx/.jsx), Vue (.vue), a Laravel app (.blade.php templates, PHP is only used for markup/logic that stays inside the new files), or plain HTML/CSS. Look at the target repo notes and reference examples above.
-- Propose 2-8 files (a page/route entry plus its section components/partials). Do NOT reference or modify any existing file.
-- Output ONLY this JSON shape in a \`\`\`json fence:
-{"slug": "${request.slug}", "summary": "...", "designNotes": "...", "filesToCreate": [{"path": "...", "purpose": "..."}]}`,
+  await runStore.updateRun(state.runId, {
+    sectionReferences: resolved.map((r) => ({
+      sectionType: r.sectionType,
+      note: r.note,
+      files: r.files.map((f) => ({ path: f.path, found: f.content !== null })),
+    })),
   });
 
-  let parsed;
-  try {
-    parsed = extractJson(text);
-  } catch (err) {
-    if (attempt < 2) {
-      await log(state.runId, `file_manifest: JSON parse failed, retrying — ${err.message}`);
-      return fileManifest(state, { attempt: attempt + 1 });
-    }
-    throw new Error(`file_manifest: could not parse JSON after retry — ${err.message}`);
-  }
+  return { classifiedSections: classified };
+}
 
-  const result = validateFileManifest(parsed);
-  if (!result.ok) {
-    if (attempt < 2) {
-      await log(state.runId, `file_manifest: schema invalid, retrying — ${result.errors}`);
-      return fileManifest(state, { attempt: attempt + 1 });
-    }
-    throw new Error(`file_manifest: schema invalid after retry —\n${result.errors}`);
-  }
-
-  const outsideAllowlist = result.value.filesToCreate.filter(
-    (f) => !allowlist.some((p) => f.path.startsWith(p))
-  );
-  if (outsideAllowlist.length > 0) {
-    if (attempt < 2) {
-      await log(state.runId, `file_manifest: ${outsideAllowlist.length} path(s) outside allowlist, retrying`);
-      return fileManifest(state, { attempt: attempt + 1 });
-    }
-    throw new Error(
-      `file_manifest: paths outside allowlist after retry: ${outsideAllowlist.map((f) => f.path).join(", ")}`
-    );
-  }
-
-  await log(state.runId, `file_manifest: ${result.value.filesToCreate.length} file(s) planned`);
-  return { fileManifest: result.value };
+/* A fresh network clone every run is slow and wasteful — instead, a single
+ * persistent "base" clone lives at WORKDIR_ROOT/_base (created once), kept up
+ * to date with a cheap shallow fetch+reset before each run, and each run gets
+ * its own isolated working directory via `git worktree add` — a new branch
+ * checked out into its own folder, sharing the base clone's object store
+ * instead of re-downloading the whole repo. Cleanup removes the worktree
+ * (and its local branch) but never touches the base clone itself.
+ *
+ * All runs share one `_base` checkout now (they didn't when each run got its
+ * own fresh clone), so two campaigns starting close together would otherwise
+ * race on `_base`'s own fetch/reset/checkout — serialized via baseCloneLock
+ * below so only one run touches `_base` at a time; `git worktree add` itself
+ * is safe to run concurrently against a settled `_base`, so only the
+ * ensure/sync step needs to be inside the lock. */
+let baseCloneLock = Promise.resolve();
+function withBaseCloneLock(fn) {
+  const next = baseCloneLock.then(fn, fn);
+  baseCloneLock = next.catch(() => {});
+  return next;
 }
 
 export async function clone(state) {
   await runStore.heartbeat(state.runId, "clone");
-  const workdir = path.join(path.resolve(config.workdirRoot), state.runId);
-  await mkdir(path.dirname(workdir), { recursive: true });
+  const workdirRoot = path.resolve(config.workdirRoot);
+  const baseDir = path.join(workdirRoot, "_base");
+  const workdir = path.join(workdirRoot, state.runId);
+  await mkdir(workdirRoot, { recursive: true });
+
   const remoteUrl = config.github.cloneUrl;
   const isHttp = remoteUrl.startsWith("http");
   const token = isHttp ? config.github.token : undefined;
-  await log(state.runId, `clone: ${remoteUrl}@${config.github.baseBranch} -> ${workdir}`);
 
-  await cloneShallow({
-    remoteUrl,
-    branch: config.github.baseBranch,
-    dir: workdir,
-    token,
-    timeoutMs: 120_000,
+  await withBaseCloneLock(async () => {
+    const baseExists = await access(path.join(baseDir, ".git")).then(() => true, () => false);
+    if (!baseExists) {
+      await log(state.runId, `clone: no cached base clone yet — cloning ${remoteUrl}@${config.github.baseBranch} once into ${baseDir}`);
+      await cloneShallow({ remoteUrl, branch: config.github.baseBranch, dir: baseDir, token, timeoutMs: 120_000 });
+      if (token) await setRemoteAuth({ dir: baseDir, remoteUrl, token });
+    } else {
+      await log(state.runId, `clone: reusing cached base clone at ${baseDir} — syncing to latest ${config.github.baseBranch} (no full re-clone)`);
+      if (token) await setRemoteAuth({ dir: baseDir, remoteUrl, token });
+      await syncBaseToLatest({ dir: baseDir, branch: config.github.baseBranch });
+    }
   });
-  if (token) {
-    await setRemoteAuth({ dir: workdir, remoteUrl, token });
-  }
+
+  const branchName = `codegen/${state.request.slug}-${state.runId.slice(0, 8)}`;
+  await addWorktree({ baseDir, workdir, branchName, baseBranch: config.github.baseBranch });
+
   const pristineFiles = await listTrackedFiles({ dir: workdir });
   await log(state.runId, `clone: snapshot done, ${pristineFiles.size} tracked files`);
-  const branchName = `codegen/${state.request.slug}-${state.runId.slice(0, 8)}`;
-  await createLocalBranch({ dir: workdir, branchName, baseBranch: config.github.baseBranch });
 
-  await runStore.updateRun(state.runId, { branchName });
-  await log(state.runId, `clone: done, branch "${branchName}" created locally`);
-  return { workdir, pristineFiles, branchName };
+  await runStore.updateRun(state.runId, { branchName, workdir });
+  await log(state.runId, `clone: done, branch "${branchName}" checked out into its own worktree`);
+  return { workdir, pristineFiles, branchName, baseDir };
 }
 
-export async function code(state) {
+const SOURCE_FILE_RE = /\.(jsx?|tsx?|vue)$/;
+const IMPORT_SCAN_EXCLUDED_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", "coverage", "vendor"]);
+const IMPORT_SCAN_MAX_FILES = 3000;
+const IMPORT_SCAN_MAX_EXAMPLES = 8;
+
+/** A prompt instruction alone ("go check how the repo does this") isn't
+ *  reliable — a real run repeated the identical `react-icons/fa6` mistake
+ *  on retry instead of looking, even after being told to. So instead of
+ *  only asking the model to explore, the orchestrator itself greps the
+ *  cloned repo for real, working import lines of whatever package the
+ *  previous verify failure named unresolvable, and hands them over as
+ *  ground truth. Bounded scan (file-count cap, common extensions only) —
+ *  this only runs once per retry, not per request. */
+export async function findExistingImportExamples({ workdir, verifyReport }) {
+  if (!verifyReport) return "";
+  const unresolved = [...verifyReport.matchAll(/Can't resolve '([^']+)'/g)].map((m) => m[1]);
+  if (unresolved.length === 0) return "";
+
+  const basePackages = new Set(
+    unresolved.map((mod) => {
+      const parts = mod.split("/");
+      return mod.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
+    })
+  );
+
+  const examples = [];
+  let scanned = 0;
+
+  async function walk(dir) {
+    if (examples.length >= IMPORT_SCAN_MAX_EXAMPLES || scanned >= IMPORT_SCAN_MAX_FILES) return;
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (examples.length >= IMPORT_SCAN_MAX_EXAMPLES || scanned >= IMPORT_SCAN_MAX_FILES) return;
+      if (IMPORT_SCAN_EXCLUDED_DIRS.has(entry.name)) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+        continue;
+      }
+      if (!SOURCE_FILE_RE.test(entry.name)) continue;
+      scanned++;
+      let content;
+      try {
+        content = await readFile(full, "utf8");
+      } catch {
+        continue;
+      }
+      for (const line of content.split("\n")) {
+        if (!/\b(from|require)\s*\(?['"]/.test(line)) continue;
+        for (const pkg of basePackages) {
+          if (line.includes(pkg)) {
+            examples.push(`${path.relative(workdir, full)}: ${line.trim()}`);
+            break;
+          }
+        }
+      }
+    }
+  }
+  await walk(workdir);
+
+  if (examples.length === 0) return "";
+  return `\nREAL EXISTING IMPORTS OF THE SAME PACKAGE(S), FOUND ELSEWHERE IN THIS REPO — copy the exact path used here, do not invent a different one:\n${examples.slice(0, IMPORT_SCAN_MAX_EXAMPLES).join("\n")}\n`;
+}
+
+/* Fan-out section generation (new_plan.md §9.5/§9.6, module.md Module 2).
+ * Replaces the old single whole-page coding-agent loop: static sections are
+ * templated directly (no LLM), each ai-required section gets its own
+ * independent coding-agent run scoped to exactly one file, all concurrent —
+ * see sections/generate-sections.mjs for the actual dispatcher. */
+export async function generateSectionsStep(state) {
   const attempt = state.codeAttempts + 1;
-  await runStore.heartbeat(state.runId, "code");
+  await runStore.heartbeat(state.runId, "generate_sections");
   await runStore.updateRun(state.runId, { codeAttempts: attempt });
-  await log(state.runId, `code: agentic loop starting (attempt ${attempt})`);
+  await log(state.runId, `generate_sections: fan-out starting (attempt ${attempt}, ${state.classifiedSections.length} section(s))`);
 
   const allowlist = resolveAllowlist(config.writePathAllowlistTemplates, state.request.slug);
-  const manifestPaths = new Set(state.fileManifest.filesToCreate.map((f) => f.path));
+  const importExamples = await findExistingImportExamples({ workdir: state.workdir, verifyReport: state.verifyReport });
 
-  const systemPrompt = `You are a coding agent adding a new campaign landing page to an existing frontend repository, matching its existing design system and shared component library.
-
-GUARDRAILS (enforced in code, not just instructions):
-- You may ONLY create files under: ${allowlist.join(", ")}
-- You may ONLY create files declared in the plan below — nothing else.
-- You can NEVER modify or overwrite a file that already existed in this repository.
-- You have no shell access. Explore with list_files/read_file, write with write_file, and call finish_coding when done.
-
-Explore the repository first — this could be a Next.js/React repo, a Laravel/PHP repo (Blade templates), a Vue repo, or something else entirely. Check for package.json vs. composer.json, the routing/page convention, an existing page or component similar to a landing page, and the styling approach (Tailwind config, CSS modules, Blade + plain CSS, whatever it actually uses), so your new code matches its REAL conventions (framework, component/template patterns, import style, design tokens/colors, spacing), THEN create the planned files.
-
-HERO REQUIREMENT (above the fold, no scrolling, at BOTH desktop and mobile widths): one block containing the shortened campaign title, a video-or-details block, and the lead-capture form (name, phone, email, CTA button). Video-or-details and the form sit side by side on desktop, stacked vertically on mobile. Use responsive sizing (e.g. CSS clamp() or the repo's existing type scale) so the title shrinks gracefully rather than overflowing. Mark these three elements with these EXACT attributes (an automated check looks for them to verify placement — plain HTML attributes, not classes): \`data-hero-title\` on the title element, \`data-hero-media\` on the video-or-details block, \`data-hero-form\` on the lead form. These attributes are invisible to visitors and don't affect styling.
-
-The page MUST be self-contained: import/include ONLY from packages or PHP classes already declared in package.json/composer.json, the target repo's own existing shared components/partials (read them first, don't guess), and files you create in this same page. Do NOT modify any existing file — if the repo needs an existing routes file edited to make this page reachable (e.g. Laravel's routes/web.php), do NOT do it; leave the page unwired and say so in your finish_coding summary so the PR can flag it for a human to wire up. Every file must be valid and clean per the repo's own conventions.
-
-FILE PLAN:
-${JSON.stringify(state.fileManifest, null, 2)}
-
-CONTENT/SECTION PLAN:
-${JSON.stringify(state.guide, null, 2)}
-${state.verifyReport ? `\nPREVIOUS ATTEMPT FAILED VERIFICATION — fix this before finishing:\n${state.verifyReport}\n` : ""}`;
-
-  const result = await runCodingAgent({
+  const result = await generateSections({
+    classifiedSections: state.classifiedSections,
     workdir: state.workdir,
-    allowedPrefixes: allowlist,
+    allowlist,
     pristineFiles: state.pristineFiles,
-    manifestPaths,
-    systemPrompt,
-    taskPrompt: "Explore the repository, then implement the file plan. Call finish_coding when done.",
-    logger: (msg) => log(state.runId, `code: ${msg}`),
+    request: state.request,
+    guide: state.guide,
+    verifyReport: state.verifyReport,
+    importExamples,
+    maxIterations: config.maxAgentIterations,
+    previewLeadSinkUrl: `${config.servicePublicBaseUrl}${PREVIEW_LEAD_SINK_PATH}`,
+    logger: (msg) => log(state.runId, `generate_sections: ${msg}`),
   });
 
-  if (result.finished) {
-    await log(state.runId, `code: finished after ${result.iterations} iteration(s) — ${result.writtenFiles.size} file(s) written`);
+  if (result.codeFinished) {
+    await log(state.runId, `generate_sections: all ${result.sectionResults.length} section(s) finished — ${result.writtenByAgent.size} file(s) written`);
   } else {
-    await log(state.runId, "code: hit max iterations without finish_coding");
+    await log(state.runId, "generate_sections: one or more ai-required sections hit max iterations without finish_coding");
   }
 
+  // Persisted (not just in-process LangGraph state) so Phase 7's
+  // approveRun() — invoked from a LATER, separate request, long after this
+  // graph.invoke() call has returned — can rebuild what commit()/openPr()
+  // need without a LangGraph checkpointer.
+  await runStore.updateRun(state.runId, { agentSummary: result.agentSummary, sectionResults: result.sectionResults });
+
   return {
-    agentSummary: result.summary,
-    agentIterations: result.iterations,
-    writtenByAgent: result.writtenFiles,
+    agentSummary: result.agentSummary,
+    writtenByAgent: result.writtenByAgent,
+    sectionResults: result.sectionResults,
     codeAttempts: attempt,
-    codeFinished: result.finished,
-    // An unfinished loop must never reach verify as if it were buildable —
-    // route straight to the retry/halt decision with a clear reason.
-    ...(result.finished ? {} : { verifyPassed: false, verifyReport: "Coding agent hit max iterations without calling finish_coding." }),
+    codeFinished: result.codeFinished,
+    // An unfinished section must never reach verify as if the page were
+    // buildable — route straight to the retry/halt decision with a clear reason.
+    ...(result.codeFinished ? {} : { verifyPassed: false, verifyReport: "One or more ai-required sections hit max iterations without calling finish_coding." }),
   };
 }
 
@@ -345,10 +393,7 @@ export async function verify(state) {
   }
   await runStore.heartbeat(state.runId, "verify");
   await log(state.runId, "verify: validating the new files (build/lint + hero-fit/seo/a11y, ecosystem-aware)");
-  const changedPaths =
-    state.writtenByAgent && state.writtenByAgent.size > 0
-      ? [...state.writtenByAgent]
-      : state.fileManifest.filesToCreate.map((f) => f.path);
+  const changedPaths = [...state.writtenByAgent];
   const pageUrlPath = config.pageUrlPathTemplate
     ? config.pageUrlPathTemplate.replaceAll("{slug}", state.request.slug)
     : null;
@@ -359,6 +404,8 @@ export async function verify(state) {
     changedPaths,
     pageUrlPath,
     serverTimeoutMs: config.verifyServerTimeoutMs,
+    packageManagerOverride: config.packageManagerOverride,
+    disableDocker: config.verifyDisableDocker,
   });
   const verifyAttempts = state.verifyAttempts + 1;
   await runStore.updateRun(state.runId, { verifyAttempts, verifyChecks: result.checks });
@@ -366,9 +413,65 @@ export async function verify(state) {
   return { verifyPassed: result.ok, verifyReport: result.ok ? null : result.report, verifyAttempts };
 }
 
+/* Records exactly what the agent wrote for this run in the database
+ * (staging/draft-store.mjs), before anything touches git — a durable,
+ * queryable copy of the generated files that a future review UI (Phase 6)
+ * can read/diff without needing the scratch worktree to still exist. */
+export async function stageDraft(state) {
+  await runStore.heartbeat(state.runId, "stage_draft");
+  const paths = [...state.writtenByAgent];
+  // Every section file gets tagged with its slot (new_plan.md §9.6/module.md
+  // Module 3) so a future per-section refine can version just one slot
+  // without touching the rest. The composed page.tsx isn't in sectionResults
+  // (it's the one extra path generate_sections writes) — it has no single
+  // slot, so it's tagged null, same convention as the schema's own comment.
+  const slotByPath = new Map(state.sectionResults.map((r) => [r.path, r.slot]));
+  const files = await Promise.all(
+    paths.map(async (p) => ({
+      path: p,
+      content: await readFile(path.join(state.workdir, p), "utf8"),
+      sectionSlot: slotByPath.get(p) ?? null,
+    }))
+  );
+  const { version } = await draftStore.stageNewVersion({ runId: state.runId, files });
+  await log(state.runId, `stage_draft: staged version ${version} (${files.length} file(s), ${slotByPath.size} section slot(s))`);
+  return {};
+}
+
+/* Starts a longer-lived preview server for a human to actually look at
+ * (Phase 4) — non-fatal by design: the graph still auto-continues to
+ * commit/push/open_pr whether or not this succeeds (Phase 6 is what adds a
+ * real human gate; until then, preview is a convenience, not a blocker).
+ * When it DOES succeed, openPr() below skips its own worktree cleanup —
+ * the preview is still bind-mounting/reading from that directory, so
+ * deleting it out from under a live preview would break the very thing
+ * this step just started. Cleanup happens later, from the preview's own
+ * lifecycle (idle sweep, explicit stop, or boot reconciliation — see
+ * preview/sandbox.mjs). */
+export async function previewBuild(state) {
+  await runStore.heartbeat(state.runId, "preview_build");
+  const pageUrlPath = config.pageUrlPathTemplate
+    ? config.pageUrlPathTemplate.replaceAll("{slug}", state.request.slug)
+    : null;
+  const result = await startPreview({
+    runId: state.runId,
+    workdir: state.workdir,
+    pageUrlPath,
+    ttlMs: config.previewTtlMs,
+    maxConcurrent: config.maxConcurrentPreviews,
+    disableDocker: config.verifyDisableDocker,
+  });
+  if (!result.ok) {
+    await log(state.runId, `preview_build: skipped — ${result.report}`);
+    return { previewStarted: false };
+  }
+  await log(state.runId, `preview_build: started (${result.kind}) — ${result.url}, expires ${result.expiresAt}`);
+  return { previewStarted: true };
+}
+
 export async function commit(state) {
   await runStore.heartbeat(state.runId, "committing");
-  const manifestPaths = state.fileManifest.filesToCreate.map((f) => f.path);
+  const manifestPaths = [...state.writtenByAgent];
   const logRelPath = "CODEGEN_LOG.md";
   await writeCodegenLog(state, path.join(state.workdir, logRelPath));
   await commitPaths({
@@ -403,8 +506,8 @@ export async function openPr(state) {
       prUrl: "(dry-run: no real PR opened — branch was pushed for real, see branchName)",
       status: "completed",
     });
-    if (!config.keepWorkdirOnFailure) {
-      await rm(state.workdir, { recursive: true, force: true }).catch(() => {});
+    if (!config.keepWorkdirOnFailure && !state.previewStarted) {
+      await removeWorktree({ baseDir: state.baseDir, workdir: state.workdir, branchName: state.branchName });
     }
     return { prUrl: null, prNumber: null, status: "completed" };
   }
@@ -421,16 +524,19 @@ export async function openPr(state) {
   });
   await runStore.updateRun(state.runId, { prUrl: pr.html_url, prNumber: pr.number, status: "completed" });
   await log(state.runId, `open_pr: ${pr.html_url}`);
-  if (!config.keepWorkdirOnFailure) {
-    await rm(state.workdir, { recursive: true, force: true }).catch(() => {});
+  if (!config.keepWorkdirOnFailure && !state.previewStarted) {
+    await removeWorktree({ baseDir: state.baseDir, workdir: state.workdir, branchName: state.branchName });
   }
   return { prUrl: pr.html_url, prNumber: pr.number, status: "completed" };
 }
 
 function buildPrBody(state) {
-  const files = state.fileManifest.filesToCreate.map((f) => `- \`${f.path}\` — ${f.purpose}`).join("\n");
+  const files = state.sectionResults
+    .map((r) => `- \`${r.path}\` — "${r.type}" section (${r.mode})`)
+    .concat([...state.writtenByAgent].filter((p) => p.endsWith("/page.tsx")).map((p) => `- \`${p}\` — composed page, imports every section above in order`))
+    .join("\n");
   return `## Summary
-${state.fileManifest.summary}
+${state.guide.sections.length} section(s) generated for "${state.request.campaignName}": ${state.sectionResults.map((r) => `${r.type} (${r.mode})`).join(", ")}.
 
 **This PR was generated by an AI coding agent** (run \`${state.runId}\`) from a campaign brief. It only adds new, isolated files — no existing file was modified.
 
@@ -456,8 +562,8 @@ async function writeCodegenLog(state, filePath) {
 ## Content/section plan
 ${JSON.stringify(state.guide, null, 2)}
 
-## File plan
-${JSON.stringify(state.fileManifest, null, 2)}
+## Section classification & results
+${JSON.stringify(state.sectionResults, null, 2)}
 
 ## Agent summary
 ${state.agentSummary ?? "(none)"}

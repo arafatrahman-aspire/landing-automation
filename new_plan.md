@@ -263,19 +263,21 @@ Two organizing principles worth stating plainly, since most of the above falls o
 
 ## 6. Implementation Plan
 
-| Phase | Deliverable | Notes |
+**⚠️ Renumbered 2026-07-28 to match reality — read this note before trusting any "Phase N" reference anywhere in this project.** This table originally numbered phases 1–11. `documentation.md`'s actual version-log entries (v0.1, v0.3, v0.5, v0.11, v0.15) have always called the exact same milestones "Phase 0" through "Phase 4" — a real, off-by-one inconsistency between this file and the changelog that actually shipped, not a stylistic choice. That mismatch is exactly what made "do phase 5" ambiguous in conversation. The table below is renumbered to match `documentation.md` (0-indexed) — that's now the one canonical numbering for this whole project. A **Status** column is added so "what's left" never again has to be reconstructed from memory.
+
+| Phase | Deliverable | Status |
 |---|---|---|
-| 1 | Core pipeline: intake → research → guide → manifest → clone → code, with the existing write-guard (layers 1–4) | Foundation; can be tested fully offline against a local bare-repo fixture |
-| 2 | Design-context catalog + resolver; section-catalog enum in the guide schema | Human curates the initial catalog against the real target repo before this phase is considered done |
-| 3 | Deterministic verify suite: build/lint (existing pattern) plus `hero-fit.mjs`, `seo-lint.mjs`, `a11y-lint.mjs` | Build a fixture library of pages that should pass/fail each check at both viewport sizes |
-| 4 | Database staging layer: `draft_files`, `runs`, versioning; `staging/materialize.mjs` | This replaces "write straight to a branch" as the default output of `code` |
-| 5 | Preview sandbox: containerized `preview_build`, port registry, reverse-proxy routing, idle teardown | Depends on the VM/Docker deployment being in place (§7) |
-| 6 | LLM validation layer (`validate/`) and its report schema, surfaced via the run-status API | Build a small golden set of "clearly on-brand" vs. "clearly off-brand" examples to sanity-check the reviewer prompt before trusting it |
-| 7 | Review workflow: approve / edit (structured + raw) / reject-with-feedback (regenerate, capped at 3) / abandon, wired into the orchestrator | Edit path must re-trigger verify before allowing another preview |
-| 8 | Commit/push/PR stage moved to fire only after approval, reusing the git/GitHub modules as-is | Low risk — this logic already exists, it just moves later in the graph |
-| 9 | Lead form component contract: honeypot, conditional job field, POST to the parent platform's lead endpoint, preview no-op mode | Blocked on the parent platform exposing (or already having) the receiving endpoint — flag this to that team early |
-| 10 | Marketing-facing review UI: campaign creation, live preview embed, approve/edit/reject actions | Can start once Phase 5 (preview) and Phase 7 (review workflow) are functional |
-| 11 | Observability, hardening, and the maintenance runbooks below | Should land before this handles real campaigns, not after |
+| 0 | Core pipeline: intake → research → guide → manifest → clone → code, with the existing write-guard (layers 1–4) | ✅ Done — `documentation.md` v0.1 |
+| 1 | Design-context catalog + resolver; section-catalog enum in the guide schema | ✅ Done — v0.3. `design/catalog.mjs`'s reference paths are still placeholders, unverified against the real target repo (module.md Module 7) |
+| 2 | Deterministic verify suite: build/lint plus `hero-fit.mjs`, `seo-lint.mjs`, `a11y-lint.mjs` | ✅ Done — v0.5. hero-fit/seo/a11y have never run against a real Chromium in this dev sandbox (module.md Module 8) |
+| 3 | Database staging layer: `draft_files`, `runs`, versioning | ✅ Done — v0.11, extended v0.17 with per-section `section_slot` versioning (§9.6) |
+| 4 | Preview sandbox: containerized `preview_build`, port registry, idle teardown | ✅ Done — v0.15 |
+| 5 | LLM validation layer (`validate/`) — design conformance / content fidelity / SEO-quality report | ❌ **Superseded by §9 below — not being built as originally scoped.** The per-section gallery review (§9.7) replaces the need for a separate LLM judgment report. |
+| 6 | Review workflow: approve / edit (structured + raw) / reject-with-feedback / abandon | ❌ **Superseded by §9 below as originally scoped** (no raw-file editor, no separate structured-edit UI — §9.7's section gallery is the only review surface). **The underlying need — a real human gate before anything reaches git — is still open**, just implemented as §9.7 + Phase 7 below instead of this phase's original design. |
+| 7 | Commit/push/PR stage moved to fire only after approval | ✅ Done — v0.19. Graph now ends at `preview_build`; `orchestrator/review-actions.mjs`'s `approveRun`/`abandonRun` are the real human gate. Reject-with-feedback-and-regenerate deliberately deferred to pair with Module 4 (module.md). |
+| 8 | Lead form component contract: honeypot, conditional job field, preview no-op mode | ✅ Done — v0.20. Real parent-platform lead-endpoint integration remains a separate external dependency, deliberately not built. Worth a follow-up: the real target repo's existing hero components actually use GHL iframes for lead capture, not a custom form — see v0.20's note. |
+| 9 | Marketing-facing review UI: campaign creation, live preview embed, approve/edit/reject actions | ✅ Done — v0.21, built as §9's gallery/modal (module.md Module 4) rather than a raw approve/edit/reject UI. `orchestrator/refine-actions.mjs` (`use-different-frame`/`modify`/`redesign`/`new`), `GET .../sections`, `POST .../sections/:slot/refine`, `SectionsPanel`/`RefineModal` in the UI. Bulk regenerate (module.md Module 6) still separate, deliberately last-priority. |
+| 10 | Observability, hardening, and the maintenance runbooks (§7) | 🔶 Partial — basic `/healthz` only; no cost tracking, no alerting |
 
 ---
 
@@ -361,3 +363,66 @@ Log token usage per run per stage — research, guide, manifest, the coding loop
 ## 8. Handoff Boundary: Where This System's Responsibility Ends
 
 Worth stating explicitly, since it shapes both the maintenance plan and expectations for the dev team: this system's job finishes when a Pull Request is opened against the target repo. A developer reviews the diff and the preview evidence attached to the PR description, merges it, and then **manually deploys the target repo** — that repo does not auto-deploy on merge today. Everything after "PR opened" is outside this system's automation and outside its monitoring; the incident runbook above (§7.7) reflects that boundary rather than trying to paper over it. If auto-deploy is ever added to the target repo, this boundary shrinks naturally with no changes required on this system's side.
+
+---
+
+## 9. Amendment — Hybrid Section Assembly (2026-07-27, supersedes §6 Phases 5–6; directly implements Phase 7)
+
+**Status as of 2026-07-28:** module.md Modules 1–3 done and tested (section classification, static templating, per-section AI fan-out, section-slot staging). First real end-to-end run against the real target repo hit and fixed a genuine config bug (`documentation.md` v0.18 — `WRITE_PATH_ALLOWLIST` didn't match this repo's `src/app/` convention). **Phase 7 (the real approval gate) is now done — v0.19.** The one piece still open from the original ask is per-section modify/refine (module.md Module 4) — reject-with-feedback-and-regenerate is deliberately paired with that, not built standalone.
+
+**Status:** approved direction, implementation in progress. This section is additive/superseding — §6's phase table stays as a historical record of the original sequencing, but Phases 5 ("LLM validation layer") and 6/7 ("review workflow: approve/edit/reject", "commit/push/PR moved to fire only after approval") are replaced by what's described here, not built as originally scoped. §4.7's "staged preview: code lives in the database first" and §5's guardrail list still apply — this amendment changes *how* a draft gets assembled and reviewed, not the "nothing reaches git until approved" guarantee.
+
+### 9.1 Why
+
+The original plan generates the entire page through one monolithic agentic coding loop, then gates it behind a single review-and-approve step. In practice most sections of a landing page (FAQ, pricing, testimonials, footer CTA, …) don't need an LLM to write bespoke code every time — they're the same handful of layouts with different copy. Only the hero (and anything a campaign brief explicitly calls out) genuinely benefits from bespoke generation. Splitting the work this way gets a marketer a real, full-page preview in minutes instead of waiting on one long agent run, and lets them refine exactly the section that needs it instead of re-reviewing the whole page.
+
+### 9.2 Section classification (replaces "guide chooses sections" as the whole story)
+
+- `schemas/brief-schema.mjs` gains an optional `aiRequiredSections: SectionType[]` field — the marketer can flag specific section types as needing bespoke AI generation instead of static templating (e.g., "I want a custom pricing layout this time").
+- Resolution rule, applied in code, not asked of the LLM: `hero` is **always** `ai-required`. Every other section is `static` **unless** it's in the brief's `aiRequiredSections`, or the fixed frame catalog (§9.3) has no static candidate for that section type at all (nothing to template against, so it falls back to `ai-required` automatically).
+- `guide` still produces the ordered section list (type + summary) exactly as today; classification is a separate, pure, deterministic pass over that list — independently testable without a live LLM call.
+
+### 9.3 Static frame catalog (new: `design/frame-catalog.mjs`)
+
+Candidate static components are sourced from the **target repo's own analyzed component library** — `src/components/frames/landing/analyze/` in the `atss-frontend` repo, a set of ~53 legacy "Frame*" components catalogued and renamed by section type earlier in this project, each already following one uniform shape: `function XFrame({ data = defaultXData }: { data?: XData })`. `design/frame-catalog.mjs` is the human-curated bridge from the fixed `SECTION_TYPES` enum (`design/schema.mjs`) to these real components — analogous to `design/catalog.mjs`, but for literal reuse (§9.4) instead of LLM grounding.
+
+Each catalog entry declares:
+- `component` / `importPath` — which real frame and how to import it.
+- `defaultData` — a full, real copy of that frame's own built-in default data (never partial — see §9.4 for why).
+- `fillableFields` — a Zod schema for the *subset* of top-level fields campaign copy is allowed to override (headings, FAQ items, CTA text, …). Fields not listed (real photos, payment links, fixed business config) always stay exactly as the frame's own default.
+- Frames whose real defaults include non-serializable values (photo imports — testimonials, instructor bios) declare no `fillableFields`/`defaultData` at all and always render with no `data` prop, i.e. the frame's own untouched default. This is a deliberate limitation: this service has no way to generate or source real photos, so it never guesses.
+
+`hero` intentionally has no catalog entry — per §9.2, hero is never static.
+
+### 9.4 Static population (new: `populate-frame.mjs`, no AI, no coding-agent loop)
+
+Pure templating: validates whatever campaign copy the guide produced for a section against that candidate's `fillableFields` schema, merges it over the frame's **full** real `defaultData` (`{...defaultData, ...overrides}` — full, not partial, because the target components take `data` as an all-or-nothing prop with no internal deep-merge; a partial object would blank out every field the merge didn't cover, including images the catalog can't reproduce), and emits a small wrapper file that imports the frame verbatim and renders it with the merged literal. Runs in parallel across every static section — cheap, deterministic, no model call, independently unit-testable with plain JS fixtures.
+
+### 9.5 AI generation, scoped per section (decision: one independent agent run per section)
+
+Each `ai-required` section (hero, plus any flagged) gets its **own** coding-agent invocation — not one shared loop writing multiple files off one file-manifest, as the original pipeline's `code` step did. These run concurrently with each other and with the static population pass (§9.4). This costs more orchestration (N independent runs instead of one) in exchange for independent retry/regeneration per section later (§9.7) without perturbing sections that already passed.
+
+### 9.6 First assembly
+
+Once every section (populated + AI-generated) is ready: each section is staged as its **own** `draft_files` row — the schema gains a **section-slot column** (decision: per-section versioning, not page-level-only) so refining one section later doesn't bump or lose history for the others. A first-cut `page.tsx` composes them in declared order and is staged too. This triggers the **first real gate**: the full deterministic verify suite (build/lint/hero-fit/seo/a11y) runs against the assembled page, not per-section — a section swap can affect page-wide checks (hero-fit, SEO, a11y), so the gate is always whole-page. On pass → `preview_build`, same as today — the marketer sees the whole page, target: minutes, not a multi-step wizard.
+
+### 9.7 Per-section refinement — this IS the review step (decision: replaces §6 Phase 6 entirely; is what Phase 7's approval gate reviews)
+
+No separate raw-file approve/edit/reject workflow gets built. The preview UI's rendered sections are each clickable, reopening a gallery/modal scoped to just that slot (use a different frame / modify / redesign / new) — every action writes a **new draft version for that slot only**, never touching the original frame file or any other section's rows. Every refinement re-runs the **full-page** verify suite (not just the section) before re-preview, for the same page-wide-check reason as §9.6. There is no separate LLM "validation report" layer (original §6 Phase 5) and no raw-text editor (original §4.7's "raw edit" mode) — the section-level gallery is the entire review surface.
+
+### 9.8 Bulk regenerate (escape hatch, rare path)
+
+One explicit "regenerate with new direction" action re-runs §9.5 across **every** section with a fresh prompt, forcing `mode: ai-required` for all sections for that one run — discards any accepted per-section refinements, so it's gated behind an explicit confirmation, not reachable accidentally.
+
+### 9.9 Approval → existing pipeline (unchanged)
+
+Approve still does exactly what §4.7/§5 already specify: commit only the manifest-declared paths, push, open a PR. Reject/edit/regenerate cycles (capped at 3) are unchanged in spirit, just operating at the per-section grain described above instead of whole-page.
+
+### 9.10 Build order
+
+1. Section-mode schema (`brief-schema.mjs`, `guide-schema.mjs`) + `design/frame-catalog.mjs` + `populate-frame.mjs` — no AI risk, ships first, independently testable.
+2. Parallel assembly (§9.5/§9.6) + first full-page verify/preview — proves the fast-path end to end.
+3. Per-section click-to-refine (§9.7) wired into a new gallery/modal UI.
+4. Bulk-regenerate (§9.8) — last, lowest priority.
+
+See `module.md` for the granular, file-level task breakdown against this build order.

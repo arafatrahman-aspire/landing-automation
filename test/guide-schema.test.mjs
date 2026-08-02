@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { validateGuide, truncateGuideFields, LIMITS } from "../src/schemas/guide-schema.mjs";
+import { validateGuide, truncateGuideFields, LIMITS, classifiedSectionSchema } from "../src/schemas/guide-schema.mjs";
 
 const validGuide = {
   heroTitle: "Save 50% on your annual plan — this week only",
@@ -54,4 +54,24 @@ test("truncateGuideFields clamps oversized strings instead of failing (LLMs misc
 test("truncateGuideFields leaves well-formed fields untouched", () => {
   const clamped = truncateGuideFields(validGuide);
   assert.deepEqual(clamped, validGuide);
+});
+
+test("classifiedSectionSchema accepts a well-formed static section", () => {
+  const result = classifiedSectionSchema.safeParse({ type: "faq", summary: "3 common questions", mode: "static", frameId: "faq-accordion" });
+  assert.equal(result.success, true);
+});
+
+test("classifiedSectionSchema accepts a well-formed ai-required section", () => {
+  const result = classifiedSectionSchema.safeParse({ type: "hero", summary: "Title, video, lead form", mode: "ai-required", frameId: null });
+  assert.equal(result.success, true);
+});
+
+test("classifiedSectionSchema rejects mode:static with a null frameId", () => {
+  const result = classifiedSectionSchema.safeParse({ type: "faq", summary: "...", mode: "static", frameId: null });
+  assert.equal(result.success, false);
+});
+
+test("classifiedSectionSchema rejects mode:ai-required with a non-null frameId", () => {
+  const result = classifiedSectionSchema.safeParse({ type: "hero", summary: "...", mode: "ai-required", frameId: "faq-accordion" });
+  assert.equal(result.success, false);
 });

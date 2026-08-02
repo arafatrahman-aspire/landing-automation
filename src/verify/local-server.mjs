@@ -15,9 +15,13 @@ import { detectPackageManager, RUN_SCRIPT_CMD } from "./package-manager.mjs";
  * will time out with a clear error rather than silently checking the wrong
  * port; that's a real, documented limitation, not a bug to work around. */
 
-const SERVE_SCRIPT_PREFERENCE = ["start", "preview", "dev"];
+export const SERVE_SCRIPT_PREFERENCE = ["start", "preview", "dev"];
 
-function getFreePort() {
+/** Exported for reuse by preview/sandbox.mjs (Phase 4) — the longer-lived
+ *  preview sandbox needs the exact same "find a free OS port"/"poll until
+ *  something answers" primitives, just with a different process lifecycle
+ *  (DB-tracked, outlives the request that started it) wrapped around them. */
+export function getFreePort() {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
     srv.unref();
@@ -29,7 +33,7 @@ function getFreePort() {
   });
 }
 
-async function waitForReady(url, timeoutMs) {
+export async function waitForReady(url, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
@@ -50,7 +54,7 @@ async function waitForReady(url, timeoutMs) {
  * @param {number} [p.timeoutMs]
  * @returns {Promise<{ok:true, baseUrl:string, stop:()=>Promise<void>} | {ok:false, report:string}>}
  */
-export async function startEphemeral({ workdir, timeoutMs = 30_000 }) {
+export async function startEphemeral({ workdir, timeoutMs = 30_000, packageManagerOverride = null }) {
   let scripts;
   try {
     const pkg = JSON.parse(await readFile(path.join(workdir, "package.json"), "utf8"));
@@ -69,7 +73,7 @@ export async function startEphemeral({ workdir, timeoutMs = 30_000 }) {
     };
   }
 
-  const pm = await detectPackageManager(workdir);
+  const pm = await detectPackageManager(workdir, packageManagerOverride);
   const port = await getFreePort();
   const [cmd, args] = RUN_SCRIPT_CMD[pm](scriptName);
   // detached so the child is its own process-group leader — `npm run <script>`

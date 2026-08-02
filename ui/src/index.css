@@ -1,29 +1,67 @@
 :root {
-  --text: #3f3f46;
-  --text-h: #18181b;
-  --bg: #fafafa;
-  --panel: #fff;
-  --border: #e4e4e7;
-  --code-bg: #f4f4f5;
-  --accent: #4f46e5;
-  --ok: #16a34a;
-  --bad: #dc2626;
-  --warn: #d97706;
+  /* Brand accent tuned to match public/favicon.svg's purple mark */
+  --accent: #7c3aed;
+  --accent-h: #6d28d9;
+  --accent-ring: rgb(124 58 237 / 35%);
+  --accent-soft: #f3eeff;
 
-  font: 15px/1.5 system-ui, "Segoe UI", Roboto, sans-serif;
+  --text: #44444c;
+  --text-h: #16161a;
+  --text-muted: #71717a;
+  --bg: #f7f7f9;
+  --panel: #ffffff;
+  --panel-2: #fbfbfc;
+  --border: #e6e6ea;
+  --border-strong: #d4d4d9;
+  --code-bg: #f3f3f6;
+
+  --ok: #16a34a;
+  --ok-soft: #eafcf1;
+  --bad: #dc2626;
+  --bad-soft: #fef1f1;
+  --warn: #b45309;
+  --warn-soft: #fef6e8;
+  --live: var(--accent);
+  --live-soft: var(--accent-soft);
+
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --shadow-sm: 0 1px 2px rgb(15 15 20 / 5%);
+  --shadow: 0 1px 3px rgb(15 15 20 / 6%), 0 8px 24px -12px rgb(15 15 20 / 12%);
+  --shadow-lg: 0 12px 32px -8px rgb(15 15 20 / 18%);
+
+  font: 15px/1.55 -apple-system, "Segoe UI", Inter, system-ui, Roboto, sans-serif;
   color-scheme: light dark;
   color: var(--text);
   background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --text: #d4d4d8;
-    --text-h: #fafafa;
-    --bg: #18181b;
-    --panel: #202024;
-    --border: #303036;
-    --code-bg: #26262b;
+    --accent: #a78bfa;
+    --accent-h: #c4b5fd;
+    --accent-ring: rgb(167 139 250 / 35%);
+    --accent-soft: #2a2145;
+
+    --text: #c7c7d1;
+    --text-h: #f5f5f7;
+    --text-muted: #8f8f9b;
+    --bg: #17171b;
+    --panel: #1e1e23;
+    --panel-2: #222228;
+    --border: #303038;
+    --border-strong: #3d3d47;
+    --code-bg: #1a1a1f;
+
+    --ok: #4ade80;
+    --ok-soft: #10281a;
+    --bad: #f87171;
+    --bad-soft: #2c1516;
+    --warn: #fbbf24;
+    --warn-soft: #2b2110;
   }
 }
 
@@ -31,26 +69,67 @@
   box-sizing: border-box;
 }
 
-body {
+html, body {
   margin: 0;
+  height: 100%;
 }
 
-h1, h2, h3 {
-  color: var(--text-h);
-  font-weight: 600;
+#root {
+  min-height: 100vh;
 }
+
+h1, h2, h3, h4 {
+  color: var(--text-h);
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+
+h1 { font-size: 1.5rem; }
+h2 { font-size: 1.25rem; }
+h3 { font-size: 1.05rem; }
+
+p { margin: 0 0 0.75em; }
 
 code, pre {
-  font-family: ui-monospace, Consolas, monospace;
+  font-family: ui-monospace, "SF Mono", Consolas, "Cascadia Code", monospace;
 }
 
 code {
   background: var(--code-bg);
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-size: 0.9em;
+  padding: 0.15em 0.45em;
+  border-radius: 5px;
+  font-size: 0.88em;
+  color: var(--text-h);
 }
 
 a {
   color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--accent-h);
+}
+
+::selection {
+  background: var(--accent-ring);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
 }

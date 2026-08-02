@@ -50,6 +50,14 @@ test("detectPackageManager reads lockfiles", async (t) => {
   assert.equal(await detectPackageManager(root), "pnpm");
 });
 
+test("detectPackageManager's override wins even with a conflicting lockfile present", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "verify-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(path.join(root, "yarn.lock"), ""); // would normally pick yarn
+  assert.equal(await detectPackageManager(root, "npm"), "npm");
+  assert.equal(await detectPackageManager(root), "yarn"); // unchanged without an override
+});
+
 /* The target repo's stack isn't fixed (Next.js today, Laravel tomorrow) —
  * these cover the ecosystem-detection fallbacks beyond a root package.json. */
 

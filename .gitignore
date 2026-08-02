@@ -1,6 +1,9 @@
 node_modules/
 data/runs/
 data/.scratch/
+data/*.db
+data/*.db-shm
+data/*.db-wal
 .env
 .env.example
 *.tsbuildinfo

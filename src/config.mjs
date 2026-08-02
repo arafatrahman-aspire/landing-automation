@@ -34,8 +34,21 @@ const envSchema = z
     CLAUDE_MODEL: z.string().default("claude-sonnet-5"),
     CODING_AGENT_MODEL: z.string().optional(),
 
-    MAX_AGENT_ITERATIONS: intFromEnv(25),
+    MAX_AGENT_ITERATIONS: intFromEnv(40),
     MAX_CODE_ATTEMPTS: intFromEnv(2),
+    // Overrides package-manager auto-detection (packageManager field, then
+    // pnpm-lock.yaml/yarn.lock, else npm) for the target repo. Set this when
+    // a repo has ambiguous/stale lockfiles (e.g. a leftover yarn.lock next to
+    // the package-lock.json it actually uses) and detection picks the wrong
+    // tool. Leave unset to keep auto-detecting.
+    PACKAGE_MANAGER_OVERRIDE: z.enum(["npm", "yarn", "pnpm"]).optional(),
+    // When the target repo has its own root Dockerfile with a `node:` base
+    // image, verify install/build runs inside `docker run` against THAT
+    // image instead of this service's host Node/npm — sidesteps host/repo
+    // version mismatches entirely (auto-detected: on by default, only takes
+    // effect when the repo actually has a usable Dockerfile AND docker is
+    // reachable; set true to force host-based install/build even then).
+    VERIFY_DISABLE_DOCKER: boolFromEnv,
     VERIFY_INSTALL_TIMEOUT_MS: intFromEnv(300_000),
     VERIFY_BUILD_TIMEOUT_MS: intFromEnv(600_000),
     // How the layout/SEO/a11y checks reach the new page once it's served —
@@ -47,6 +60,17 @@ const envSchema = z
     // entirely (build/lint still runs) until it's been configured.
     PAGE_URL_PATH_TEMPLATE: z.string().optional(),
     VERIFY_SERVER_TIMEOUT_MS: intFromEnv(30_000),
+
+    // How long a preview sandbox (Phase 4) stays up after a successful
+    // run before the idle sweep tears it down, in the absence of an
+    // explicit stop. 30 minutes is enough for one human to actually look
+    // at it without leaving servers running indefinitely by default.
+    PREVIEW_TTL_MS: intFromEnv(30 * 60_000),
+    // Soft cap on simultaneously-running previews — the oldest is stopped
+    // to make room for a new one past this, not refused outright.
+    MAX_CONCURRENT_PREVIEWS: intFromEnv(3),
+    // How often the idle-preview sweep runs.
+    PREVIEW_SWEEP_INTERVAL_MS: intFromEnv(60_000),
 
     // --- Target repo ---
     GITHUB_TOKEN: z.string().optional(),
@@ -67,11 +91,20 @@ const envSchema = z
     GIT_AUTHOR_NAME: z.string().default("Landing Page Codegen Bot"),
     GIT_AUTHOR_EMAIL: z.string().default("codegen-bot@example.com"),
 
-    RUN_STATE_DIR: z.string().default("./data/runs"),
+    DB_PATH: z.string().default("./data/campaigns.db"),
     WORKDIR_ROOT: z.string().default("./data/.scratch"),
     KEEP_WORKDIR_ON_FAILURE: boolFromEnv,
 
     SKIP_RESEARCH: boolFromEnv,
+
+    // Phase 8 (new_plan.md §4.8) — where a generated preview page's lead
+    // form should POST in preview mode. A preview runs the TARGET repo's
+    // own server on its own port (preview/sandbox.mjs), a completely
+    // separate process from this one, so the generated form can't just
+    // fetch a relative path — it needs this service's own externally-
+    // reachable base URL. Defaults to localhost at this service's own port,
+    // which only works for local dev; set explicitly for any real deployment.
+    SERVICE_PUBLIC_BASE_URL: z.string().url().optional(),
   })
   .superRefine((env, ctx) => {
     if (env.AI_PROVIDER === "gemini" && !env.GEMINI_API_KEY) {
@@ -117,10 +150,16 @@ function loadConfig() {
 
     maxAgentIterations: env.MAX_AGENT_ITERATIONS,
     maxCodeAttempts: env.MAX_CODE_ATTEMPTS,
+    packageManagerOverride: env.PACKAGE_MANAGER_OVERRIDE ?? null,
+    verifyDisableDocker: env.VERIFY_DISABLE_DOCKER,
     verifyInstallTimeoutMs: env.VERIFY_INSTALL_TIMEOUT_MS,
     verifyBuildTimeoutMs: env.VERIFY_BUILD_TIMEOUT_MS,
     pageUrlPathTemplate: env.PAGE_URL_PATH_TEMPLATE || null,
     verifyServerTimeoutMs: env.VERIFY_SERVER_TIMEOUT_MS,
+
+    previewTtlMs: env.PREVIEW_TTL_MS,
+    maxConcurrentPreviews: env.MAX_CONCURRENT_PREVIEWS,
+    previewSweepIntervalMs: env.PREVIEW_SWEEP_INTERVAL_MS,
 
     github: {
       token: env.GITHUB_TOKEN,
@@ -138,11 +177,13 @@ function loadConfig() {
     gitAuthorName: env.GIT_AUTHOR_NAME,
     gitAuthorEmail: env.GIT_AUTHOR_EMAIL,
 
-    runStateDir: env.RUN_STATE_DIR,
+    dbPath: env.DB_PATH,
     workdirRoot: env.WORKDIR_ROOT,
     keepWorkdirOnFailure: env.KEEP_WORKDIR_ON_FAILURE,
 
     skipResearch: env.SKIP_RESEARCH,
+
+    servicePublicBaseUrl: env.SERVICE_PUBLIC_BASE_URL || `http://localhost:${env.PORT}`,
   };
 }
 

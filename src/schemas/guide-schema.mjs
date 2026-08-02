@@ -29,6 +29,29 @@ export const guideSchema = z.object({
     .max(9),
 });
 
+/* new_plan.md §9.2 — section mode is resolved in code (sections/classify.mjs),
+ * never asked of the LLM: the base guideSchema.sections shape above is
+ * unchanged. classifiedSectionSchema validates classify.mjs's OUTPUT (the
+ * guide's section list + the resolved mode/frameId), for defensiveness and
+ * so it's documented as a real, checked shape rather than just a JS object. */
+export const sectionModeSchema = z.enum(["static", "ai-required"]);
+
+export const classifiedSectionSchema = z
+  .object({
+    type: sectionTypeSchema,
+    summary: z.string().min(1).max(LIMITS.sectionSummary),
+    mode: sectionModeSchema,
+    frameId: z.string().min(1).nullable(),
+  })
+  .superRefine((val, ctx) => {
+    if (val.mode === "static" && val.frameId === null) {
+      ctx.addIssue({ code: "custom", path: ["frameId"], message: "frameId is required when mode is 'static'" });
+    }
+    if (val.mode === "ai-required" && val.frameId !== null) {
+      ctx.addIssue({ code: "custom", path: ["frameId"], message: "frameId must be null when mode is 'ai-required'" });
+    }
+  });
+
 function truncate(str, max) {
   if (typeof str !== "string" || str.length <= max) return str;
   return `${str.slice(0, max - 1).trimEnd()}…`;
