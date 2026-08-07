@@ -148,7 +148,7 @@ Status values a run can be in: `researching`, `drafting`, `coding`, `verifying`,
 
 Reference frames are real code — actual `.tsx`/`.jsx`/HTML+CSS files from the target repo's existing shared component library — not screenshots or a separate design-token file. The coding agent already has `read_file`/`list_files` tools to explore the repo, but relying on it to guess which files matter produces inconsistent results. Instead:
 
-- A human curates `design/catalog.mjs`: a mapping from section type (`hero`, `timeline`, `details`, `faq`, `testimonials`, `curriculum`, `pricing`, `instructor`, `footer-cta`, etc.) to one or more canonical example file paths in the target repo, with a short human-written note on when to use which.
+- A human curates `design-catalog/reference-examples.mjs`: a mapping from section type (`hero`, `timeline`, `details`, `faq`, `testimonials`, `curriculum`, `pricing`, `instructor`, `footer-cta`, etc.) to one or more canonical example file paths in the target repo, with a short human-written note on when to use which.
 - At `generate_guide` and `file_manifest`, the resolver fetches the actual contents of the relevant reference files and injects them into the coding agent's context — so "reuse or redesign a component" always starts from a concrete, real example, never a blank page.
 - This catalog is edited by a human whenever the target repo's component library changes — same "human sets the boundary, not the AI" philosophy as the write-path allowlist below.
 
@@ -169,7 +169,7 @@ This is the most business-critical structural constraint, so it's enforced two w
 - No hard character limit on the title, but explicit sizing guidance: keep it in a comfortable range (roughly 40–60 characters) and use responsive sizing (e.g. CSS `clamp()` or the existing type scale) so a longer title shrinks gracefully instead of wrapping awkwardly or pushing the form out of view.
 
 **What gets checked automatically, every time, at both viewport sizes:**
-- `verify/hero-fit.mjs` renders the staged page in a headless browser at a desktop size (e.g. 1440×900) and a mobile size (e.g. 390×844), measures the bounding boxes of the title, the video-or-details block, and the form, and fails the check if any of them falls below the visible viewport at either size — no scrolling required to see all three.
+- `verify/check-hero-visibility.mjs` renders the staged page in a headless browser at a desktop size (e.g. 1440×900) and a mobile size (e.g. 390×844), measures the bounding boxes of the title, the video-or-details block, and the form, and fails the check if any of them falls below the visible viewport at either size — no scrolling required to see all three.
 - On failure, the exact overflow (in pixels, per viewport) is fed back to the coding agent as a structured error, exactly like a failed lint rule. This is retryable, because it's objective — not a matter of taste.
 
 ### 4.6 Two-layer validation
@@ -268,15 +268,15 @@ Two organizing principles worth stating plainly, since most of the above falls o
 | Phase | Deliverable | Status |
 |---|---|---|
 | 0 | Core pipeline: intake → research → guide → manifest → clone → code, with the existing write-guard (layers 1–4) | ✅ Done — `documentation.md` v0.1 |
-| 1 | Design-context catalog + resolver; section-catalog enum in the guide schema | ✅ Done — v0.3. `design/catalog.mjs`'s reference paths are still placeholders, unverified against the real target repo (module.md Module 7) |
+| 1 | Design-context catalog + resolver; section-catalog enum in the guide schema | ✅ Done — v0.3. `design-catalog/reference-examples.mjs`'s reference paths are still placeholders, unverified against the real target repo (module.md Module 7) |
 | 2 | Deterministic verify suite: build/lint plus `hero-fit.mjs`, `seo-lint.mjs`, `a11y-lint.mjs` | ✅ Done — v0.5. hero-fit/seo/a11y have never run against a real Chromium in this dev sandbox (module.md Module 8) |
 | 3 | Database staging layer: `draft_files`, `runs`, versioning | ✅ Done — v0.11, extended v0.17 with per-section `section_slot` versioning (§9.6) |
 | 4 | Preview sandbox: containerized `preview_build`, port registry, idle teardown | ✅ Done — v0.15 |
 | 5 | LLM validation layer (`validate/`) — design conformance / content fidelity / SEO-quality report | ❌ **Superseded by §9 below — not being built as originally scoped.** The per-section gallery review (§9.7) replaces the need for a separate LLM judgment report. |
 | 6 | Review workflow: approve / edit (structured + raw) / reject-with-feedback / abandon | ❌ **Superseded by §9 below as originally scoped** (no raw-file editor, no separate structured-edit UI — §9.7's section gallery is the only review surface). **The underlying need — a real human gate before anything reaches git — is still open**, just implemented as §9.7 + Phase 7 below instead of this phase's original design. |
-| 7 | Commit/push/PR stage moved to fire only after approval | ✅ Done — v0.19. Graph now ends at `preview_build`; `orchestrator/review-actions.mjs`'s `approveRun`/`abandonRun` are the real human gate. Reject-with-feedback-and-regenerate deliberately deferred to pair with Module 4 (module.md). |
+| 7 | Commit/push/PR stage moved to fire only after approval | ✅ Done — v0.19. Graph now ends at `preview_build`; `pipeline/approve-or-abandon-run.mjs`'s `approveRun`/`abandonRun` are the real human gate. Reject-with-feedback-and-regenerate deliberately deferred to pair with Module 4 (module.md). |
 | 8 | Lead form component contract: honeypot, conditional job field, preview no-op mode | ✅ Done — v0.20. Real parent-platform lead-endpoint integration remains a separate external dependency, deliberately not built. Worth a follow-up: the real target repo's existing hero components actually use GHL iframes for lead capture, not a custom form — see v0.20's note. |
-| 9 | Marketing-facing review UI: campaign creation, live preview embed, approve/edit/reject actions | ✅ Done — v0.21, built as §9's gallery/modal (module.md Module 4) rather than a raw approve/edit/reject UI. `orchestrator/refine-actions.mjs` (`use-different-frame`/`modify`/`redesign`/`new`), `GET .../sections`, `POST .../sections/:slot/refine`, `SectionsPanel`/`RefineModal` in the UI. Bulk regenerate (module.md Module 6) still separate, deliberately last-priority. |
+| 9 | Marketing-facing review UI: campaign creation, live preview embed, approve/edit/reject actions | ✅ Done — v0.21, built as §9's gallery/modal (module.md Module 4) rather than a raw approve/edit/reject UI. `pipeline/refine-section.mjs` (`use-different-frame`/`modify`/`redesign`/`new`), `GET .../sections`, `POST .../sections/:slot/refine`, `SectionsPanel`/`RefineModal` in the UI. Bulk regenerate (module.md Module 6) still separate, deliberately last-priority. |
 | 10 | Observability, hardening, and the maintenance runbooks (§7) | 🔶 Partial — basic `/healthz` only; no cost tracking, no alerting |
 
 ---
@@ -304,7 +304,7 @@ Two organizing principles worth stating plainly, since most of the above falls o
 ```
 
 - **API container**: long-running, holds the SQLite database on a persistent volume, runs the orchestrator, serves the HTTP status/review API. Restart policy `unless-stopped`.
-- **Preview sandbox pool**: short-lived, one container per active review, hard resource caps, explicitly torn down by `preview/sandbox.mjs` on approval, rejection, or idle timeout — never silently auto-restarted, since a crashed preview should surface as "preview failed, please regenerate," not reappear unexpectedly.
+- **Preview sandbox pool**: short-lived, one container per active review, hard resource caps, explicitly torn down by `preview/preview-server.mjs` on approval, rejection, or idle timeout — never silently auto-restarted, since a crashed preview should surface as "preview failed, please regenerate," not reappear unexpectedly.
 - **Reverse proxy**: owns TLS, routes the API, and routes each run's internal preview path.
 
 ### 7.2 Startup / crash recovery
@@ -378,13 +378,13 @@ The original plan generates the entire page through one monolithic agentic codin
 
 ### 9.2 Section classification (replaces "guide chooses sections" as the whole story)
 
-- `schemas/brief-schema.mjs` gains an optional `aiRequiredSections: SectionType[]` field — the marketer can flag specific section types as needing bespoke AI generation instead of static templating (e.g., "I want a custom pricing layout this time").
+- `schemas/campaign-brief-schema.mjs` gains an optional `aiRequiredSections: SectionType[]` field — the marketer can flag specific section types as needing bespoke AI generation instead of static templating (e.g., "I want a custom pricing layout this time").
 - Resolution rule, applied in code, not asked of the LLM: `hero` is **always** `ai-required`. Every other section is `static` **unless** it's in the brief's `aiRequiredSections`, or the fixed frame catalog (§9.3) has no static candidate for that section type at all (nothing to template against, so it falls back to `ai-required` automatically).
 - `guide` still produces the ordered section list (type + summary) exactly as today; classification is a separate, pure, deterministic pass over that list — independently testable without a live LLM call.
 
-### 9.3 Static frame catalog (new: `design/frame-catalog.mjs`)
+### 9.3 Static frame catalog (new: `design-catalog/static-frame-catalog.mjs`)
 
-Candidate static components are sourced from the **target repo's own analyzed component library** — `src/components/frames/landing/analyze/` in the `atss-frontend` repo, a set of ~53 legacy "Frame*" components catalogued and renamed by section type earlier in this project, each already following one uniform shape: `function XFrame({ data = defaultXData }: { data?: XData })`. `design/frame-catalog.mjs` is the human-curated bridge from the fixed `SECTION_TYPES` enum (`design/schema.mjs`) to these real components — analogous to `design/catalog.mjs`, but for literal reuse (§9.4) instead of LLM grounding.
+Candidate static components are sourced from the **target repo's own analyzed component library** — `src/components/frames/landing/analyze/` in the `atss-frontend` repo, a set of ~53 legacy "Frame*" components catalogued and renamed by section type earlier in this project, each already following one uniform shape: `function XFrame({ data = defaultXData }: { data?: XData })`. `design-catalog/static-frame-catalog.mjs` is the human-curated bridge from the fixed `SECTION_TYPES` enum (`design-catalog/section-types.mjs`) to these real components — analogous to `design-catalog/reference-examples.mjs`, but for literal reuse (§9.4) instead of LLM grounding.
 
 Each catalog entry declares:
 - `component` / `importPath` — which real frame and how to import it.
@@ -420,7 +420,7 @@ Approve still does exactly what §4.7/§5 already specify: commit only the manif
 
 ### 9.10 Build order
 
-1. Section-mode schema (`brief-schema.mjs`, `guide-schema.mjs`) + `design/frame-catalog.mjs` + `populate-frame.mjs` — no AI risk, ships first, independently testable.
+1. Section-mode schema (`brief-schema.mjs`, `guide-schema.mjs`) + `design-catalog/static-frame-catalog.mjs` + `populate-frame.mjs` — no AI risk, ships first, independently testable.
 2. Parallel assembly (§9.5/§9.6) + first full-page verify/preview — proves the fast-path end to end.
 3. Per-section click-to-refine (§9.7) wired into a new gallery/modal UI.
 4. Bulk-regenerate (§9.8) — last, lowest priority.

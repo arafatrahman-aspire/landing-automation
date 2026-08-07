@@ -21,7 +21,7 @@ project. Given a campaign brief, it:
 
 GitHub itself — the PR, its commits, and a `CODEGEN_LOG.md` committed
 alongside the new page — is the durable record of what happened and why.
-The local SQLite database (`src/state/schema.mjs`) tracks campaign briefs,
+The local SQLite database (`src/state/database-schema.mjs`) tracks campaign briefs,
 run status/logs, and staged draft file versions for the HTTP status API and
 UI while the service is alive; nothing in it is required to understand a
 merged PR after the fact.
@@ -90,7 +90,7 @@ create campaigns and watch runs progress without curl. See
 
 ## Safety model
 
-The write tool (`src/ai/tools.mjs`) enforces four independent checks, in
+The write tool (`src/llm/filesystem-tools.mjs`) enforces four independent checks, in
 order, before any file is written — a hole in one can't defeat the others:
 
 1. **Path containment** — no `..`, no absolute paths; must resolve inside the scratch clone.

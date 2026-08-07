@@ -9,7 +9,7 @@
 import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { runCodingAgent } from "../src/ai/coding-agent.mjs";
+import { runCodingAgent } from "../src/llm/coding-agent.mjs";
 
 const root = await mkdtemp(path.join(tmpdir(), "agent-harness-"));
 console.log(`Fixture repo: ${root}`);

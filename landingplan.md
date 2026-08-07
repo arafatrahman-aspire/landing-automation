@@ -64,7 +64,7 @@ POST /campaigns  (brief JSON)
                                         └────────┘     └─────────┘
 ```
 
-Each node in this state machine is a LangGraph step (`src/orchestrator/graph.mjs`). The conditional edge at `verify` either routes to `commit` (pass) or back to `code` with the error report (retry, max `MAX_CODE_ATTEMPTS`). Exhausted retries route straight to `END` — no broken code ever reaches a branch or PR.
+Each node in this state machine is a LangGraph step (`src/pipeline/run-campaign-pipeline.mjs`). The conditional edge at `verify` either routes to `commit` (pass) or back to `code` with the error report (retry, max `MAX_CODE_ATTEMPTS`). Exhausted retries route straight to `END` — no broken code ever reaches a branch or PR.
 
 ---
 
@@ -72,7 +72,7 @@ Each node in this state machine is a LangGraph step (`src/orchestrator/graph.mjs
 
 ### 4.1 Campaign Intake (P0)
 - `POST /campaigns` with validated brief: slug, campaignName, offer, audience, CTA, free-form notes.
-- Zod schema (`src/schemas/brief-schema.mjs`): slug is lowercase kebab-case, all fields length-bounded.
+- Zod schema (`src/schemas/campaign-brief-schema.mjs`): slug is lowercase kebab-case, all fields length-bounded.
 - Returns `202` with a `runId` and status URL for polling.
 
 ### 4.2 Research Agent (P0)
@@ -200,7 +200,7 @@ new_approach/
 
 ## 6. Safety Model (The Write Guard)
 
-The `write_file` tool in `src/ai/tools.mjs` enforces **four independent checks** in strict order. A hole in any layer cannot defeat the others:
+The `write_file` tool in `src/llm/filesystem-tools.mjs` enforces **four independent checks** in strict order. A hole in any layer cannot defeat the others:
 
 ### Layer 1: Path Containment
 - No absolute paths (`/etc/passwd` → rejected).

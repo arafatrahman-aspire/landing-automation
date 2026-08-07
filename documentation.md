@@ -1736,3 +1736,360 @@ work.
 **Files touched:** new `src/orchestrator/refine-actions.mjs`; `src/sections/generate-sections.mjs`,
 `src/server.mjs`; new `test/refine-actions.test.mjs`; UI: `ui/src/api.ts`,
 `ui/src/pages/RunDetailPage.tsx`, `ui/src/App.css`.
+
+### v0.22 — Readability restructure — 2026-08-02 — Renamed/reorganized `src/` for humans (no behavior change)
+
+**Why:** the file/folder layout had drifted into a shape only someone who'd
+built it could navigate — 13 small domain folders with some genuinely
+uninformative names (`index.mjs`, `ops.mjs`, `api.mjs`, `sandbox.mjs`,
+`db.mjs`), and one 580-line `orchestrator/steps.mjs` mixing 9 unrelated
+pipeline stages plus several unrelated helpers in a single file. Requested
+directly, with the explicit scope of a project-wide rename, not just an
+architecture change. Zero logic changed anywhere in this pass — every
+edit is a rename, a relocation, or splitting one file into several with the
+same code moved verbatim; the 155-then-157-test suite is the proof (same
+pass/fail/skip counts before and after).
+
+**What changed** — old path → new path, folder by folder:
+
+- `src/ai/` → `src/llm/`: `text.mjs` → `generate-text.mjs`, `tools.mjs` → `filesystem-tools.mjs`, `coding-agent.mjs` unchanged.
+- `src/orchestrator/` → `src/pipeline/`: `graph.mjs` → `run-campaign-pipeline.mjs`, `review-actions.mjs` → `approve-or-abandon-run.mjs`, `refine-actions.mjs` → `refine-section.mjs`. `steps.mjs` (580 lines) split into `pipeline/steps/` — one file per LangGraph stage (`01-intake.mjs` … `09-start-preview.mjs`), plus `find-existing-imports.mjs` (a helper, not a stage) and `commit-push-and-open-pr.mjs` (the three post-approval functions, no longer graph nodes since Phase 7). `pipeline/steps/index.mjs` re-exports all of them so `run-campaign-pipeline.mjs` keeps one `import * as steps` line.
+- `src/design/` → `src/design-catalog/`: `schema.mjs` → `section-types.mjs`, `catalog.mjs` → `reference-examples.mjs`, `resolve.mjs` → `resolve-references.mjs`, `frame-catalog.mjs` → `static-frame-catalog.mjs`.
+- `src/sections/`: `classify.mjs` → `classify-sections.mjs`, `populate-frame.mjs` → `fill-static-frame.mjs`. `generate-sections.mjs` (256 lines, several unrelated concerns) split into: `generate-sections.mjs` (kept — just the fan-out dispatcher + `buildStaticSectionFile`), `compose-page.mjs` (path/slot helpers + `composePage`), `hero-contract.mjs` (`buildHeroContract`), `section-agent-prompt.mjs` (`buildSectionAgentSystemPrompt`), `write-guarded-file.mjs` (`writeGuardedFile`, shared with `refine-section.mjs`).
+- `src/verify/`: `index.mjs` → `run-full-verify-suite.mjs` (the single worst name in the repo — gave zero information), `build.mjs` → `build-and-lint.mjs`, `local-server.mjs` → `ephemeral-server.mjs`, `package-manager.mjs` → `detect-package-manager.mjs`, `hero-fit.mjs` → `check-hero-visibility.mjs`, `seo-lint.mjs` → `check-seo-tags.mjs`, `a11y-lint.mjs` → `check-accessibility.mjs`. `docker-build.mjs` unchanged.
+- `src/preview/sandbox.mjs` → `src/preview/preview-server.mjs` ("sandbox" was jargon; it starts/stops/tracks a live preview server).
+- `src/staging/draft-store.mjs` → `src/staging/draft-versions.mjs`.
+- `src/state/`: `db.mjs` → `database-connection.mjs`, `schema.mjs` → `database-schema.mjs`, `repository.mjs` → `campaign-repository.mjs`, `sqlite-repository.mjs` → `sqlite-campaign-repository.mjs`.
+- `src/git/ops.mjs` → `src/git/clone-and-commit.mjs`; `src/github/api.mjs` → `src/github/open-pull-request.mjs` (both old names were generic enough to be interchangeable at a glance, which was itself confusing).
+- `src/schemas/brief-schema.mjs` → `campaign-brief-schema.mjs`; `guide-schema.mjs` → `content-guide-schema.mjs`.
+- Every file under `test/` renamed to mirror its source file 1:1, and split the same way `generate-sections.test.mjs` was split (new `compose-page.test.mjs`, `section-agent-prompt.test.mjs`).
+- Comments were also passed over: every large block comment that used to sit above a whole function was broken into smaller comments placed next to the specific sub-block or line it actually explains, rather than one paragraph up top covering the whole function.
+
+**Deliberately out of scope:** `ui/` (already clearly named — `CampaignListPage.tsx`, `api.ts`, etc.); replacing LangGraph itself (`StateGraph`/`Annotation`/`START`/`END` is a library dependency, not something a rename touches); a project-wide identifier audit (`resolveWritePath`, `runFullVerifySuite`, `classifySections`, `createPullRequest`, Express's `req`/`res` were already clear and left alone); the `design-catalog/static-frame-catalog.mjs` "frame"/`frameId` terminology (touches the public API shape and the UI — disproportionate to a readability pass).
+
+**Verification:** `npm test` — 157 tests, 149 pass, 8 pre-existing skips, 0 fail, identical to the pre-restructure baseline. `cd ui && npm run build && npm run lint` — clean. `createCodegenGraph()` compile smoke test — passes. Booted the real `src/server.mjs` and confirmed `/healthz` returns 200. Repo-wide grep swept `src/`, `test/`, `dev/run-agent-standalone.mjs`, and this project's own docs (`README.md`, `new_plan.md`, `module.md`, `workflow.md`, `landingplan.md`) for every old filename — none left outside this changelog's own historical entries above, which describe what was true at the time and are intentionally not rewritten.
+
+**Known pre-existing staleness NOT fixed by this pass** (out of scope — this was a rename, not a content audit): `workflow.md` still shows the old `file_manifest → code` pipeline shape (superseded by Hybrid Section Assembly, v0.16) and still points at the long-retired flat-JSON `state/run-store.mjs` instead of the current SQLite `state/campaign-repository.mjs` — both predate this restructure and are a separate doc-accuracy cleanup, not a path rename.
+
+**Files touched:** every file under `src/` except `config.mjs`, `server.mjs` (renamed imports, not itself), `leadform/`, and `verify/docker-build.mjs`; every file under `test/`; `dev/run-agent-standalone.mjs`; `README.md`, `new_plan.md`, `module.md`, `workflow.md`, `landingplan.md`.
+
+### v0.23 — Bugfix + Feature — 2026-08-04 — Root-caused the "always failing" build, crash resume, animated log console
+
+Three separate pieces of work, driven by a real failing run.
+
+**1. Why every build was failing (two independent root causes, neither one "verify being too strict").**
+
+The pasted failure showed five errors. Four were `Module not found: Can't
+resolve '@components/frames/landing/analyze/…'` and one was the hero using
+`useState` without a `"use client"` directive.
+
+*Cause A — the frame components were never committed.* The target repo's
+`src/components/frames/landing/analyze/` directory is **untracked in git**:
+`git ls-files` returns 0 files for it and `git status` shows `?? …/analyze/`.
+Those ~53 components exist only in the local `_base` working copy. Every run
+creates a fresh `git worktree` off the `dev` branch, which by definition
+contains only committed files — so the whole `analyze/` folder was absent from
+every run's workdir, and every static section emitted an import to a file that
+wasn't there. Proven directly: the frame resolver reports **8/8 catalog frames
+present in `_base`, 0/8 in an actual run worktree.**
+
+This was *unfixable by the retry loop*, which is what made it look permanent:
+static sections are templated from the catalog, not written by the coding
+agent, so a verify-failure retry regenerates the identical broken import.
+
+*Cause B — no `"use client"`.* The hero always renders a stateful lead form,
+but nothing in its prompt mentioned that a Next.js App Router component using
+hooks must declare `"use client"` as its first line. The target repo's own
+interactive frames all do — the convention existed, the agent just wasn't told.
+
+**Fixes (deliberately root causes, not a lowered bar).** Weakening verify would
+only have shipped broken pages into PRs; the gate correctly caught five real
+defects. Instead:
+- New `src/design-catalog/resolve-frame-file.mjs` resolves a candidate's
+  `importPath` through the target repo's *own* `tsconfig.json`/`jsconfig.json`
+  `paths` aliases (handles JSONC, `baseUrl`, directory/index imports, and falls
+  back to repo- and `src/`-relative resolution when there's no config).
+- `pipeline/steps/05-classify-sections.mjs` now preflights every catalog frame
+  against the real workdir. A section whose frames are missing **degrades to
+  `ai-required`** — the agent writes it from scratch — instead of guaranteeing
+  a failed build. Missing frames are logged loudly as a catalog-curation bug.
+- `sections/classify-sections.mjs` takes an `isFrameAvailable` predicate and
+  picks the first *available* candidate. The I/O stays in the pipeline step, so
+  both functions remain pure and unit-testable.
+- `sections/section-agent-prompt.mjs` now specifies the `"use client"`
+  requirement explicitly.
+
+*Still worth doing on your side:* commit and push `analyze/` to the target
+repo, so those sections go back to being free/static instead of AI-generated.
+Note `SyllabusAccordionFrame.tsx` uses hooks but has no `'use client'` of its
+own, so it would need that line added before it builds.
+
+**2. Crash resume — plus two data-loss bugs found while building it.**
+
+- `reconcileCrashedRuns()` marked *every* non-terminal run failed on boot,
+  and `staged_for_review` is deliberately non-terminal — so **restarting the
+  service destroyed every run awaiting human review**, discarding finished,
+  already-paid-for work.
+- Worse, `stopPreviewRow()` deleted the run's git worktree whenever a preview
+  stopped. Since approve's `commit()` runs git *inside* that worktree, both a
+  service restart and a routine 30-minute idle-preview sweep left a reviewable
+  run impossible to approve.
+
+Now: runs awaiting review are left completely untouched; the worktree is only
+removed once the run itself is terminal; runs caught mid-commit/push are still
+flagged for manual attention (git can't be safely re-driven); and everything
+else mid-generation is re-driven by the new
+`src/pipeline/resume-interrupted-runs.mjs`. Resume re-runs the pipeline rather
+than restoring a mid-graph snapshot (there's no checkpointer), but research
+notes and the content plan are now persisted and reused, so a resumed run skips
+both of those LLM calls. Section files are intentionally *not* replayed from
+`draft_files` — a resumed run gets a fresh worktree, and replaying an unverified
+draft would be trusting output that never passed verify. Toggle with
+`RESUME_INTERRUPTED_RUNS` (default on).
+
+**3. Animated live log console + UI motion.** The log was a flat `<pre>`. It's
+now a parsed console: timestamps, per-stage badges, and severity colouring
+(pass/warn/fail) derived from each line, with new lines sliding in, a blinking
+cursor and breathing glow while a run is live, and auto-follow that politely
+stops when you scroll up to read scrollback. Continuation lines (stack traces,
+multi-line verify reports) fold into their parent entry instead of being
+dropped. The stepper's active stage pulses, completed steps pop, failures
+shake. All of it sits behind `prefers-reduced-motion`.
+
+**Verification:** 174 tests, 166 pass, 8 pre-existing skips, 0 fail (up from
+157/149 — 17 new). The frame resolver was validated against the real target
+repo (8/8 vs 0/8). The schema migration was run against a copy of the real live
+`data/campaigns.db`. Server boots and `/healthz` responds. UI builds and lints
+clean. The log parser was checked against a real 89-line run log from the live
+database. **Not verified:** no live end-to-end LLM run — the "use client" prompt
+fix in particular is only confirmed to be present in the prompt, not yet
+observed changing real model output.
+
+**Files touched:** new `src/design-catalog/resolve-frame-file.mjs`,
+`src/pipeline/resume-interrupted-runs.mjs`; `src/sections/classify-sections.mjs`,
+`src/sections/section-agent-prompt.mjs`, `src/pipeline/steps/05-classify-sections.mjs`,
+`02-research.mjs`, `03-generate-guide.mjs`, `04-clone-target-repo.mjs`,
+`src/state/sqlite-campaign-repository.mjs`, `src/state/database-schema.mjs`,
+`src/preview/preview-server.mjs`, `src/config.mjs`, `src/server.mjs`,
+`.env.example`; new `test/resolve-frame-file.test.mjs`,
+`test/resume-interrupted-runs.test.mjs`; UI: `ui/src/pages/RunDetailPage.tsx`,
+`ui/src/App.css`.
+
+### v0.24 — Bugfix — 2026-08-04 — The run log was hiding every build error; verify history is now persisted
+
+**The complaint that triggered this:** a verify failure whose log entry ended
+mid-word at `- Env`, showing nothing but npm install chatter. The actual
+compiler error was invisible.
+
+**Root cause:** `07-verify.mjs` logged `result.report.slice(0, 500)`. A failing
+`npm ci && npm run build` emits ~1400 characters of package counts, funding
+notices, audit summaries, deprecation warnings and npm upgrade notices *before*
+the compiler says anything. So the 500-character budget was spent entirely on
+chatter, and every failure logged identically regardless of what actually broke.
+The real report was 2313 characters with the error starting past character 1400.
+
+New `src/verify/summarize-report.mjs` strips package-manager bookkeeping and
+seeks to the first real failure marker (`Failed to compile`, `Module not found`,
+`Syntax Error`, `Type error`, …), keeping the command header for context. The
+full report is still passed verbatim to the retry prompt and stored — this only
+governs what the one-line log entry shows. Verified against the real stored
+report from run `aee7e242`: the old slice contained no error text at all; the
+new summary leads with `Failed to compile.` and both failing files.
+
+**Verify history is now persisted.** The `verify_reports` table had existed
+since Phase 3 with **zero writers**. A failing run never reaches `stage_draft`
+and its scratch worktree is disposable, so the only surviving copy of a failure
+was `runs.error` — written once, after retries are exhausted, discarding every
+earlier attempt's report. `recordVerifyReport()`/`listVerifyReports()` now keep
+one row per attempt.
+
+**`deleteRun` was broken for any run with child rows.** It cleared only
+`draft_files` and `run_logs`, but seven tables carry a foreign key to `runs` and
+`PRAGMA foreign_keys` is ON — so a run that had ever started a preview could not
+be deleted at all. Now driven off a single `CHILD_TABLES_OF_RUNS` list.
+
+**Two agent-behaviour fixes, from the errors that surfaced once the earlier
+frame/`use client` fixes cleared the way:**
+- `Can't resolve '../../../components/Accordion'` — the agent invented a local
+  component. `find-existing-imports.mjs` used to reduce such a specifier to a
+  "base package" of `..` and grep for it, matching nearly every relative import
+  in the repo and flooding the retry prompt with noise. Relative specifiers now
+  get a direct instruction instead: don't import a project-local file you
+  haven't opened; implement the element inline.
+- The section prompt now also forbids importing unopened project-local files and
+  requires a complete, parseable file in one write.
+
+**Confirmed working from the previous version:** the `@components/frames/…`
+resolution errors and the `useState`-without-`"use client"` error are both gone
+from this run — v0.23's frame-availability fallback and prompt fix did their job.
+The remaining failures are new and different.
+
+**Still unexplained:** `HeroSection0.tsx` failed with `Unexpected token
+'section'. Expected jsx identifier` at a plain `<section>` tag. The generated
+file could not be inspected — the run never staged (staging happens only after
+verify passes) and its worktree was already gone, despite
+`KEEP_WORKDIR_ON_FAILURE=true`. Prompt hardening around complete/parseable
+output is a mitigation, not a diagnosis; the persisted verify reports mean the
+next occurrence will at least be fully recorded.
+
+**Verification:** 185 tests, 177 pass, 8 pre-existing skips, 0 fail (11 new).
+The summarizer is tested against the real 2313-char report from the live
+database. Server boots, `/healthz` responds, live DB untouched. One transient
+assertion failure was seen once and did not reproduce across five subsequent
+full runs — most likely a timing flake in the docker/preview tests, not
+confirmed fixed.
+
+**Files touched:** new `src/verify/summarize-report.mjs`;
+`src/pipeline/steps/07-verify.mjs`, `src/pipeline/steps/find-existing-imports.mjs`,
+`src/sections/section-agent-prompt.mjs`, `src/state/sqlite-campaign-repository.mjs`;
+new `test/summarize-report.test.mjs`; extended `test/find-existing-imports.test.mjs`,
+`test/sqlite-campaign-repository.test.mjs`.
+
+### v0.25 — Feature — 2026-08-04 — Verify retries now REPAIR the broken file instead of regenerating everything
+
+**The pattern that forced this.** Three consecutive real runs each failed on a
+different, unrelated mistake: a missing frame component, then an invented
+`../../../components/Accordion` import plus a JSX syntax error, then
+`Cannot find name 'toggleFqa'. Did you mean 'toggleFaq'?`. Each individual
+failure was trivial. The run still never converged.
+
+**Root cause — the retry was a re-roll, not a fix.** On a verify failure the
+graph routes back to `generate_sections`, which regenerated **every**
+ai-required section with the task prompt *"Explore the repository, then
+implement X at path"*. Two consequences:
+
+1. The agent never read its own previous attempt. A one-token typo fix was
+   re-rolled as a from-scratch rewrite of the whole component.
+2. Sections that had compiled perfectly were rewritten too — so a retry could
+   turn one broken file into a *different* broken file. That is precisely why
+   consecutive attempts kept failing on unrelated errors.
+
+With `MAX_CODE_ATTEMPTS=2` that amounted to exactly one extra roll of the dice.
+
+**The fix.** New `src/verify/failing-files.mjs` parses the build report for the
+files it actually blames — handling tsc `file.tsx:51:32` errors, webpack
+`Module not found` blocks, and ANSI-coloured swc syntax errors carrying a
+docker `/app/` prefix. It only ever blames files under the campaign's own
+allowlist, and never `page.tsx` (composed deterministically, never
+agent-written, but present in every import trace).
+
+`generateSections()` now takes `retryFailedPaths` + `previousSectionResults`:
+- Sections **not** blamed are skipped entirely and their previous result is
+  carried forward verbatim — no rewrite, no regression risk, no LLM cost.
+- A blamed section is put in **repair mode**: *"Your previous attempt is
+  ALREADY WRITTEN at <path> and the build FAILED on it. Call read_file on it
+  first, then fix the specific reported error — most failures here are a single
+  typo, a mismatched name, or one bad import, so change as little as possible."*
+- If the failure can't be attributed to any file, it falls back to the old
+  regenerate-everything behaviour, which is the only safe option.
+
+`MAX_CODE_ATTEMPTS` default raised 2 → 3 (and in `.env`): a retry is now a
+cheap single-file repair rather than a full regeneration, so more attempts buy
+real convergence instead of more dice.
+
+**Verification:** 194 tests, 186 pass, 8 pre-existing skips, 0 fail (13 new).
+The blame extractor is tested against all three real failure reports verbatim.
+A real end-to-end test proves an unblamed section is preserved **byte for
+byte** across a targeted retry, and that an unattributable failure still
+regenerates everything. Graph compiles, server boots, `/healthz` responds.
+
+**Not verified:** no live LLM run — repair mode is confirmed to be wired and
+prompted correctly, but not yet observed fixing a real typo end to end.
+
+**Files touched:** new `src/verify/failing-files.mjs`;
+`src/sections/generate-sections.mjs`, `src/pipeline/steps/06-generate-sections.mjs`,
+`src/config.mjs`, `.env`, `.env.example`; new `test/failing-files.test.mjs`;
+extended `test/generate-sections.test.mjs`.
+
+### v0.26 — Bugfix — 2026-08-05 — Generated code now respects the target repo's TypeScript strictness
+
+**The failure:** `Type error: Binding element 'children' implicitly has an
+'any' type.` on
+`const Button = ({ children, type = 'button', onClick, disabled, className }) => (`
+
+**Not a version conflict** (the question that prompted this). Two facts settle it:
+1. The target repo's `tsconfig.json` sets `"strict": true`, which implies
+   `noImplicitAny`.
+2. `next build` runs the type checker, so an untyped destructured prop is a
+   hard build failure, not a warning.
+
+Nothing in the section prompt ever mentioned that the repo type-checks
+strictly — and the repo's own components already follow a clear convention
+(`interface IProps { … }` then `}: IProps) => {`) that the agent had no reason
+to know about. It wrote idiomatic *JavaScript* React into a `.tsx` file in a
+strict TypeScript project.
+
+**Fix:** new `src/pipeline/steps/detect-typescript-strictness.mjs` reads the
+target repo's own `tsconfig.json` (JSONC-tolerant) and builds a prompt fragment
+describing what its type checker will accept: every parameter and destructured
+prop explicitly typed, the repo's `interface IProps` convention, typed React
+event handlers, typed nested helper components, `?` for optional props. It
+assumes strict whenever strictness can't be disproved (e.g. inherited through
+`extends`) — adding types to a loose repo is harmless, omitting them in a
+strict one is fatal. A repo with no `tsconfig.json` gets no fragment at all.
+
+Threaded through `generateSections()` **and** `refine-section.mjs` — refine
+builds its own prompt, so leaving it out would let a refined section
+reintroduce the exact failure the pipeline had just fixed.
+
+**Also confirmed working from v0.24:** the generated file contained the comment
+*"Basic Button component for local use, as external components cannot be
+imported without prior exploration"* — the agent built the button inline
+instead of inventing an import, which is precisely what that version's
+invented-import rule asked for.
+
+**Verification:** 201 tests, 193 pass, 8 pre-existing skips, 0 fail (7 new).
+The detector was run against the real target repo and correctly reports
+`{isTypeScript: true, strict: true}`. Graph compiles, server boots, `/healthz`
+responds.
+
+**Not verified:** no live LLM run — the rules are confirmed present in the
+prompt and correct for this repo, but not yet observed changing model output.
+
+**Files touched:** new `src/pipeline/steps/detect-typescript-strictness.mjs`;
+`src/sections/section-agent-prompt.mjs`, `src/sections/generate-sections.mjs`,
+`src/pipeline/steps/06-generate-sections.mjs`, `src/pipeline/refine-section.mjs`;
+new `test/detect-typescript-strictness.test.mjs`; extended
+`test/section-agent-prompt.test.mjs`.
+
+### v0.27 — Feature (escape hatch) — 2026-08-05 — CONTINUE_ON_VERIFY_FAILURE: stage an unbuildable draft for review anyway
+
+**Requested explicitly** ("for now if it fails, then skips the verification")
+after four consecutive real runs each failed on a different generation defect.
+The concern that a weakened gate lets non-compiling code reach a PR was raised
+earlier and reaffirmed by the user; this implements it as a deliberate,
+reversible switch rather than a behaviour change.
+
+**What it does.** When verify still fails after every retry, the graph routes to
+`stage_draft` instead of `END`, so the run reaches `staged_for_review` with a
+preview, exactly like a passing run — except it is flagged.
+
+**What keeps it honest:**
+- Off by default (`CONTINUE_ON_VERIFY_FAILURE=false` in `.env.example`; enabled
+  in the local `.env`). Default routing is unchanged and still tested.
+- It does **not** short-circuit repair: retries still run to exhaustion first,
+  so the targeted-repair loop (v0.25) gets every attempt it would have had.
+- The run carries a new `verifyBypassed` flag (new `runs.verify_bypassed`
+  column, additive migration) and keeps the full failure report in `runs.error`.
+- The run log states plainly: *"THE PAGE IS NOT KNOWN TO BUILD; do not approve
+  it without checking the errors above."*
+- The review panel replaces its normal "verification passed" copy with a red
+  banner: **"This page does NOT build."** — approving opens a PR containing code
+  that does not compile.
+
+**Bug caught by the new test before it shipped:** `node:sqlite` cannot bind a
+JavaScript boolean, and `07-verify.mjs` passes `verifyBypassed` on *every*
+verify — so this would have thrown on every single run. `updateRun` now coerces
+booleans to the 0/1 integer SQLite actually stores.
+
+**Verification:** 206 tests, 198 pass, 8 pre-existing skips, 0 fail (5 new).
+The routing decision table is pinned for all four combinations (pass / retries
+left / exhausted+flag / exhausted+no-flag), and default behaviour is asserted
+unchanged. Additive migration run against a copy of the real live
+`data/campaigns.db`. Graph compiles, server boots, UI builds and lints clean.
+
+**Files touched:** `src/config.mjs`, `src/pipeline/run-campaign-pipeline.mjs`,
+`src/pipeline/steps/07-verify.mjs`, `src/state/sqlite-campaign-repository.mjs`,
+`src/state/database-schema.mjs`, `.env`, `.env.example`; new
+`test/continue-on-verify-failure.test.mjs`; UI: `ui/src/api.ts`,
+`ui/src/pages/RunDetailPage.tsx`, `ui/src/App.css`.

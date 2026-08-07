@@ -18,7 +18,7 @@ import {
   type RefineAction,
 } from "../api";
 
-// Must stay in sync with src/design/schema.mjs's SECTION_TYPES — duplicated
+// Must stay in sync with src/design-catalog/section-types.mjs's SECTION_TYPES — duplicated
 // here since the UI can't import a backend .mjs module directly.
 const SECTION_TYPES = ["hero", "details", "timeline", "testimonials", "faq", "curriculum", "pricing", "instructor", "footer-cta"];
 
@@ -60,6 +60,112 @@ const STAGES: { key: string; label: string }[] = [
 
 function statusLabel(status: string): string {
   return status.replaceAll("_", " ");
+}
+
+/* ---------------- Live log console ---------------- */
+
+type LogLine = { id: number; time: string; level: string; stage: string | null; message: string };
+
+// The backend writes plain text lines shaped "[iso-ts] [level] message", where
+// most messages are themselves prefixed "stage: ...". Parsing that back out
+// lets each line be colored and grouped instead of rendered as a flat blob.
+const LOG_LINE_RE = /^\[([^\]]+)\]\s*\[([^\]]+)\]\s*([\s\S]*)$/;
+const KNOWN_STAGES = new Set(
+  STAGES.map((s) => s.key).concat([
+    "generate_sections",
+    "classify_sections",
+    "open_pr",
+    "resume",
+    "refine",
+    // Legacy stage names still present in the logs of runs created before the
+    // Hybrid Section Assembly change — kept so old runs still render badges.
+    "file_manifest",
+    "code",
+  ])
+);
+
+function parseLog(raw: string): LogLine[] {
+  const lines: LogLine[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    const match = LOG_LINE_RE.exec(line);
+    if (!match) {
+      // A continuation line (e.g. a stack trace) — attach it to the line above
+      // rather than dropping it or pretending it's its own entry.
+      const prev = lines[lines.length - 1];
+      if (prev) prev.message += `\n${line}`;
+      continue;
+    }
+    const [, time, level, rest] = match;
+    const stageMatch = /^([a-z_]+):\s*/.exec(rest);
+    const stage = stageMatch && KNOWN_STAGES.has(stageMatch[1]) ? stageMatch[1] : null;
+    lines.push({
+      id: lines.length,
+      time: time.slice(11, 19), // HH:MM:SS — the date is noise at this density
+      level: level.toLowerCase(),
+      stage,
+      message: stage ? rest.slice(stageMatch![0].length) : rest,
+    });
+  }
+  return lines;
+}
+
+// Highlights the parts of a message a human actually scans for: verdicts,
+// file paths, and counts.
+function severityOf(line: LogLine): string {
+  if (line.level === "error") return "err";
+  const m = line.message.toUpperCase();
+  if (m.includes("FAILED") || m.includes("REJECTED")) return "err";
+  if (m.includes("WARNING") || m.includes("SKIPPED")) return "warn";
+  if (m.includes("PASSED") || m.includes("DONE") || m.includes("SUCCEEDED")) return "ok";
+  return "info";
+}
+
+function LogConsole({ raw, live }: { raw: string; live: boolean }) {
+  const lines = parseLog(raw);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const stickToBottom = useRef(true);
+
+  // Only auto-scroll when the reader is already at the bottom — yanking the
+  // view down while they're reading scrollback is worse than not following.
+  function handleScroll() {
+    const el = bodyRef.current;
+    if (!el) return;
+    stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  }
+
+  useEffect(() => {
+    if (stickToBottom.current) bodyRef.current?.scrollTo({ top: bodyRef.current.scrollHeight });
+  }, [raw]);
+
+  return (
+    <div className={`console ${live ? "is-live" : ""}`}>
+      <div className="console-bar">
+        <span className="console-dot console-dot-r" />
+        <span className="console-dot console-dot-y" />
+        <span className="console-dot console-dot-g" />
+        <span className="console-title">run log</span>
+        {live && (
+          <span className="console-live">
+            <span className="console-live-dot" />
+            live
+          </span>
+        )}
+        <span className="console-count">{lines.length} lines</span>
+      </div>
+      <div className="console-body" ref={bodyRef} onScroll={handleScroll}>
+        {lines.length === 0 && <div className="console-empty">waiting for output…</div>}
+        {lines.map((line) => (
+          <div key={line.id} className={`console-line sev-${severityOf(line)}`}>
+            <span className="console-time">{line.time}</span>
+            {line.stage && <span className="console-stage">{line.stage}</span>}
+            <span className="console-msg">{line.message}</span>
+          </div>
+        ))}
+        {live && <div className="console-cursor" />}
+      </div>
+    </div>
+  );
 }
 
 function Stepper({ run }: { run: RunSummary }) {
@@ -365,7 +471,7 @@ function SectionsPanel({ runId, onRefined }: { runId: string; onRefined: () => v
 /** Phase 7 — the human approval gate. Only rendered while
  *  status === "staged_for_review"; nothing this service generates reaches
  *  git before Approve is clicked. */
-function ReviewPanel({ runId, onDecided }: { runId: string; onDecided: () => void }) {
+function ReviewPanel({ runId, onDecided, verifyBypassed }: { runId: string; onDecided: () => void; verifyBypassed?: boolean }) {
   const [busy, setBusy] = useState<"approve" | "abandon" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -404,10 +510,18 @@ function ReviewPanel({ runId, onDecided }: { runId: string; onDecided: () => voi
         <span className="status-pill status-warn">awaiting your decision</span>
       </div>
       <div className="card-body">
-        <p style={{ marginTop: 0 }}>
-          Verification passed and a preview is staged above. Nothing has been committed or pushed yet — approve to open a
-          pull request, or abandon to end this run without touching git.
-        </p>
+        {verifyBypassed ? (
+          <div className="danger-banner">
+            <strong>This page does NOT build.</strong> Verification failed on every attempt and the draft was staged
+            anyway because <code>CONTINUE_ON_VERIFY_FAILURE</code> is on. Approving it will open a pull request
+            containing code that does not compile. Read the build errors in the log below first.
+          </div>
+        ) : (
+          <p style={{ marginTop: 0 }}>
+            Verification passed and a preview is staged above. Nothing has been committed or pushed yet — approve to open a
+            pull request, or abandon to end this run without touching git.
+          </p>
+        )}
         {actionError && (
           <div className="error" style={{ marginBottom: 16 }}>
             {actionError}
@@ -445,7 +559,6 @@ export default function RunDetailPage() {
   const [preview, setPreview] = useState<Preview | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
-  const logRef = useRef<HTMLPreElement>(null);
 
   useEffect(() => {
     if (!runId) return;
@@ -483,10 +596,6 @@ export default function RunDetailPage() {
       clearTimeout(timer);
     };
   }, [runId]);
-
-  useEffect(() => {
-    logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-  }, [log]);
 
   async function refetchRun() {
     if (!runId) return;
@@ -661,7 +770,7 @@ export default function RunDetailPage() {
 
       {run.status === "staged_for_review" && <SectionsPanel runId={run.runId} onRefined={refetchAfterRefine} />}
 
-      {run.status === "staged_for_review" && <ReviewPanel runId={run.runId} onDecided={refetchRun} />}
+      {run.status === "staged_for_review" && <ReviewPanel runId={run.runId} onDecided={refetchRun} verifyBypassed={run.verifyBypassed} />}
 
       {draft && (
         <div className="section-block card">
@@ -683,9 +792,7 @@ export default function RunDetailPage() {
 
       <div className="section-block">
         <h3>Log</h3>
-        <pre className="log-tail" ref={logRef}>
-          {log || "(no log yet)"}
-        </pre>
+        <LogConsole raw={log} live={!TERMINAL.has(run.status) && run.status !== "staged_for_review"} />
       </div>
     </div>
   );

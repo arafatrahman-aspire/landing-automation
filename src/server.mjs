@@ -4,14 +4,15 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { rm } from "node:fs/promises";
 import { config } from "./config.mjs";
-import { validateBrief } from "./schemas/brief-schema.mjs";
-import * as runStore from "./state/repository.mjs";
-import * as draftStore from "./staging/draft-store.mjs";
-import * as preview from "./preview/sandbox.mjs";
-import { runCodegen } from "./orchestrator/graph.mjs";
-import { approveRun, abandonRun, ReviewActionError } from "./orchestrator/review-actions.mjs";
-import { listSections, refineSection, RefineActionError } from "./orchestrator/refine-actions.mjs";
-import { removeWorktree } from "./git/ops.mjs";
+import { validateBrief } from "./schemas/campaign-brief-schema.mjs";
+import * as runStore from "./state/campaign-repository.mjs";
+import * as draftStore from "./staging/draft-versions.mjs";
+import * as preview from "./preview/preview-server.mjs";
+import { runCodegen } from "./pipeline/run-campaign-pipeline.mjs";
+import { resumeInterruptedRuns } from "./pipeline/resume-interrupted-runs.mjs";
+import { approveRun, abandonRun, ReviewActionError } from "./pipeline/approve-or-abandon-run.mjs";
+import { listSections, refineSection, RefineActionError } from "./pipeline/refine-section.mjs";
+import { removeWorktree } from "./git/clone-and-commit.mjs";
 import { HONEYPOT_FIELD_NAME, PREVIEW_LEAD_SINK_PATH } from "./leadform/contract.mjs";
 
 const baseDir = path.join(path.resolve(config.workdirRoot), "_base");
@@ -216,9 +217,30 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: "internal_error", message: err.message });
 });
 
-const reconciled = await runStore.reconcileCrashedRuns();
-if (reconciled > 0) {
-  console.log(`Startup: marked ${reconciled} run(s) from previous lifetime as failed (no resume in v1).`);
+// Boot-time triage of runs a previous process lifetime left behind. Runs
+// awaiting review are deliberately untouched (their work is done and staged);
+// runs mid-commit/push are marked for manual attention; everything else
+// mid-generation is safe to re-drive.
+const { failed, resumable } = await runStore.reconcileCrashedRuns();
+if (failed > 0) {
+  console.log(`Startup: marked ${failed} run(s) from a previous lifetime as failed (they were mid-commit/push and can't be safely re-driven).`);
+}
+if (resumable.length > 0) {
+  if (config.resumeInterruptedRuns) {
+    const { resumed, skipped } = await resumeInterruptedRuns({
+      runIds: resumable,
+      logger: (msg) => console.log(`Startup: ${msg}`),
+    });
+    console.log(`Startup: resumed ${resumed} interrupted run(s)${skipped > 0 ? `, skipped ${skipped}` : ""}.`);
+  } else {
+    for (const runId of resumable) {
+      await runStore.updateRun(runId, {
+        status: "failed",
+        error: "Process restarted while this run was in progress; automatic resume is disabled (RESUME_INTERRUPTED_RUNS=false).",
+      });
+    }
+    console.log(`Startup: marked ${resumable.length} interrupted run(s) failed (RESUME_INTERRUPTED_RUNS=false).`);
+  }
 }
 
 // Any preview still 'running' in the DB is from a previous process

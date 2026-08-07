@@ -16,13 +16,13 @@ The core safety guarantee: **no existing file in the target repo is ever modifie
 
 ```
 HTTP API (Express)  ──▶  Orchestrator (LangGraph state machine)  ──▶  external GitHub repo (PR)
-  src/server.mjs           src/orchestrator/graph.mjs + steps.mjs
+  src/server.mjs           src/pipeline/run-campaign-pipeline.mjs + pipeline/steps/
         │                            │
-        │                            ├── AI: research/guide/manifest (one-shot LLM)   src/ai/text.mjs
-        │                            ├── AI: coding agent (tool-using loop)           src/ai/coding-agent.mjs + tools.mjs
-        │                            ├── Git: shared base clone + per-run worktree     src/git/ops.mjs
+        │                            ├── AI: research/guide/manifest (one-shot LLM)   src/llm/generate-text.mjs
+        │                            ├── AI: coding agent (tool-using loop)           src/llm/coding-agent.mjs + filesystem-tools.mjs
+        │                            ├── Git: shared base clone + per-run worktree     src/git/clone-and-commit.mjs
         │                            ├── Verify: build/lint + hero/seo/a11y            src/verify/*
-        │                            └── GitHub: open PR                               src/github/api.mjs
+        │                            └── GitHub: open PR                               src/github/open-pull-request.mjs
         │
         └── Run state (filesystem, no DB)                                             src/state/run-store.mjs
 ```
@@ -33,7 +33,7 @@ There is a separate React/Vite UI in `ui/` for driving the API from a browser.
 
 ## 3. The pipeline (LangGraph state machine)
 
-Defined in [src/orchestrator/graph.mjs](src/orchestrator/graph.mjs); each node's logic lives in [src/orchestrator/steps.mjs](src/orchestrator/steps.mjs).
+Defined in [src/pipeline/run-campaign-pipeline.mjs](src/pipeline/run-campaign-pipeline.mjs); each node's logic lives in [src/pipeline/steps/](src/pipeline/steps/).
 
 ```
 intake → research → clone → generate_guide → file_manifest → code → verify
@@ -62,7 +62,7 @@ A verify failure that exhausts retries routes **straight to END** — it never r
 
 ### Where the repo gets detected
 
-`clone` happens **before** guide/file_manifest deliberately. The target repo's stack is not fixed — it could be Next.js, React, Vue, Laravel/Blade, or plain HTML. A lightweight scan (`detectRepoConventions` in steps.mjs) reads `package.json`/`composer.json` and top-level dirs so the guide and manifest stages describe the plan in terms of what the repo *actually is*, instead of guessing and locking in wrong file paths.
+`clone` happens **before** guide/file_manifest deliberately. The target repo's stack is not fixed — it could be Next.js, React, Vue, Laravel/Blade, or plain HTML. A lightweight scan (`detectRepoConventions` in pipeline/steps/03-generate-guide.mjs) reads `package.json`/`composer.json` and top-level dirs so the guide and manifest stages describe the plan in terms of what the repo *actually is*, instead of guessing and locking in wrong file paths.
 
 ---
 
@@ -83,13 +83,13 @@ The request runs in the background: `POST /campaigns` returns immediately; you p
 
 ### Brief schema
 
-Validated by [src/schemas/brief-schema.mjs](src/schemas/brief-schema.mjs). Core fields: `campaignName`, `slug`, `offer`, `audience`, `cta`, `brief`, and optional `videoUrl`. The `slug` drives the branch name, the write allowlist, and the page URL.
+Validated by [src/schemas/campaign-brief-schema.mjs](src/schemas/campaign-brief-schema.mjs). Core fields: `campaignName`, `slug`, `offer`, `audience`, `cta`, `brief`, and optional `videoUrl`. The `slug` drives the branch name, the write allowlist, and the page URL.
 
 ---
 
 ## 5. Git strategy: base clone + worktrees
 
-Implemented in [src/git/ops.mjs](src/git/ops.mjs), orchestrated by the `clone` step.
+Implemented in [src/git/clone-and-commit.mjs](src/git/clone-and-commit.mjs), orchestrated by the `clone` step.
 
 - A fresh network clone every run is slow, so a single **base clone** lives at `WORKDIR_ROOT/_base`, created once.
 - Before each run it's kept current with a cheap shallow **fetch + reset** (`syncBaseToLatest`), not a re-clone.
@@ -102,7 +102,7 @@ Auth: for HTTP remotes, the `GITHUB_TOKEN` is injected into the remote URL. `TAR
 
 ## 6. The coding agent & its guardrails
 
-The loop lives in [src/ai/coding-agent.mjs](src/ai/coding-agent.mjs); the filesystem tools are in [src/ai/tools.mjs](src/ai/tools.mjs).
+The loop lives in [src/llm/coding-agent.mjs](src/llm/coding-agent.mjs); the filesystem tools are in [src/llm/filesystem-tools.mjs](src/llm/filesystem-tools.mjs).
 
 ### Tools the agent has (and only these)
 
@@ -115,7 +115,7 @@ There is **deliberately no shell-exec tool.** Build/lint verification is a separ
 
 ### The four independent write guards
 
-`resolveWritePath` in tools.mjs checks every write in this order; a hole in one layer doesn't defeat the others:
+`resolveWritePath` in filesystem-tools.mjs checks every write in this order; a hole in one layer doesn't defeat the others:
 
 1. **Path traversal** — reject absolute paths and anything escaping the repo (`..`).
 2. **Pristine** — never overwrite a file that existed before this run started (unless the agent itself created it earlier in this run, so it can iterate on its own files across retries).
@@ -141,13 +141,13 @@ The coding agent's system prompt mandates a hero block that fits above the fold 
 
 ## 7. Verification suite
 
-Coordinated by [src/verify/index.mjs](src/verify/index.mjs).
+Coordinated by [src/verify/run-full-verify-suite.mjs](src/verify/run-full-verify-suite.mjs).
 
-1. **build/lint** (`verify/build.mjs`) runs first — fail fast, no point measuring layout of something that doesn't build. Ecosystem-aware install + build.
-2. If that passes **and** the repo is Node-servable **and** `PAGE_URL_PATH_TEMPLATE` is configured, an **ephemeral server** is started (`verify/local-server.mjs`) and three checks run in parallel against the live page:
-   - **hero-fit** (`verify/hero-fit.mjs`) — the hero elements exist and fit above the fold at desktop and mobile widths (via Playwright).
-   - **seo-lint** (`verify/seo-lint.mjs`) — title/meta/heading correctness.
-   - **a11y-lint** (`verify/a11y-lint.mjs`) — accessibility via axe-core.
+1. **build/lint** (`verify/build-and-lint.mjs`) runs first — fail fast, no point measuring layout of something that doesn't build. Ecosystem-aware install + build.
+2. If that passes **and** the repo is Node-servable **and** `PAGE_URL_PATH_TEMPLATE` is configured, an **ephemeral server** is started (`verify/ephemeral-server.mjs`) and three checks run in parallel against the live page:
+   - **hero-fit** (`verify/check-hero-visibility.mjs`) — the hero elements exist and fit above the fold at desktop and mobile widths (via Playwright).
+   - **seo-lint** (`verify/check-seo-tags.mjs`) — title/meta/heading correctness.
+   - **a11y-lint** (`verify/check-accessibility.mjs`) — accessibility via axe-core.
 3. The server is always stopped afterward.
 
 If the repo isn't servable or no page URL is configured, the layout/SEO/a11y checks are **skipped** (build/lint still gates), so the pipeline still works for repos like Laravel where the page isn't wired into routing yet.
@@ -169,7 +169,7 @@ The overall result (`ok` + a human-readable report + per-check booleans) is stor
 
 ## 9. Design catalog (grounding the LLM in real code)
 
-[src/design/catalog.mjs](src/design/catalog.mjs) + [src/design/resolve.mjs](src/design/resolve.mjs) + [src/design/schema.mjs](src/design/schema.mjs).
+[src/design-catalog/reference-examples.mjs](src/design-catalog/reference-examples.mjs) + [src/design-catalog/resolve-references.mjs](src/design-catalog/resolve-references.mjs) + [src/design-catalog/section-types.mjs](src/design-catalog/section-types.mjs).
 
 The guide stage chooses sections from a **fixed catalog** of section types (hero, faq, etc.). For each type, the catalog can list **reference files** in the target repo. Before prompting, `resolveSectionReferences` reads that real code out of the cloned repo and injects it into the prompt, so the model plans against actual conventions instead of a blank page. A missing example is a quality gap (fix it in `catalog.mjs`), never a reason to fail a run. The resolved references are also persisted on the run so a human can see which files grounded the plan.
 

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolveWritePath } from "../src/ai/tools.mjs";
+import { resolveWritePath } from "../src/llm/filesystem-tools.mjs";
 
 /* The most important test in the service: proves the write-tool guard is
  * airtight offline, with no filesystem/network/LLM involved. */

@@ -1,6 +1,6 @@
 /* config.mjs validates and freezes process.env into `config` the moment
  * it's first imported (by anything, transitively) — so any test touching a
- * module that reaches config.mjs (directly or via state/db.mjs) must call
+ * module that reaches config.mjs (directly or via state/database-connection.mjs) must call
  * this BEFORE that first import, not after. Node's test runner gives each
  * test file its own process, so setting process.env here doesn't leak
  * between unrelated test files. */

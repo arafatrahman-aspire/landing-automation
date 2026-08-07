@@ -35,7 +35,7 @@ const envSchema = z
     CODING_AGENT_MODEL: z.string().optional(),
 
     MAX_AGENT_ITERATIONS: intFromEnv(40),
-    MAX_CODE_ATTEMPTS: intFromEnv(2),
+    MAX_CODE_ATTEMPTS: intFromEnv(3),
     // Overrides package-manager auto-detection (packageManager field, then
     // pnpm-lock.yaml/yarn.lock, else npm) for the target repo. Set this when
     // a repo has ambiguous/stale lockfiles (e.g. a leftover yarn.lock next to
@@ -97,9 +97,28 @@ const envSchema = z
 
     SKIP_RESEARCH: boolFromEnv,
 
+    // Escape hatch: when verify still fails after every retry, stage and
+    // preview the draft anyway instead of ending the run as
+    // failed_verification. The run is marked verifyBypassed and surfaces a
+    // loud warning in the review UI — the page is NOT known to build, so
+    // approving it can open a PR with code that doesn't compile. Off by
+    // default; intended as a temporary unblock while generation quality is
+    // still being tuned, not a normal operating mode.
+    CONTINUE_ON_VERIFY_FAILURE: boolFromEnv,
+
+    // Crash resume: on boot, re-drive runs that a previous process lifetime
+    // left mid-generation, reusing their persisted research/content plan
+    // (pipeline/resume-interrupted-runs.mjs). Runs already inside the
+    // commit/push/PR sequence are never auto-resumed regardless of this
+    // setting. Set to "false" to go back to marking interrupted runs failed.
+    RESUME_INTERRUPTED_RUNS: z
+      .string()
+      .optional()
+      .transform((v) => v !== "false" && v !== "0"),
+
     // Phase 8 (new_plan.md §4.8) — where a generated preview page's lead
     // form should POST in preview mode. A preview runs the TARGET repo's
-    // own server on its own port (preview/sandbox.mjs), a completely
+    // own server on its own port (preview/preview-server.mjs), a completely
     // separate process from this one, so the generated form can't just
     // fetch a relative path — it needs this service's own externally-
     // reachable base URL. Defaults to localhost at this service's own port,
@@ -182,6 +201,8 @@ function loadConfig() {
     keepWorkdirOnFailure: env.KEEP_WORKDIR_ON_FAILURE,
 
     skipResearch: env.SKIP_RESEARCH,
+    continueOnVerifyFailure: env.CONTINUE_ON_VERIFY_FAILURE,
+    resumeInterruptedRuns: env.RESUME_INTERRUPTED_RUNS,
 
     servicePublicBaseUrl: env.SERVICE_PUBLIC_BASE_URL || `http://localhost:${env.PORT}`,
   };

@@ -77,6 +77,9 @@ export interface RunSummary {
   sectionReferences?: SectionReference[] | null;
   verifyChecks?: VerifyChecks | null;
   verifyAttempts?: number;
+  /** True when the draft was staged despite a FAILING build
+   *  (CONTINUE_ON_VERIFY_FAILURE) — the page is not known to compile. */
+  verifyBypassed?: boolean;
 }
 
 export interface VerifyChecks {
