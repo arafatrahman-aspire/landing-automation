@@ -127,7 +127,12 @@ async function callGemini({ system, contents }) {
       system_instruction: { parts: [{ text: system }] },
       contents,
       tools: [{ functionDeclarations: GEMINI_FUNCTION_DECLARATIONS }],
-      generationConfig: { maxOutputTokens: MAX_TOKENS },
+      generationConfig: {
+        maxOutputTokens: MAX_TOKENS,
+        // Same Gemini 2.5 issue as generate-text.mjs: thinking can exhaust the
+        // output budget and leave the tool-call turn empty/truncated.
+        thinkingConfig: { thinkingBudget: 0 },
+      },
     }),
     signal: AbortSignal.timeout(120_000),
   });

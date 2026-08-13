@@ -1,4 +1,5 @@
 import { chromium } from "playwright";
+import { LEAD_FORM_ANCHOR_ID, LEAD_FORM_HREF } from "../leadform/contract.mjs";
 
 /* Deterministic, non-negotiable check (new_plan.md §4.5): the hero — title,
  * video-or-details block, and lead form — must be visible without
@@ -7,7 +8,10 @@ import { chromium } from "playwright";
  * told to add (steps.mjs's code() system prompt requires exactly these three
  * data attributes) — guessing via heuristics (first <form>, biggest <video>,
  * ...) would be fragile and give confusing failures. A missing attribute is
- * itself reported as a structured, fixable error, same as an overflow. */
+ * itself reported as a structured, fixable error, same as an overflow.
+ *
+ * The lead form must also carry id="regForm" so in-page CTA links
+ * (href="#regForm") actually scroll to it. */
 
 export const HERO_HOOKS = [
   { attr: "data-hero-title", label: "hero title" },
@@ -44,6 +48,15 @@ export async function checkHeroFit({ url }) {
           if (!box) {
             problems.push(`[${viewport.name}] ${hook.label} ("${hook.attr}") exists but isn't visible/rendered.`);
             continue;
+          }
+          if (hook.attr === "data-hero-form") {
+            const formId = await locator.getAttribute("id");
+            if (formId !== LEAD_FORM_ANCHOR_ID) {
+              problems.push(
+                `[${viewport.name}] lead form ("data-hero-form") is missing id="${LEAD_FORM_ANCHOR_ID}" ` +
+                  `(got ${formId == null ? "no id" : `id="${formId}"`}) — CTA buttons linking to ${LEAD_FORM_HREF} will not scroll to the form.`
+              );
+            }
           }
           const overflowBottom = box.y + box.height - viewport.height;
           if (overflowBottom > 0) {

@@ -158,6 +158,12 @@ export function initSchema(db) {
   addColumnIfMissing(db, "previews", "kind", "TEXT");
   addColumnIfMissing(db, "previews", "container_name", "TEXT");
   addColumnIfMissing(db, "previews", "url", "TEXT");
+  // The frameable-proxy port and the URL the review UI embeds. Kept separate
+  // from `url` (which still points straight at the preview server) so
+  // "open in a new tab" and "render in the iframe" stay independently
+  // meaningful — see preview/frameable-proxy.mjs.
+  addColumnIfMissing(db, "previews", "proxy_port", "INTEGER");
+  addColumnIfMissing(db, "previews", "embed_url", "TEXT");
   addColumnIfMissing(db, "draft_files", "section_slot", "TEXT");
   addColumnIfMissing(db, "runs", "agent_summary", "TEXT");
   addColumnIfMissing(db, "runs", "section_results_json", "TEXT");

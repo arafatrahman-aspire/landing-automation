@@ -3,6 +3,10 @@ import { mkdir, access } from "node:fs/promises";
 import { config } from "../../config.mjs";
 import * as runStore from "../../state/campaign-repository.mjs";
 import { cloneShallow, syncBaseToLatest, addWorktree, removeWorktree, listTrackedFiles, setRemoteAuth } from "../../git/clone-and-commit.mjs";
+import {
+  campaignsParentFromAllowlistTemplate,
+  quarantineSiblingCampaigns,
+} from "../../git/quarantine-sibling-campaigns.mjs";
 import { logStage } from "./log-helper.mjs";
 
 // A fresh network clone every run is slow and wasteful. Instead, a single
@@ -45,23 +49,58 @@ export async function clone(state) {
     } else {
       await logStage(state.runId, `clone: reusing cached base clone at ${baseDir} — syncing to latest ${config.github.baseBranch} (no full re-clone)`);
       if (token) await setRemoteAuth({ dir: baseDir, remoteUrl, token });
-      await syncBaseToLatest({ dir: baseDir, branch: config.github.baseBranch });
+      await syncBaseToLatest({
+        dir: baseDir,
+        branch: config.github.baseBranch,
+        logger: (msg) => logStage(state.runId, `clone: ${msg}`),
+      });
     }
   });
 
   const branchName = `codegen/${state.request.slug}-${state.runId.slice(0, 8)}`;
 
-  // A resumed run (pipeline/resume-interrupted-runs.mjs) may still have the
-  // worktree and branch its previous lifetime created — `git worktree add`
-  // refuses to reuse either name, so clear them out first. Best-effort: on a
-  // normal first run there's nothing there and this is a no-op.
+  // A resumed or previously-interrupted run may still have the directory and
+  // branch its earlier lifetime created — `git worktree add` refuses to reuse
+  // either name. Clear them out first; on a normal first run this is a no-op.
+  //
+  // Not best-effort: if the leftover can't be cleared, `worktree add` is
+  // guaranteed to fail with a much less informative "already exists", so say
+  // plainly what's actually wrong instead of letting that happen.
   const stale = await access(workdir).then(() => true, () => false);
   if (stale) {
-    await logStage(state.runId, `clone: found a leftover worktree at ${workdir} (resumed run) — removing it before re-checkout`);
-    await removeWorktree({ baseDir, workdir, branchName }).catch(() => {});
+    await logStage(state.runId, `clone: found a leftover directory at ${workdir} — clearing it before re-checkout`);
+    const removal = await removeWorktree({ baseDir, workdir, branchName });
+    if (!removal.ok) {
+      throw new Error(
+        `clone: a leftover directory at ${workdir} could not be removed (${removal.reason}). Delete it manually and re-run.`
+      );
+    }
+  } else if (branchName) {
+    // The directory can be gone while the branch survives (e.g. the worktree
+    // was removed but the branch was not) — that alone breaks `add -b`.
+    await removeWorktree({ baseDir, workdir, branchName });
   }
 
   await addWorktree({ baseDir, workdir, branchName, baseBranch: config.github.baseBranch });
+
+  // Drop other campaigns from this worktree so a poisoned page that reached the
+  // base branch (CONTINUE_ON_VERIFY_FAILURE → approve → merge) cannot fail
+  // `next build` for every later run. Deletions are local only — commitPaths
+  // stages solely what this run writes.
+  const campaignsParent = campaignsParentFromAllowlistTemplate(config.writePathAllowlistTemplates[0] ?? "");
+  if (campaignsParent) {
+    const { removed } = await quarantineSiblingCampaigns({
+      workdir,
+      slug: state.request.slug,
+      campaignsParent,
+    });
+    if (removed.length > 0) {
+      await logStage(
+        state.runId,
+        `clone: quarantined ${removed.length} sibling campaign(s) so a pre-existing broken page cannot poison this run's build — ${removed.join(", ")}`
+      );
+    }
+  }
 
   const pristineFiles = await listTrackedFiles({ dir: workdir });
   await logStage(state.runId, `clone: snapshot done, ${pristineFiles.size} tracked files`);

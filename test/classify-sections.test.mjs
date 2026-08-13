@@ -16,6 +16,15 @@ test("an unflagged section type with a static candidate defaults to static", () 
   assert.equal(resolveSectionMode("faq", []), "static");
 });
 
+test("curriculum/testimonials/instructor degrade to ai-required — no campaign-safe static frame", () => {
+  assert.equal(listFrameCandidates("curriculum").length, 0);
+  assert.equal(listFrameCandidates("testimonials").length, 0);
+  assert.equal(listFrameCandidates("instructor").length, 0);
+  assert.equal(resolveSectionMode("curriculum", []), "ai-required");
+  assert.equal(resolveSectionMode("testimonials", []), "ai-required");
+  assert.equal(resolveSectionMode("instructor", []), "ai-required");
+});
+
 test("a section type with no static candidate falls back to ai-required even if unflagged", () => {
   // "hero" has no catalog entry by design; asserting the general fallback
   // behavior against it directly (distinct from the special-case rule above,

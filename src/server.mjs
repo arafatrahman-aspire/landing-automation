@@ -11,7 +11,8 @@ import * as preview from "./preview/preview-server.mjs";
 import { runCodegen } from "./pipeline/run-campaign-pipeline.mjs";
 import { resumeInterruptedRuns } from "./pipeline/resume-interrupted-runs.mjs";
 import { approveRun, abandonRun, ReviewActionError } from "./pipeline/approve-or-abandon-run.mjs";
-import { listSections, refineSection, RefineActionError } from "./pipeline/refine-section.mjs";
+import { getPlan, savePlan, approvePlan, abandonAtPlan, PlanActionError } from "./pipeline/approve-or-edit-plan.mjs";
+import { listSections, refineSection, refinePage, RefineActionError } from "./pipeline/refine-section.mjs";
 import { removeWorktree } from "./git/clone-and-commit.mjs";
 import { HONEYPOT_FIELD_NAME, PREVIEW_LEAD_SINK_PATH } from "./leadform/contract.mjs";
 
@@ -78,6 +79,20 @@ app.get("/campaigns/:runId", isAuthorized, async (req, res) => {
   res.json(run);
 });
 
+/* The brief a run was created from, so the UI can pre-fill a new campaign
+ * from an old one. Marketing runs variations of the same campaign constantly,
+ * and retyping every field was the sharpest daily friction in the old flow.
+ * Deliberately returns the brief ALONE rather than reusing GET /campaigns/:runId
+ * — duplicating pulls in nothing about the previous run's outcome. */
+app.get("/campaigns/:runId/brief", isAuthorized, async (req, res) => {
+  const run = await runStore.getRun(req.params.runId);
+  if (!run?.request) return res.status(404).json({ error: "not_found" });
+  // The slug is unique per campaign page: handing back the old one would
+  // guarantee a collision, so the caller is made to choose a new one.
+  const { slug: _slug, ...reusable } = run.request;
+  res.json(reusable);
+});
+
 app.get("/campaigns/:runId/draft", isAuthorized, async (req, res) => {
   const draft = await draftStore.getLatestVersion(req.params.runId);
   if (!draft) return res.status(404).json({ error: "not_found" });
@@ -121,6 +136,51 @@ app.post("/campaigns/:runId/preview/stop", isAuthorized, async (req, res) => {
   res.status(204).send();
 });
 
+/* Restart a preview after it expired or was stopped. Available once a draft
+ * has been staged and the scratch worktree is still on disk (approve/abandon
+ * remove it). Auto-start at the end of a run is unchanged. */
+app.post("/campaigns/:runId/preview/start", isAuthorized, async (req, res) => {
+  const run = await runStore.getRun(req.params.runId);
+  if (!run) return res.status(404).json({ error: "not_found" });
+  if (run.status !== "staged_for_review") {
+    return res.status(409).json({
+      error: "wrong_status",
+      message: `Preview can only be (re)started while the draft is staged for review (status is "${run.status}").`,
+    });
+  }
+  if (!run.workdir) {
+    return res.status(409).json({ error: "no_workdir", message: "This run has no scratch worktree left to serve a preview from." });
+  }
+  const draft = await draftStore.getLatestVersion(req.params.runId);
+  if (!draft) {
+    return res.status(409).json({ error: "no_draft", message: "No staged draft to preview yet." });
+  }
+
+  const pageUrlPath = config.pageUrlPathTemplate
+    ? config.pageUrlPathTemplate.replaceAll("{slug}", run.slug)
+    : null;
+  const result = await preview.restartPreview({
+    runId: req.params.runId,
+    workdir: run.workdir,
+    pageUrlPath,
+    ttlMs: config.previewTtlMs,
+    maxConcurrent: config.maxConcurrentPreviews,
+    disableDocker: config.verifyDisableDocker,
+    baseDir,
+  });
+  if (!result.ok) {
+    return res.status(500).json({ error: "preview_start_failed", message: result.report });
+  }
+  const live = await preview.getPreview(req.params.runId);
+  res.json(live ?? {
+    kind: result.kind,
+    url: result.url,
+    status: "running",
+    expiresAt: result.expiresAt,
+    embedUrl: result.embedUrl ?? null,
+  });
+});
+
 // Phase 9 / module.md Module 4 (new_plan.md §9.7) — per-section refinement
 // IS the review step: no separate raw-file editor, just these two routes.
 app.get("/campaigns/:runId/sections", isAuthorized, async (req, res) => {
@@ -147,6 +207,73 @@ app.post("/campaigns/:runId/sections/:slot/refine", isAuthorized, async (req, re
       return res.status(status).json({ error: err.reason, message: err.message });
     }
     res.status(500).json({ error: "refine_failed", message: err.message });
+  }
+});
+
+// Page-level AI edit — one plain-language request can rewrite several sections,
+// then verify / stage / refresh preview once (marketing review loop).
+app.post("/campaigns/:runId/refine-page", isAuthorized, async (req, res) => {
+  const instructions = req.body?.instructions;
+  console.log(`POST /campaigns/${req.params.runId}/refine-page — ${(instructions ?? "").slice(0, 80)}`);
+  try {
+    const result = await refinePage(req.params.runId, { instructions });
+    res.json(result);
+  } catch (err) {
+    if (err instanceof RefineActionError) {
+      const status = err.reason === "not_found" ? 404 : err.reason === "wrong_status" ? 409 : err.reason === "verify_failed" ? 422 : 400;
+      return res.status(status).json({ error: err.reason, message: err.message });
+    }
+    res.status(500).json({ error: "refine_failed", message: err.message });
+  }
+});
+
+/* The plan gate (v0.37) — the human step BEFORE generation, as opposed to
+ * approve/abandon below, which is the human step before git. GET is allowed at
+ * any status (the plan stays worth reading after the fact); PATCH/approve/
+ * abandon require `awaiting_plan_approval` and 409 otherwise, matching the
+ * approve/abandon guards. See pipeline/approve-or-edit-plan.mjs. */
+function handlePlanError(err, res, fallback) {
+  if (err instanceof PlanActionError) {
+    const status = err.reason === "not_found" ? 404 : err.reason === "invalid_plan" ? 400 : 409;
+    return res.status(status).json({ error: err.reason, message: err.message, issues: err.message });
+  }
+  res.status(500).json({ error: fallback, message: err.message });
+}
+
+app.get("/campaigns/:runId/plan", isAuthorized, async (req, res) => {
+  try {
+    res.json(await getPlan(req.params.runId));
+  } catch (err) {
+    handlePlanError(err, res, "plan_read_failed");
+  }
+});
+
+app.patch("/campaigns/:runId/plan", isAuthorized, async (req, res) => {
+  console.log(`PATCH /campaigns/${req.params.runId}/plan`);
+  try {
+    res.json({ ok: true, guide: await savePlan(req.params.runId, req.body) });
+  } catch (err) {
+    handlePlanError(err, res, "plan_save_failed");
+  }
+});
+
+app.post("/campaigns/:runId/plan/approve", isAuthorized, async (req, res) => {
+  console.log(`POST /campaigns/${req.params.runId}/plan/approve`);
+  try {
+    // An edited plan may ride along, so "save then approve" is one atomic
+    // action rather than two requests that could half-apply.
+    res.json(await approvePlan(req.params.runId, { guide: req.body?.guide ?? null }));
+  } catch (err) {
+    handlePlanError(err, res, "plan_approve_failed");
+  }
+});
+
+app.post("/campaigns/:runId/plan/abandon", isAuthorized, async (req, res) => {
+  console.log(`POST /campaigns/${req.params.runId}/plan/abandon`);
+  try {
+    res.json(await abandonAtPlan(req.params.runId));
+  } catch (err) {
+    handlePlanError(err, res, "plan_abandon_failed");
   }
 });
 
@@ -257,6 +384,29 @@ setInterval(() => {
     console.error("preview sweep failed:", err.message);
   });
 }, config.previewSweepIntervalMs).unref();
+
+// `npm run dev` runs node with --watch, which restarts this process whenever
+// ANY file under src/ changes. A campaign run takes minutes (clone -> LLM ->
+// npm ci -> next build), so editing a source file mid-run kills that run —
+// almost always during verify, the longest stage. Runs then come back as
+// "restarted while at stage verify" in the log, which looks like a build
+// failure but is really this. Loud, because it is not obvious from the symptom.
+// In watch mode Node runs the script in a CHILD process, so --watch never
+// appears in that child's execArgv; it marks the child with
+// WATCH_REPORT_DEPENDENCIES instead. Both signals are checked so this keeps
+// working if either changes.
+const isWatchMode = process.execArgv.some((arg) => arg.startsWith("--watch")) || Boolean(process.env.WATCH_REPORT_DEPENDENCIES);
+if (isWatchMode) {
+  console.warn(
+    "\n⚠  Running with --watch (npm run dev).\n" +
+      "   Editing any file under src/ RESTARTS this process and kills any campaign\n" +
+      "   run in flight — typically mid-verify, which looks like a build failure.\n" +
+      "   Use `npm start` when running real campaigns.\n" +
+      "   (--watch also sets WATCH_REPORT_DEPENDENCIES, which used to break every\n" +
+      "    `next build` we spawned. That is now stripped from child processes —\n" +
+      "    see src/spawn-env.mjs — but the restart problem above is still real.)\n"
+  );
+}
 
 app.listen(config.port, () => {
   console.log(`campaign-codegen-pr-service listening on :${config.port}`);

@@ -1,4 +1,5 @@
-import { buildHeroContract } from "./hero-contract.mjs";
+import { buildHeroContract, buildCtaLinkPromptFragment } from "./hero-contract.mjs";
+import { buildContentRulesPromptFragment } from "../schemas/content-rules-prompt.mjs";
 
 // System prompt for ONE section's coding-agent run — much narrower than a
 // whole-page prompt would be, since this agent only ever writes one declared
@@ -13,6 +14,13 @@ export function buildSectionAgentSystemPrompt(
   // so a failure can't always be pinned to one exact section) — handed to
   // every ai-required section on retry, not perfectly targeted to whichever
   // section actually caused it.
+
+  // Tone/brand/must-include rules, without the structural ones: which sections
+  // exist and how long the page is were settled by the guide stage, and this
+  // agent can only write its own single file. Repeating decisions it cannot
+  // act on invites it to argue with them in the copy.
+  const contentRules = buildContentRulesPromptFragment(request, { includeStructure: false });
+
   return `You are a coding agent implementing ONE section component of a marketing landing page inside an existing frontend repository, matching its existing design system and shared component library.
 
 GUARDRAILS (enforced in code, not just instructions):
@@ -26,13 +34,14 @@ CLIENT-COMPONENT DIRECTIVE (a real past run failed the build on exactly this): i
 Explore the repository first (package.json, an existing page or component, the styling approach) so this component matches its REAL conventions (framework, component patterns, import style, design tokens/colors, spacing).
 
 SECTION TO BUILD: "${section.type}" — ${section.summary}
-${section.type === "hero" ? `\n${buildHeroContract({ requiresJobField: Boolean(request.requiresJobField), previewLeadSinkUrl })}\n` : ""}
+${section.type === "hero" ? `\n${buildHeroContract({ requiresJobField: Boolean(request.requiresJobField), previewLeadSinkUrl })}\n` : `\n${buildCtaLinkPromptFragment()}\n`}
 CAMPAIGN CONTEXT:
 Campaign: ${request.campaignName}
 Offer: ${request.offer}
 Audience: ${request.audience}
 CTA: ${request.cta}
 Video URL: ${request.videoUrl ?? "(none provided)"}
+${contentRules ? `\n${contentRules}\n` : ""}
 ${guideData ? `Full content/section plan (for cross-section context only — you are ONLY building the "${section.type}" section): ${JSON.stringify(guideData)}` : ""}
 
 IMPORT PATHS MUST BE COPIED FROM REAL USAGE, NEVER GUESSED FROM GENERAL KNOWLEDGE: before importing anything beyond a package's plain root export, find an EXISTING file in this repo that already imports from that same package and copy its exact import path verbatim. If nothing in the repo already imports it, avoid introducing it rather than guessing.

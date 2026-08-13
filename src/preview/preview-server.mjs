@@ -5,6 +5,8 @@ import { getDb } from "../state/database-connection.mjs";
 import { findPackageJsonDir, detectPackageManager, RUN_SCRIPT_CMD } from "../verify/detect-package-manager.mjs";
 import { getFreePort, waitForReady, SERVE_SCRIPT_PREFERENCE } from "../verify/ephemeral-server.mjs";
 import { hasDocker, parseDockerBuildStage } from "../verify/docker-build.mjs";
+import { startFrameableProxy } from "./frameable-proxy.mjs";
+import { cleanEnvForChildProcess } from "../spawn-env.mjs";
 import { removeWorktree } from "../git/clone-and-commit.mjs";
 import { isTerminal } from "../state/campaign-repository.mjs";
 
@@ -29,7 +31,7 @@ import { isTerminal } from "../state/campaign-repository.mjs";
 
 function runCommand(cmd, args, { timeoutMs } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args);
+    const child = spawn(cmd, args, { env: cleanEnvForChildProcess() });
     let stdout = "";
     let stderr = "";
     const timer = timeoutMs
@@ -60,15 +62,70 @@ async function readServeScript(pkgDir) {
   }
 }
 
-function insertPreviewRow(db, { runId, kind, port, pid, containerName, url, expiresAt }) {
+/* Every serve script the repo declares, in preference order, rather than only
+ * the first one.
+ *
+ * The first choice is "start" — a production server over an already-built
+ * .next directory, which is what you want when verify passed. But a preview is
+ * also the most useful thing in the world when verify FAILED
+ * (CONTINUE_ON_VERIFY_FAILURE stages the draft anyway): the reviewer wants to
+ * see what the agent actually produced before deciding. In that case there is
+ * no build output, `next start` exits immediately, and the old single-script
+ * code gave up — so the one run where seeing the page matters most was the one
+ * run that showed nothing. Falling through to "dev" compiles on demand and
+ * renders the page even while some unrelated file in the repo won't typecheck. */
+async function readServeScripts(pkgDir) {
+  try {
+    const pkg = JSON.parse(await readFile(path.join(pkgDir, "package.json"), "utf8"));
+    const scripts = pkg.scripts ?? {};
+    return SERVE_SCRIPT_PREFERENCE.filter((s) => scripts[s]);
+  } catch {
+    return [];
+  }
+}
+
+function insertPreviewRow(db, { runId, kind, port, pid, containerName, url, expiresAt, proxyPort, embedUrl }) {
   const now = new Date().toISOString();
   const info = db
     .prepare(
-      `INSERT INTO previews (run_id, kind, port, pid, container_name, url, status, expires_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)`
+      `INSERT INTO previews (run_id, kind, port, pid, container_name, url, status, expires_at, created_at, proxy_port, embed_url)
+       VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)`
     )
-    .run(runId, kind, port ?? null, pid ?? null, containerName ?? null, url, expiresAt, now);
+    .run(runId, kind, port ?? null, pid ?? null, containerName ?? null, url, expiresAt, now, proxyPort ?? null, embedUrl ?? null);
   return info.lastInsertRowid;
+}
+
+/* Live frameable-proxy handles, keyed by preview row id.
+ *
+ * Unlike the preview server itself — a separate OS process, addressable by
+ * the pid we persisted, killable from any later process lifetime — the proxy
+ * is an http.Server living inside THIS process. There is no pid to store and
+ * nothing for a future process to reconnect to, so the handle is held in
+ * memory and dropped when the row is stopped. A service restart takes every
+ * proxy down with it, which is exactly right: boot-time reconciliation stops
+ * the previews they were fronting anyway. */
+const liveProxies = new Map();
+
+async function closeProxyFor(previewId) {
+  const proxy = liveProxies.get(previewId);
+  if (!proxy) return;
+  liveProxies.delete(previewId);
+  await proxy.close().catch(() => {});
+}
+
+/** Fronts an already-running preview server with a proxy that strips
+ *  X-Frame-Options so the review UI can embed the real page.
+ *
+ *  Best-effort: if the proxy can't start, the preview is still perfectly
+ *  usable via "open in a new tab" — losing the embed is a downgrade in
+ *  convenience, not a reason to fail a run at its very last step. */
+async function attachFrameableProxy({ baseUrl, pageUrlPath }) {
+  try {
+    const proxy = await startFrameableProxy({ targetBaseUrl: baseUrl });
+    return { proxy, embedUrl: pageUrlPath ? `${proxy.baseUrl}${pageUrlPath}` : proxy.baseUrl };
+  } catch {
+    return { proxy: null, embedUrl: null };
+  }
 }
 
 function getActivePreviewRow(db, runId) {
@@ -103,6 +160,10 @@ function killGroupOrPid(pid, signal) {
  *  throughout: a stop path failing shouldn't block the sweep/boot-reconcile
  *  loop calling it from moving on to the next row. */
 async function stopPreviewRow(db, row, { baseDir } = {}) {
+  // Before the server it fronts — a proxy left listening after its upstream
+  // dies would keep answering with 502s at a port the UI still has embedded.
+  await closeProxyFor(row.id);
+
   if (row.kind === "docker" && row.container_name) {
     await runCommand("docker", ["kill", row.container_name], { timeoutMs: 10_000 }).catch(() => {});
   } else if (row.kind === "process" && row.pid) {
@@ -134,7 +195,9 @@ async function stopPreviewRow(db, row, { baseDir } = {}) {
  * @param {number} p.ttlMs
  * @param {number} p.maxConcurrent
  * @param {boolean} [p.disableDocker]
- * @returns {Promise<{ok: boolean, report?: string, previewId?: number, url?: string, kind?: string, expiresAt?: string}>}
+ * @returns {Promise<{ok: boolean, report?: string, previewId?: number, url?: string, embedUrl?: string|null, kind?: string, script?: string, expiresAt?: string}>}
+ *   `url` points straight at the preview server (open in a new tab); `embedUrl`
+ *   goes through the frameable proxy and is what the review UI iframes.
  */
 export async function startPreview({ runId, workdir, pageUrlPath = null, ttlMs, maxConcurrent, disableDocker = false }) {
   const db = getDb();
@@ -206,8 +269,20 @@ export async function startPreview({ runId, workdir, pageUrlPath = null, ttlMs, 
       return { ok: false, report: `docker preview server did not respond at ${baseUrl} within 60s:\n${stderr.slice(-1500)}` };
     }
 
-    const previewId = insertPreviewRow(db, { runId, kind: "docker", port, pid: null, containerName, url, expiresAt });
-    return { ok: true, previewId, url, kind: "docker", expiresAt };
+    const { proxy, embedUrl } = await attachFrameableProxy({ baseUrl, pageUrlPath });
+    const previewId = insertPreviewRow(db, {
+      runId,
+      kind: "docker",
+      port,
+      pid: null,
+      containerName,
+      url,
+      expiresAt,
+      proxyPort: proxy?.port ?? null,
+      embedUrl,
+    });
+    if (proxy) liveProxies.set(previewId, proxy);
+    return { ok: true, previewId, url, embedUrl, kind: "docker", expiresAt };
   }
 
   // Process-based fallback — same detached/process-group pattern as
@@ -215,28 +290,55 @@ export async function startPreview({ runId, workdir, pageUrlPath = null, ttlMs, 
   // closure) is what's persisted, since this preview needs to be
   // stoppable from a completely different process invocation later.
   const pm = await detectPackageManager(pkgDir);
-  const [cmd, args] = RUN_SCRIPT_CMD[pm](scriptName);
-  const child = spawn(cmd, args, {
-    cwd: pkgDir,
-    env: { ...process.env, PORT: String(port), HOST: "0.0.0.0" },
-    detached: true,
-  });
+  const candidates = await readServeScripts(pkgDir);
+  const attemptReports = [];
 
-  let stderr = "";
-  child.stderr?.on("data", (d) => (stderr += d));
-  let exited = false;
-  child.on("exit", () => {
-    exited = true;
-  });
+  for (const candidate of candidates) {
+    const [cmd, args] = RUN_SCRIPT_CMD[pm](candidate);
+    const child = spawn(cmd, args, {
+      cwd: pkgDir,
+      env: cleanEnvForChildProcess({ PORT: String(port), HOST: "0.0.0.0" }),
+      detached: true,
+    });
 
-  const ready = await waitForReady(baseUrl, 60_000);
-  if (!ready || exited) {
+    let stderr = "";
+    child.stderr?.on("data", (d) => (stderr += d));
+    let exited = false;
+    child.on("exit", () => {
+      exited = true;
+    });
+
+    // `dev` compiles the route on first request rather than ahead of time, so
+    // it answers later than `start` does — give it the room to.
+    const readyTimeoutMs = candidate === "dev" ? 120_000 : 60_000;
+    const ready = await waitForReady(baseUrl, readyTimeoutMs);
+    if (ready && !exited) {
+      const { proxy, embedUrl } = await attachFrameableProxy({ baseUrl, pageUrlPath });
+      const previewId = insertPreviewRow(db, {
+        runId,
+        kind: "process",
+        port,
+        pid: child.pid,
+        containerName: null,
+        url,
+        expiresAt,
+        proxyPort: proxy?.port ?? null,
+        embedUrl,
+      });
+      if (proxy) liveProxies.set(previewId, proxy);
+      return { ok: true, previewId, url, embedUrl, kind: "process", script: candidate, expiresAt };
+    }
+
     if (child.pid) killGroupOrPid(child.pid, "SIGKILL");
-    return { ok: false, report: `preview server did not respond at ${baseUrl} within 60s (tried "${pm} run ${scriptName}"):\n${stderr.slice(-1500)}` };
+    attemptReports.push(`"${pm} run ${candidate}" did not answer at ${baseUrl} within ${readyTimeoutMs / 1000}s:\n${stderr.slice(-800)}`);
   }
 
-  const previewId = insertPreviewRow(db, { runId, kind: "process", port, pid: child.pid, containerName: null, url, expiresAt });
-  return { ok: true, previewId, url, kind: "process", expiresAt };
+  return {
+    ok: false,
+    report: candidates.length
+      ? `No serve script could start a preview server.\n\n${attemptReports.join("\n\n")}`
+      : `No "${SERVE_SCRIPT_PREFERENCE.join('"/"')}" script found in package.json.`,
+  };
 }
 
 /** Looks up the current preview for a run, if any — for GET /campaigns/:runId/preview. */
@@ -244,7 +346,17 @@ export async function getPreview(runId) {
   const db = getDb();
   const row = getActivePreviewRow(db, runId);
   if (!row) return null;
-  return { kind: row.kind, port: row.port, url: row.url, status: row.status, expiresAt: row.expires_at };
+  return {
+    kind: row.kind,
+    port: row.port,
+    url: row.url,
+    status: row.status,
+    expiresAt: row.expires_at,
+    // Null on rows written before the proxy existed, and on rows whose proxy
+    // failed to start — the UI falls back to a link-only panel rather than
+    // embedding an iframe that would render blank.
+    embedUrl: row.embed_url ?? null,
+  };
 }
 
 /** Explicit stop — POST /campaigns/:runId/preview/stop. */
@@ -254,6 +366,26 @@ export async function stopPreview({ runId, baseDir }) {
   if (!row) return { ok: false, reason: "not_found" };
   await stopPreviewRow(db, row, { baseDir });
   return { ok: true };
+}
+
+/**
+ * Restart (or start) a preview for a run that already has a staged draft.
+ * Used by POST /campaigns/:runId/preview/start when the auto-started preview
+ * has expired or been stopped, and the reviewer wants to look again.
+ *
+ * @param {object} p
+ * @param {string} p.runId
+ * @param {string} p.workdir
+ * @param {string|null} [p.pageUrlPath]
+ * @param {number} p.ttlMs
+ * @param {number} p.maxConcurrent
+ * @param {boolean} [p.disableDocker]
+ * @param {string} p.baseDir
+ */
+export async function restartPreview({ runId, workdir, pageUrlPath = null, ttlMs, maxConcurrent, disableDocker = false, baseDir }) {
+  // Stop any leftover row first so we don't leave two servers for one run.
+  await stopPreview({ runId, baseDir }).catch(() => {});
+  return startPreview({ runId, workdir, pageUrlPath, ttlMs, maxConcurrent, disableDocker });
 }
 
 /** Called on a timer (server.mjs) — stops any preview past its expires_at. */

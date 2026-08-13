@@ -27,6 +27,9 @@ Offer: ${request.offer}
 Audience: ${request.audience}
 Brief notes: ${request.brief}`,
     webSearch: true,
+    maxTokens: 8192,
+    // json:true omitted while webSearch is on — Gemini tool use + responseMimeType
+    // can conflict; extractJson still parses the reply.
   });
   const researchNotes = extractJson(text);
   // Persisted (not just held in LangGraph state) so a crash-resumed run can

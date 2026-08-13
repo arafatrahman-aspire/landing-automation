@@ -56,10 +56,56 @@ export interface GuidePlan {
   sections: { type: string; summary: string }[];
 }
 
+/* The plan gate — the human step BEFORE generation. Editing here is free;
+ * every change after generation costs another AI run. See
+ * src/pipeline/approve-or-edit-plan.mjs. */
+
+export interface PlanSection {
+  type: string;
+  summary: string;
+  /** How this section would be built if approved as-is. */
+  mode: "static" | "ai-required";
+  candidates: { id: string; description: string }[];
+}
+
+export interface Plan {
+  /** False once the run has moved past the gate — the plan stays readable,
+   *  but saving would silently disagree with the page already generated. */
+  editable: boolean;
+  status: string;
+  guide: GuidePlan;
+  sections: PlanSection[];
+}
+
+export function getPlan(runId: string): Promise<Plan> {
+  return request<Plan>(`/campaigns/${runId}/plan`);
+}
+
+export function savePlan(runId: string, guide: GuidePlan): Promise<{ ok: true; guide: GuidePlan }> {
+  return request(`/campaigns/${runId}/plan`, { method: "PATCH", body: JSON.stringify(guide) });
+}
+
+/** Saves any final edit and starts generation in one call, so the two can't
+ *  half-apply. */
+export function approvePlan(runId: string, guide?: GuidePlan): Promise<{ ok: true; status: string }> {
+  return request(`/campaigns/${runId}/plan/approve`, { method: "POST", body: JSON.stringify(guide ? { guide } : {}) });
+}
+
+export function abandonPlan(runId: string): Promise<{ ok: true; status: "abandoned" }> {
+  return request(`/campaigns/${runId}/plan/abandon`, { method: "POST" });
+}
+
 export interface SectionReference {
   sectionType: string;
   note: string;
   files: { path: string; found: boolean }[];
+}
+
+export interface ResearchNotes {
+  keywords?: string[];
+  painPoints?: string[];
+  faqQuestions?: string[];
+  notes?: string;
 }
 
 export interface RunSummary {
@@ -74,6 +120,8 @@ export interface RunSummary {
   branchName: string | null;
   error: string | null;
   guide?: GuidePlan | null;
+  researchNotes?: ResearchNotes | null;
+  request?: CampaignBrief | null;
   sectionReferences?: SectionReference[] | null;
   verifyChecks?: VerifyChecks | null;
   verifyAttempts?: number;
@@ -113,9 +161,15 @@ export async function getRunDraft(runId: string): Promise<Draft | null> {
 export interface Preview {
   kind: "process" | "docker";
   port: number;
+  /** Points straight at the preview server — use this for "open in a new tab". */
   url: string;
   status: string;
   expiresAt: string;
+  /** Goes through the frameable proxy (src/preview/frameable-proxy.mjs), which
+   *  strips the target repo's `X-Frame-Options: DENY`. This is the only URL an
+   *  <iframe> can actually render; null on older rows, or if the proxy failed
+   *  to start, in which case the UI degrades to a link. */
+  embedUrl: string | null;
 }
 
 /** Returns null once a run has no active preview (404) — normal before
@@ -131,6 +185,11 @@ export async function getPreview(runId: string): Promise<Preview | null> {
 
 export async function stopPreview(runId: string): Promise<void> {
   await request<void>(`/campaigns/${runId}/preview/stop`, { method: "POST" });
+}
+
+/** Restart a preview after it expired or was stopped (staged drafts only). */
+export async function startPreview(runId: string): Promise<Preview> {
+  return request<Preview>(`/campaigns/${runId}/preview/start`, { method: "POST" });
 }
 
 export function listCampaigns(): Promise<RunSummary[]> {
@@ -153,6 +212,12 @@ export async function getRunLog(runId: string): Promise<string> {
   return res.text();
 }
 
+export type Tone = "professional" | "friendly" | "urgent" | "technical" | "playful";
+export type PageLength = "short" | "standard" | "long";
+
+/** Mirrors briefSchema in src/schemas/campaign-brief-schema.mjs. Everything
+ *  past `videoUrl` is optional: a brief that sets none of it behaves exactly
+ *  as briefs did before these existed. */
 export interface CampaignBrief {
   slug: string;
   campaignName: string;
@@ -161,11 +226,33 @@ export interface CampaignBrief {
   cta: string;
   brief?: string;
   videoUrl?: string;
+  deadline?: string;
   requiresJobField?: boolean;
+
+  // Content rules — pure prompt input, no effect on the pipeline's shape.
+  tone?: Tone;
+  brandNotes?: string;
+  mustInclude?: string[];
+  avoid?: string[];
+  referenceUrl?: string;
+
+  // Structure. `sectionTypes` picks WHETHER a section exists;
+  // `aiRequiredSections` picks HOW it gets built (bespoke AI vs. reusing an
+  // existing layout). They are deliberately separate.
+  sectionTypes?: string[];
+  pageLength?: PageLength;
+  aiRequiredSections?: string[];
 }
 
 export function createCampaign(brief: CampaignBrief): Promise<{ runId: string; status: string; statusUrl: string }> {
   return request("/campaigns", { method: "POST", body: JSON.stringify(brief) });
+}
+
+/** The brief a past run was created from, for pre-filling the form. Campaigns
+ *  get run in variations constantly; retyping every field each time was the
+ *  most obvious daily friction in the old flow. */
+export function getCampaignBrief(runId: string): Promise<CampaignBrief> {
+  return request<CampaignBrief>(`/campaigns/${runId}/brief`);
 }
 
 const TERMINAL_STATUSES = new Set([
@@ -215,6 +302,17 @@ export interface FrameCandidateSummary {
   description: string;
 }
 
+/** Derived from the layout's own Zod schema (src/sections/describe-fillable-fields.mjs),
+ *  which is the same schema the save is validated against — so a form built
+ *  from these always submits something the server accepts. */
+export type CopyField =
+  | { key: string; label: string; kind: "text" }
+  | { key: string; label: string; kind: "text-list" }
+  | { key: string; label: string; kind: "group-list"; fields: { key: string; label: string }[] }
+  | { key: string; label: string; kind: "unsupported" };
+
+export type CopyValues = Record<string, string | string[] | Record<string, string>[]>;
+
 export interface SectionSummary {
   type: string;
   mode: "static" | "ai-required";
@@ -223,18 +321,25 @@ export interface SectionSummary {
   slot: string;
   frameId?: string;
   candidates: FrameCandidateSummary[];
+  /** Empty for AI-written sections and photo-based layouts — both have no
+   *  editable data object, which is what tells the UI to offer the AI path. */
+  fields: CopyField[];
+  data: CopyValues | null;
 }
 
 export function getSections(runId: string): Promise<SectionSummary[]> {
   return request<SectionSummary[]>(`/campaigns/${runId}/sections`);
 }
 
-export type RefineAction = "use-different-frame" | "modify" | "redesign" | "new";
+/** "edit-copy" is the only one that makes no LLM call — it rewrites the
+ *  section's data object and re-verifies. Instant and free. */
+export type RefineAction = "edit-copy" | "use-different-frame" | "modify" | "redesign" | "new";
 
 export interface RefineParams {
   frameId?: string;
   instructions?: string;
   sectionType?: string;
+  data?: CopyValues;
 }
 
 export interface RefineResult {
@@ -248,6 +353,19 @@ export function refineSection(runId: string, slot: string, action: RefineAction,
   return request<RefineResult>(`/campaigns/${runId}/sections/${slot}/refine`, {
     method: "POST",
     body: JSON.stringify({ action, ...params }),
+  });
+}
+
+export interface RefinePageResult extends RefineResult {
+  slots: string[];
+  planSource: "keywords" | "llm" | "all";
+}
+
+/** Plain-language page edit — may rewrite several sections, then re-stage + refresh preview. */
+export function refinePage(runId: string, instructions: string): Promise<RefinePageResult> {
+  return request<RefinePageResult>(`/campaigns/${runId}/refine-page`, {
+    method: "POST",
+    body: JSON.stringify({ instructions }),
   });
 }
 

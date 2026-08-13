@@ -20,6 +20,24 @@ const FAILED_STATUSES = new Set([
   "failed_push_incomplete",
 ]);
 
+/* The stage column used to print the raw pipeline node name — "classify_sections",
+ * "preview_build" — which is precise and means nothing to anyone who hasn't read
+ * the graph. Same keys as RunDetailPage's STAGES, phrased for a glance. */
+const STAGE_LABEL: Record<string, string> = {
+  intake: "Reading the brief",
+  research: "Researching",
+  clone: "Cloning the repo",
+  guide: "Planning the page",
+  classify_sections: "Choosing designs",
+  generate_sections: "Writing sections",
+  verify: "Building & checking",
+  stage_draft: "Staging for review",
+  preview_build: "Starting preview",
+  committing: "Committing",
+  pushing: "Pushing",
+  opening_pr: "Opening the PR",
+};
+
 function relativeTime(iso: string): string {
   const diffMs = Date.now() - new Date(iso).getTime();
   const mins = Math.round(diffMs / 60_000);
@@ -170,23 +188,33 @@ export default function CampaignListPage() {
                       {statusLabel(r.status)}
                     </span>
                   </td>
-                  <td className="empty">{r.stage ?? "—"}</td>
+                  <td className="empty" title={r.stage ?? ""}>
+                    {r.stage ? (STAGE_LABEL[r.stage] ?? r.stage) : "—"}
+                  </td>
                   <td className="empty" title={new Date(r.createdAt).toLocaleString()}>
                     {relativeTime(r.createdAt)}
                   </td>
                   <td>
-                    {isTerminalStatus(r.status) ? (
-                      <button
-                        type="button"
-                        className="danger-link"
-                        disabled={deletingId === r.runId}
-                        onClick={() => handleDelete(r)}
-                      >
-                        {deletingId === r.runId ? "deleting…" : "delete"}
-                      </button>
-                    ) : (
-                      <span className="live-indicator">running</span>
-                    )}
+                    <div className="row-actions">
+                      {/* Running variations of the same campaign is the normal
+                          case, so duplicating is offered on every row, not just
+                          finished ones. */}
+                      <Link to={`/new?duplicateOf=${r.runId}`} className="button-ghost row-action">
+                        duplicate
+                      </Link>
+                      {isTerminalStatus(r.status) ? (
+                        <button
+                          type="button"
+                          className="danger-link"
+                          disabled={deletingId === r.runId}
+                          onClick={() => handleDelete(r)}
+                        >
+                          {deletingId === r.runId ? "deleting…" : "delete"}
+                        </button>
+                      ) : (
+                        <span className="live-indicator">running</span>
+                      )}
+                    </div>
                   </td>
                 </tr>
               ))}

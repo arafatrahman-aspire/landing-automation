@@ -10,6 +10,14 @@ const boolFromEnv = z
   .optional()
   .transform((v) => v === "true" || v === "1");
 
+// Same shape, opposite default: unset means ON. For flags where the safe,
+// boring behaviour is the enabled one and turning it OFF is the deliberate
+// opt-in (see VERIFY_DISABLE_DOCKER).
+const boolFromEnvDefaultTrue = z
+  .string()
+  .optional()
+  .transform((v) => v === undefined || v === "" || !(v === "false" || v === "0"));
+
 const intFromEnv = (def) =>
   z
     .string()
@@ -34,6 +42,13 @@ const envSchema = z
     CLAUDE_MODEL: z.string().default("claude-sonnet-5"),
     CODING_AGENT_MODEL: z.string().optional(),
 
+    // Pause after the AI plans the page and BEFORE any section is generated,
+    // so a human can edit the hero copy, SEO tags and section list first.
+    // Steering here is free; every change after generation costs another LLM
+    // run. Overridable per campaign via the brief's `reviewPlan` field —
+    // unset there falls back to this.
+    REVIEW_PLAN_BEFORE_GENERATING: boolFromEnvDefaultTrue,
+
     MAX_AGENT_ITERATIONS: intFromEnv(40),
     MAX_CODE_ATTEMPTS: intFromEnv(3),
     // Overrides package-manager auto-detection (packageManager field, then
@@ -42,13 +57,25 @@ const envSchema = z
     // the package-lock.json it actually uses) and detection picks the wrong
     // tool. Leave unset to keep auto-detecting.
     PACKAGE_MANAGER_OVERRIDE: z.enum(["npm", "yarn", "pnpm"]).optional(),
-    // When the target repo has its own root Dockerfile with a `node:` base
-    // image, verify install/build runs inside `docker run` against THAT
-    // image instead of this service's host Node/npm — sidesteps host/repo
-    // version mismatches entirely (auto-detected: on by default, only takes
-    // effect when the repo actually has a usable Dockerfile AND docker is
-    // reachable; set true to force host-based install/build even then).
-    VERIFY_DISABLE_DOCKER: boolFromEnv,
+    // Docker is OFF by default (v0.32). Verify and preview both run the
+    // target repo's own `npm ci` / `npm run build` / `npm run start` directly
+    // on this host.
+    //
+    // It used to be the other way around: when the target repo had a root
+    // Dockerfile with a `node:` base image, verify built inside `docker run`
+    // against that image, so the build matched the repo's declared Node
+    // version instead of whatever this host happens to have. That reasoning
+    // is still sound, but in practice the container path was the single
+    // largest source of failed runs — image pulls, bind-mount permissions,
+    // and containers outliving the process that spawned them (which then
+    // held open file handles inside a worktree we were trying to delete).
+    // Host npm is slower to get wrong and far easier to debug: the same
+    // command you'd type yourself, in a directory you can `cd` into.
+    //
+    // Set VERIFY_DISABLE_DOCKER=false to put the container path back — it
+    // still only engages when the repo really has a usable Dockerfile AND
+    // docker is reachable.
+    VERIFY_DISABLE_DOCKER: boolFromEnvDefaultTrue,
     VERIFY_INSTALL_TIMEOUT_MS: intFromEnv(300_000),
     VERIFY_BUILD_TIMEOUT_MS: intFromEnv(600_000),
     // How the layout/SEO/a11y checks reach the new page once it's served —
@@ -169,6 +196,7 @@ function loadConfig() {
 
     maxAgentIterations: env.MAX_AGENT_ITERATIONS,
     maxCodeAttempts: env.MAX_CODE_ATTEMPTS,
+    reviewPlanBeforeGenerating: env.REVIEW_PLAN_BEFORE_GENERATING,
     packageManagerOverride: env.PACKAGE_MANAGER_OVERRIDE ?? null,
     verifyDisableDocker: env.VERIFY_DISABLE_DOCKER,
     verifyInstallTimeoutMs: env.VERIFY_INSTALL_TIMEOUT_MS,

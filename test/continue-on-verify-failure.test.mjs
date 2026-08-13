@@ -18,34 +18,38 @@ setTestConfigEnv({
 
 const { config } = await import("../src/config.mjs");
 const runStore = await import("../src/state/campaign-repository.mjs");
+const { decideAfterVerify } = await import("../src/pipeline/decide-after-verify.mjs");
 
 test("the flag is read from the environment", () => {
   assert.equal(config.continueOnVerifyFailure, true);
 });
 
-/* routeAfterVerify isn't exported (it's internal to the graph), so this
- * mirrors its exact logic to pin the decision table down. */
-function routeAfterVerify(state, { continueOnVerifyFailure, maxCodeAttempts }) {
-  if (state.verifyPassed) return "stage_draft";
-  if (state.codeAttempts < maxCodeAttempts) return "generate_sections";
-  if (continueOnVerifyFailure) return "stage_draft";
-  return "END";
-}
-
 test("a failing build with retries left still retries — the flag doesn't short-circuit repair", () => {
-  const route = routeAfterVerify({ verifyPassed: false, codeAttempts: 1 }, { continueOnVerifyFailure: true, maxCodeAttempts: 2 });
+  const route = decideAfterVerify(
+    { verifyPassed: false, codeAttempts: 1 },
+    { continueOnVerifyFailure: true, maxCodeAttempts: 2 }
+  );
   assert.equal(route, "generate_sections");
 });
 
 test("with retries exhausted, the flag stages instead of ending the run", () => {
-  const withFlag = routeAfterVerify({ verifyPassed: false, codeAttempts: 2 }, { continueOnVerifyFailure: true, maxCodeAttempts: 2 });
-  const withoutFlag = routeAfterVerify({ verifyPassed: false, codeAttempts: 2 }, { continueOnVerifyFailure: false, maxCodeAttempts: 2 });
+  const withFlag = decideAfterVerify(
+    { verifyPassed: false, codeAttempts: 2 },
+    { continueOnVerifyFailure: true, maxCodeAttempts: 2 }
+  );
+  const withoutFlag = decideAfterVerify(
+    { verifyPassed: false, codeAttempts: 2 },
+    { continueOnVerifyFailure: false, maxCodeAttempts: 2 }
+  );
   assert.equal(withFlag, "stage_draft");
-  assert.equal(withoutFlag, "END", "default behavior must be unchanged");
+  assert.equal(withoutFlag, "end", "default behavior must be unchanged");
 });
 
 test("a passing build is unaffected by the flag", () => {
-  assert.equal(routeAfterVerify({ verifyPassed: true, codeAttempts: 2 }, { continueOnVerifyFailure: true, maxCodeAttempts: 2 }), "stage_draft");
+  assert.equal(
+    decideAfterVerify({ verifyPassed: true, codeAttempts: 2 }, { continueOnVerifyFailure: true, maxCodeAttempts: 2 }),
+    "stage_draft"
+  );
 });
 
 test("verifyBypassed round-trips so the review UI can warn about an unbuildable draft", async () => {

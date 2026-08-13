@@ -10,7 +10,9 @@ export const LIMITS = {
   heroTitle: 80,
   seoTitle: 70,
   seoMetaDescription: 200,
-  sectionSummary: 400,
+  // Section briefs are intentional creative direction for coding/static fill —
+  // no hard character cap. SEO title/meta stay capped because they map to
+  // real SERP constraints.
 };
 
 export const guideSchema = z.object({
@@ -22,7 +24,7 @@ export const guideSchema = z.object({
     .array(
       z.object({
         type: sectionTypeSchema,
-        summary: z.string().min(1).max(LIMITS.sectionSummary),
+        summary: z.string().min(1),
       })
     )
     .min(1)
@@ -39,7 +41,7 @@ export const sectionModeSchema = z.enum(["static", "ai-required"]);
 export const classifiedSectionSchema = z
   .object({
     type: sectionTypeSchema,
-    summary: z.string().min(1).max(LIMITS.sectionSummary),
+    summary: z.string().min(1),
     mode: sectionModeSchema,
     frameId: z.string().min(1).nullable(),
   })
@@ -63,6 +65,9 @@ function truncate(str, max) {
  * length is objectively fixable, so it's handled deterministically here
  * rather than spending a regeneration attempt (and an extra LLM call) on
  * what's ultimately a cosmetic overage, not a structural problem.
+ *
+ * Section summaries are intentionally NOT truncated — they are creative
+ * briefs, not SERP fields.
  */
 export function truncateGuideFields(candidate) {
   if (!candidate || typeof candidate !== "object") return candidate;
@@ -71,13 +76,6 @@ export function truncateGuideFields(candidate) {
   if (typeof clamped.seoTitle === "string") clamped.seoTitle = truncate(clamped.seoTitle, LIMITS.seoTitle);
   if (typeof clamped.seoMetaDescription === "string") {
     clamped.seoMetaDescription = truncate(clamped.seoMetaDescription, LIMITS.seoMetaDescription);
-  }
-  if (Array.isArray(clamped.sections)) {
-    clamped.sections = clamped.sections.map((s) =>
-      s && typeof s === "object" && typeof s.summary === "string"
-        ? { ...s, summary: truncate(s.summary, LIMITS.sectionSummary) }
-        : s
-    );
   }
   return clamped;
 }

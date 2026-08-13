@@ -37,18 +37,27 @@ test("rejects a missing required field", () => {
   assert.equal(result.ok, false);
 });
 
-test("truncateGuideFields clamps oversized strings instead of failing (LLMs miscount characters)", () => {
+test("truncateGuideFields clamps oversized SEO strings instead of failing (LLMs miscount characters)", () => {
   const oversized = {
     ...validGuide,
     seoTitle: "x".repeat(LIMITS.seoTitle + 50),
     seoMetaDescription: "y".repeat(LIMITS.seoMetaDescription + 50),
-    sections: [{ type: "hero", summary: "z".repeat(LIMITS.sectionSummary + 50) }],
+    sections: [{ type: "hero", summary: "z".repeat(2000) }],
   };
   const clamped = truncateGuideFields(oversized);
   assert.equal(validateGuide(clamped).ok, true);
   assert.ok(clamped.seoTitle.length <= LIMITS.seoTitle);
   assert.ok(clamped.seoMetaDescription.length <= LIMITS.seoMetaDescription);
-  assert.ok(clamped.sections[0].summary.length <= LIMITS.sectionSummary);
+  // Section summaries have no character cap — left intact.
+  assert.equal(clamped.sections[0].summary.length, 2000);
+});
+
+test("section summaries of any length are accepted", () => {
+  const long = {
+    ...validGuide,
+    sections: [{ type: "hero", summary: "Detailed brief. ".repeat(80).trim() }],
+  };
+  assert.equal(validateGuide(long).ok, true);
 });
 
 test("truncateGuideFields leaves well-formed fields untouched", () => {

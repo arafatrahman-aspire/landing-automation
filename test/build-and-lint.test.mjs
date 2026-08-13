@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { verifyBuild, detectPackageManager } from "../src/verify/build-and-lint.mjs";
+import { verifyBuild, detectPackageManager, isNextEslintToolingMismatch } from "../src/verify/build-and-lint.mjs";
 
 /* Local fixtures only — no network, no real npm install (a real package.json
  * with no dependencies makes `npm ci` a near-instant no-op). */
@@ -20,6 +20,49 @@ test("passes when build (and no lint) succeeds", async (t) => {
 
   const result = await verifyBuild({ workdir: root, installTimeoutMs: 60_000, buildTimeoutMs: 60_000 });
   assert.equal(result.ok, true);
+});
+
+test("isNextEslintToolingMismatch detects the Next 14 + ESLint 9 Invalid Options crash", () => {
+  const sample = `Invalid Options:
+- Unknown options: useEslintrc, extensions, resolvePluginsRelativeTo
+- 'extensions' has been removed.`;
+  assert.equal(isNextEslintToolingMismatch(sample), true);
+  assert.equal(isNextEslintToolingMismatch("error  Unexpected console statement  no-console"), false);
+});
+
+test("build pass + Next/ESLint tooling-mismatch lint failure is treated as verify pass", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "verify-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await makeFixture(root, {
+    name: "fixture",
+    version: "0.0.0",
+    scripts: {
+      build: "echo build-ok",
+      lint: "node -e \"console.error('Invalid Options:\\n- Unknown options: useEslintrc, extensions'); process.exit(1)\"",
+    },
+  });
+
+  const result = await verifyBuild({ workdir: root, installTimeoutMs: 60_000, buildTimeoutMs: 60_000 });
+  assert.equal(result.ok, true);
+  assert.match(result.report, /Lint skipped/i);
+  assert.match(result.report, /ESLint 9/i);
+});
+
+test("a real lint rule failure still fails verify", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "verify-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await makeFixture(root, {
+    name: "fixture",
+    version: "0.0.0",
+    scripts: {
+      build: "echo build-ok",
+      lint: "node -e \"console.error('error  Unexpected console  no-console'); process.exit(1)\"",
+    },
+  });
+
+  const result = await verifyBuild({ workdir: root, installTimeoutMs: 60_000, buildTimeoutMs: 60_000 });
+  assert.equal(result.ok, false);
+  assert.match(result.report, /lint failed/i);
 });
 
 test("fails with a report when the build script exits non-zero", async (t) => {

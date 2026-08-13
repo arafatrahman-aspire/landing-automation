@@ -15,7 +15,7 @@ test("passes when title/media/form all fit above the fold", { skip }, async (t) 
     page(`
       <h1 data-hero-title>Save 50% today</h1>
       <div data-hero-media style="height:100px">video</div>
-      <form data-hero-form style="height:100px"><input /></form>
+      <form data-hero-form id="regForm" style="height:100px"><input /></form>
     `)
   );
   t.after(server.close);
@@ -30,7 +30,7 @@ test("fails with a specific overflow message when the form is pushed below the f
       <h1 data-hero-title>Save 50% today</h1>
       <div data-hero-media style="height:100px">video</div>
       <div style="height:1200px">spacer pushing the form down</div>
-      <form data-hero-form style="height:100px"><input /></form>
+      <form data-hero-form id="regForm" style="height:100px"><input /></form>
     `)
   );
   t.after(server.close);
@@ -45,7 +45,7 @@ test("fails with a clear message when a required data-hero-* attribute is missin
   const server = await serveHtml(
     page(`
       <h1 data-hero-title>Save 50% today</h1>
-      <form data-hero-form><input /></form>
+      <form data-hero-form id="regForm"><input /></form>
     `)
   );
   t.after(server.close);
@@ -53,4 +53,20 @@ test("fails with a clear message when a required data-hero-* attribute is missin
   const result = await checkHeroFit({ url: server.url });
   assert.equal(result.ok, false);
   assert.match(result.report, /missing required "data-hero-media"/i);
+});
+
+test("fails when data-hero-form is present but id=regForm is missing", { skip }, async (t) => {
+  const server = await serveHtml(
+    page(`
+      <h1 data-hero-title>Save 50% today</h1>
+      <div data-hero-media style="height:100px">video</div>
+      <form data-hero-form style="height:100px"><input /></form>
+    `)
+  );
+  t.after(server.close);
+
+  const result = await checkHeroFit({ url: server.url });
+  assert.equal(result.ok, false);
+  assert.match(result.report, /id="regForm"/);
+  assert.match(result.report, /#regForm/);
 });

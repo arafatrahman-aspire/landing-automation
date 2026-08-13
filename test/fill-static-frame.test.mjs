@@ -86,3 +86,60 @@ test("every real catalog candidate populates without throwing", () => {
     }
   }
 });
+
+/* ---------------- "use client" boundary ---------------- */
+
+test('every generated wrapper opens with "use client"', () => {
+  // The regression: a wrapper rendering SyllabusAccordionFrame (which calls
+  // useState but carries no "use client" of its own) sat between a Server
+  // Component page and a hook — so the build failed with "You're importing a
+  // component that needs useState... none of its parents are marked with
+  // 'use client'". Both wrapper shapes must carry the boundary.
+  const withData = frameCatalog.faq[0];
+  const bare = Object.values(frameCatalog)
+    .flat()
+    .find((c) => !c.fillableFields);
+
+  assert.match(populateFrame({ candidate: withData, componentName: "FaqSection" }).fileContent, /^"use client";\n\n/);
+  if (bare) {
+    assert.match(populateFrame({ candidate: bare, componentName: "BareSection" }).fileContent, /^"use client";\n\n/);
+  }
+});
+
+test('the directive comes before the import, not after', () => {
+  // Anything above it — even a comment — and Next stops treating it as a
+  // directive, which fails exactly the same way as omitting it.
+  const { fileContent } = populateFrame({ candidate: frameCatalog.faq[0], componentName: "FaqSection" });
+  const lines = fileContent.split("\n");
+  assert.equal(lines[0], '"use client";');
+  assert.ok(fileContent.indexOf('"use client"') < fileContent.indexOf("import "));
+});
+
+test("risk-list-with-image emits a working #regForm CTA instead of the dead frame button", () => {
+  const candidate = frameCatalog.details.find((c) => c.id === "risk-list-with-image");
+  assert.ok(candidate, "expected risk-list-with-image in catalog");
+  const { fileContent } = populateFrame({
+    candidate,
+    overrides: { buttonText: "Reserve my spot" },
+    componentName: "DetailsSection1",
+  });
+  assert.match(fileContent, /href="#regForm"/);
+  assert.match(fileContent, /Reserve my spot/);
+  assert.doesNotMatch(fileContent, /RiskListWithImageFrame/);
+});
+
+test("process-explainer emits a StaticImageData image so TypeScript accepts ProcessExplainerItem", () => {
+  const candidate = frameCatalog.timeline.find((c) => c.id === "process-explainer");
+  assert.ok(candidate, "expected process-explainer in catalog");
+  const { fileContent } = populateFrame({
+    candidate,
+    overrides: { title: "Your 3-day path" },
+    componentName: "TimelineSection3",
+  });
+  assert.match(fileContent, /import SideImage from "@assets\/images\/frames\/landing\/frame-4-image-1\.png"/);
+  assert.match(fileContent, /image: SideImage/);
+  assert.match(fileContent, /Your 3-day path/);
+  assert.match(fileContent, /ProcessExplainerFrame/);
+  // Must not JSON-serialize data without image (the original type error).
+  assert.doesNotMatch(fileContent, /const data = \[/);
+});

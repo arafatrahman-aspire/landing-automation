@@ -239,7 +239,15 @@ export async function deleteRun(runId) {
 // deleteRun can't silently miss one as the schema grows.
 const CHILD_TABLES_OF_RUNS = ["run_logs", "draft_files", "verify_reports", "validation_reports", "previews", "review_decisions", "token_usage"];
 
-const AWAITING_HUMAN_STATUSES = new Set(["staged_for_review"]);
+/* Runs parked on a human, not crashed. Neither is terminal — the run isn't
+ * finished, it's waiting — so DELETE stays a 409 and the boot-time
+ * reconciliation must leave them exactly as they are rather than "resuming"
+ * (which would re-drive the pipeline straight past the gate the human is
+ * standing at).
+ *
+ * "awaiting_plan_approval" is the earlier of the two: the content plan exists
+ * and nothing has been generated from it yet. */
+const AWAITING_HUMAN_STATUSES = new Set(["staged_for_review", "awaiting_plan_approval"]);
 
 /* Statuses where the run was somewhere inside the approve -> commit -> push
  * -> open-PR sequence. These must NEVER be auto-resumed: re-running them

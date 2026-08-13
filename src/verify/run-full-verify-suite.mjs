@@ -4,6 +4,7 @@ import { startEphemeral } from "./ephemeral-server.mjs";
 import { checkHeroFit } from "./check-hero-visibility.mjs";
 import { checkSeo } from "./check-seo-tags.mjs";
 import { checkAccessibility } from "./check-accessibility.mjs";
+import { checkBrowserAvailable } from "./browser-availability.mjs";
 
 /* Coordinates the full deterministic verify suite (new_plan.md §4.6, Layer 1):
  * build/lint first (fail fast — no point measuring the layout of something
@@ -40,8 +41,17 @@ export async function runFullVerifySuite({
   }
 
   const pkgDir = await findPackageJsonDir(workdir);
-  if (!pkgDir || !pageUrlPath) {
-    const reason = !pkgDir ? "not a Node-servable repo" : "PAGE_URL_PATH_TEMPLATE is not configured";
+  // All three remaining checks drive a real browser against a real server. Any
+  // of these three preconditions missing means they can't run — which is a
+  // SKIP, not a failure: the build gate already passed, and reporting `null`
+  // ("not run") is the honest answer. Crashing here instead would fail a run
+  // over an optional tool that was never installed.
+  const browser = !pkgDir || !pageUrlPath ? { ok: false } : await checkBrowserAvailable();
+  if (!pkgDir || !pageUrlPath || !browser.ok) {
+    let reason;
+    if (!pkgDir) reason = "not a Node-servable repo";
+    else if (!pageUrlPath) reason = "PAGE_URL_PATH_TEMPLATE is not configured";
+    else reason = `no browser available — ${browser.reason}. Run \`npx playwright install chromium\` to enable them`;
     return {
       ok: true,
       report: `${base.report}\n(Layout/SEO/accessibility checks skipped — ${reason}.)`,

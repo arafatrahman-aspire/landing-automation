@@ -22,11 +22,12 @@ import { z } from "zod";
  * SERVICE repo, since they only resolve inside the target repo's own build).
  *
  * `fillableFields` is a Zod schema for the subset of top-level keys campaign
- * copy is allowed to override. A candidate with NO `fillableFields` (and no
- * `defaultData`) always renders bare (`<XFrame />`, no `data` prop at all) —
- * deliberate for frames whose real defaults include photos (testimonials,
- * instructor bios): this service can't generate or source real photos, so
- * it never guesses at replacing them.
+ * copy is allowed to override. Section types whose only reusable frames are
+ * photo-dependent (testimonials, instructor) or whose body content is
+ * hardcoded outside the `data` prop (curriculum / SyllabusAccordionFrame)
+ * have NO catalog entry at all — classify-sections.mjs degrades them to
+ * ai-required, same as pricing and hero. Never bare-render a frame whose
+ * canned defaults are another campaign's industry and claims.
  *
  * `hero` intentionally has NO entry: per new_plan.md §9.2, hero is always
  * ai-required, never static.
@@ -83,7 +84,7 @@ export const frameCatalog = {
       component: "ProcessExplainerFrame",
       importPath: `${importBase}/ProcessExplainerFrame`,
       description:
-        "Title + description + ordered process-step list + side image. The source component has no built-in default (fully prop-driven already) — this catalog entry supplies a generic one. Data shape is an ARRAY of one item; the side image always stays the frame's own default.",
+        "Title + description + ordered process-step list + side image. The source component requires `image: StaticImageData` — fill-static-frame.mjs attaches a stock frame asset at emit time (JSON cannot carry image imports). Data shape is an ARRAY of one item; mergeStrategy merges overrides into element 0.",
       // ProcessExplainerFrame's `data` prop is `ProcessExplainerItem[]`, not
       // an object — mergeStrategy below merges overrides into element 0.
       defaultData: [
@@ -104,18 +105,13 @@ export const frameCatalog = {
     },
   ],
 
-  testimonials: [
-    {
-      id: "testimonial-carousel",
-      component: "TestimonialCarouselFrame",
-      importPath: `${importBase}/TestimonialCarouselFrame`,
-      description:
-        "Auto-playing testimonial carousel. Not campaign-fillable — every quote is paired with a real reviewer photo this service can't source or generate, so it always renders with the frame's own curated default untouched.",
-      // No defaultData/fillableFields on purpose — see file header. Listed
-      // here so it's still selectable as "the" static candidate for this
-      // section type; fill-static-frame.mjs always renders it bare.
-    },
-  ],
+  /* `testimonials` intentionally has NO static candidate — same treatment as
+   * `pricing` / `hero`. The only frame we could reuse (TestimonialCarouselFrame)
+   * is photo-dependent and ships Aspire Tech cybersecurity quotes about bank
+   * professionals. Bare-rendering it on an unrelated campaign (e.g. a weekend
+   * photography course) puts someone else's industry and claims on the page.
+   * classify-sections.mjs degrades testimonials to ai-required so the coding
+   * agent writes campaign-specific quotes instead. */
 
   faq: [
     {
@@ -185,67 +181,46 @@ export const frameCatalog = {
     },
   ],
 
-  curriculum: [
-    {
-      id: "syllabus-accordion",
-      component: "SyllabusAccordionFrame",
-      importPath: `${importBase}/SyllabusAccordionFrame`,
-      description:
-        "Syllabus accordion + download-syllabus modal CTA. Heading and button text are campaign-fillable; the GHL form wiring (ghlFormId/ghlFormName) stays default — that's business config, not campaign copy.",
-      defaultData: {
-        heading: "Syllabus Of Cloud Security Training Program",
-        ghlFormId: "RzdOq6FcRqPL9VxYEKN4",
-        ghlFormName: "Training - USA-Mar2025-Download-Sylabus",
-        downloadButtonText: "Download Full Syllabus",
-      },
-      fillableFields: z
-        .object({
-          heading: z.string().min(1),
-          downloadButtonText: z.string().min(1),
-        })
-        .partial(),
-    },
-  ],
+  /* `curriculum` intentionally has NO static candidate. SyllabusAccordionFrame
+   * only accepts heading/button/GHL ids via its `data` prop — the accordion
+   * ITEMS are hardcoded from the target repo's shared `FrameData` (Azure /
+   * AWS / Splunk certification modules). Overriding the heading to
+   * "Your Fun Photography Roadmap" while leaving those modules underneath is
+   * exactly the bug a real photography campaign hit. No amount of
+   * generate-static-content can fix a prop the frame doesn't expose.
+   * classify-sections.mjs degrades curriculum to ai-required. */
 
-  pricing: [
-    {
-      id: "pricing-packages-grid",
-      component: "PricingPackagesGridFrame",
-      importPath: `${importBase}/PricingPackagesGridFrame`,
-      description:
-        "Tiered pricing card grid + comparison table. Only the intro copy is campaign-fillable — the packages/prices themselves stay curated defaults (too structured/sensitive for a text guide to reinvent reliably).",
-      defaultData: {
-        eyebrow: "Certification Training",
-        heading: "Choose Your Learning Path",
-        description:
-          "Select the certification package that aligns with your career goals and budget. Each tier includes industry-recognized certifications and career support.",
-      },
-      fillableFields: z
-        .object({
-          eyebrow: z.string().min(1),
-          heading: z.string().min(1),
-          description: z.string().min(1),
-        })
-        .partial(),
-    },
-  ],
+  /* `pricing` intentionally has NO static candidate, so classify-sections.mjs
+   * degrades it to ai-required and the AI writes a pricing section for the
+   * campaign actually being run.
+   *
+   * There WAS an entry here for PricingPackagesGridFrame, and it was wrong in
+   * two independent ways.
+   *
+   * Broken: its defaultData declared only the three intro-copy fields, while
+   * `PricingPackagesGridData` also requires `packages` and `consultationUrl`.
+   * Since `data` is an all-or-nothing prop, every campaign that planned a
+   * pricing section failed to build with
+   *   Property 'packages' is missing in type '{ eyebrow: string; ... }'.
+   *
+   * Wrong even once fixed: completing the object means copying that frame's
+   * real defaults — Bronze through Titanium, $10,000 to $40,000, each with a
+   * live fastpaydirect payment link for one specific cybersecurity
+   * certification programme. Rendering that on an unrelated campaign's page
+   * would put someone else's prices and working payment URLs in front of the
+   * wrong audience. Bare-rendering the frame gives exactly the same result,
+   * because those are the frame's own internal defaults.
+   *
+   * Pricing is the section that most has to be campaign-specific, so the
+   * honest answer is to have no reusable layout for it at all. Absent rather
+   * than mapped to `[]`, because validateFrameCatalog rightly rejects a listed
+   * type with no candidates — same treatment as `hero` above. */
 
-  instructor: [
-    {
-      id: "trainer-profiles",
-      component: "TrainerProfilesFrame",
-      importPath: `${importBase}/TrainerProfilesFrame`,
-      description: "Trainer/instructor profile card grid. Only the section heading is campaign-fillable — real bios/photos stay curated defaults.",
-      defaultData: {
-        heading: "Meet Your Trainers",
-      },
-      fillableFields: z
-        .object({
-          heading: z.string().min(1),
-        })
-        .partial(),
-    },
-  ],
+  /* `instructor` intentionally has NO static candidate — TrainerProfilesFrame
+   * is photo-dependent (real bios + certificate images) and can only ever
+   * bare-render the frame's own cybersecurity trainer roster. Same reason as
+   * testimonials above: shipping that roster on an unrelated campaign is
+   * wrong, and this service can't source replacement photos. */
 
   "footer-cta": [
     {

@@ -2,6 +2,7 @@ import { StateGraph, Annotation, START, END } from "@langchain/langgraph";
 import { config } from "../config.mjs";
 import * as steps from "./steps/index.mjs";
 import * as runStore from "../state/campaign-repository.mjs";
+import { decideAfterVerify } from "./decide-after-verify.mjs";
 
 /* LangGraph state machine (mirrors the parent project's
  * scripts/campaign/lib/graph.mjs pattern — StateGraph + a single
@@ -12,6 +13,16 @@ import * as runStore from "../state/campaign-repository.mjs";
  *                                                                                            └retry──┘ (codeAttempts < MAX_CODE_ATTEMPTS)
  *                                                                                                    │ pass
  *                                                          stage_draft -> preview_build -> END (status: staged_for_review)
+ *
+ * THE PLAN GATE (v0.37): generate_guide has a conditional edge. On the first
+ * pass it ends the graph at `awaiting_plan_approval` — the plan exists, and
+ * nothing has been generated from it. A human edits the hero copy, SEO tags
+ * and section list, approves, and pipeline/approve-or-edit-plan.mjs re-drives
+ * runCodegen() from the top with `planApproved: true` and the edited guide in
+ * the initial state; research() and guide() both short-circuit on their own
+ * persisted results, so the second pass costs nothing extra and starts at
+ * classify_sections in practice. No checkpointer is involved — this is the
+ * same re-drive mechanism resume-interrupted-runs.mjs uses for crash recovery.
  *
  * `clone` happens BEFORE guide (not after, as you might expect) because the
  * target repo's actual stack isn't fixed — it could be Next.js, Laravel,
@@ -59,23 +70,46 @@ const CodegenState = Annotation.Root({
   verifyPassed: Annotation(),
   verifyReport: Annotation(),
   verifyBypassed: Annotation(),
+  // True when the build failed only in files outside this campaign's allowlist
+  // (target repo does not build on its own). Skips the generate_sections retry.
+  verifyForeignFailure: Annotation(),
   verifyAttempts: Annotation({ reducer: (_prev, next) => next, default: () => 0 }),
   codeAttempts: Annotation({ reducer: (_prev, next) => next, default: () => 0 }),
   prUrl: Annotation(),
   prNumber: Annotation(),
   status: Annotation(),
   previewStarted: Annotation(),
+  // The plan gate (v0.37). False/absent on the first pass, so the graph stops
+  // after generate_guide; approve-or-edit-plan.mjs re-drives the whole
+  // pipeline with this true, and the second pass runs straight through.
+  planApproved: Annotation(),
 });
 
+/* Stop after the plan and wait for a human, or carry straight on?
+ *
+ * Steering the plan is free — it's four fields and a section list, before a
+ * single LLM coding run has happened. Steering after generation costs a full
+ * regeneration per change. So the gate defaults ON, per campaign
+ * (`brief.reviewPlan`) falling back to REVIEW_PLAN_BEFORE_GENERATING.
+ *
+ * The second pass is not a resume from a checkpoint — there is no
+ * checkpointer. approvePlan() re-drives runCodegen() from the top with the
+ * persisted (and possibly human-edited) guide in the initial state, and both
+ * research() and guide() short-circuit on their own persisted results. That
+ * is exactly the mechanism resume-interrupted-runs.mjs already uses for crash
+ * recovery, which is why this gate needed no new graph entry point. */
+function routeAfterGuide(state) {
+  if (state.planApproved) return "classify_sections";
+  const wantsGate = state.request?.reviewPlan ?? config.reviewPlanBeforeGenerating;
+  return wantsGate ? END : "classify_sections";
+}
+
 function routeAfterVerify(state) {
-  if (state.verifyPassed) return "stage_draft";
-  if (state.codeAttempts < config.maxCodeAttempts) return "generate_sections";
-  // Escape hatch (CONTINUE_ON_VERIFY_FAILURE): stage and preview the draft
-  // even though it doesn't build, so a human can look at it rather than the
-  // run just ending. The run carries verifyBypassed so the review UI can say
-  // plainly that this page is NOT known to build.
-  if (config.continueOnVerifyFailure) return "stage_draft";
-  return END;
+  const decision = decideAfterVerify(state, {
+    maxCodeAttempts: config.maxCodeAttempts,
+    continueOnVerifyFailure: config.continueOnVerifyFailure,
+  });
+  return decision === "end" ? END : decision;
 }
 
 export function createCodegenGraph() {
@@ -94,7 +128,7 @@ export function createCodegenGraph() {
     .addEdge("intake", "research")
     .addEdge("research", "clone")
     .addEdge("clone", "generate_guide")
-    .addEdge("generate_guide", "classify_sections")
+    .addConditionalEdges("generate_guide", routeAfterGuide)
     .addEdge("classify_sections", "generate_sections")
     .addEdge("generate_sections", "verify")
     .addConditionalEdges("verify", routeAfterVerify)
@@ -131,6 +165,23 @@ export async function runCodegen(initialState) {
   await runStore.updateRun(initialState.runId, { status: "running" });
   try {
     const final = await graph.invoke(initialState);
+
+    // Stopped at the plan gate (routeAfterGuide). Distinguishable from every
+    // other END by having a guide but no verify outcome at all — nothing was
+    // generated, so verifyPassed/verifyBypassed/verifyReport are all unset.
+    // Checked FIRST: a run that never reached verify must not fall through to
+    // the "retries exhausted" branch below and be marked failed.
+    if (final.guide && !final.planApproved && final.verifyPassed === undefined && final.verifyBypassed === undefined) {
+      await runStore.updateRun(initialState.runId, { status: "awaiting_plan_approval", stage: "awaiting_plan_approval" });
+      await runStore.appendLog(
+        initialState.runId,
+        "info",
+        `plan: ready for review — ${final.guide.sections.length} section(s): ${final.guide.sections.map((s) => s.type).join(", ")}. ` +
+          `Nothing has been generated yet; edit the plan and approve it to continue.`
+      );
+      return final;
+    }
+
     if (!final.verifyPassed && final.verifyBypassed) {
       // Staged despite a failing build (CONTINUE_ON_VERIFY_FAILURE). It still
       // reaches review — but the report is kept on the run so the UI and the

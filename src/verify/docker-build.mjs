@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { cleanEnvForChildProcess } from "../spawn-env.mjs";
 
 /* A target repo's own Dockerfile is a stronger "how do I actually build
  * this" signal than whatever Node/npm happens to be installed on this
@@ -23,7 +24,7 @@ function truncateReport(text) {
 
 function runCommand(cmd, args, { cwd, timeoutMs, onTimeout } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { cwd });
+    const child = spawn(cmd, args, { cwd, env: cleanEnvForChildProcess() });
     let stdout = "";
     let stderr = "";
     let timedOut = false;

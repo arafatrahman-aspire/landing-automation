@@ -3,6 +3,7 @@ import net from "node:net";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { detectPackageManager, RUN_SCRIPT_CMD } from "./detect-package-manager.mjs";
+import { cleanEnvForChildProcess } from "../spawn-env.mjs";
 
 /* Ephemeral (not DB-tracked, not long-lived) build-and-serve primitive used
  * ONLY internally by one verify() call, to give hero-fit/seo-lint/a11y-lint
@@ -81,7 +82,7 @@ export async function startEphemeral({ workdir, timeoutMs = 30_000, packageManag
   // killing just the wrapper's pid leaves the real server running forever
   // (a real leaked-process bug, not just a test-cleanup nicety). Killing the
   // whole group (negative pid) reaches it too.
-  const child = spawn(cmd, args, { cwd: workdir, env: { ...process.env, PORT: String(port) }, detached: true });
+  const child = spawn(cmd, args, { cwd: workdir, env: cleanEnvForChildProcess({ PORT: String(port) }), detached: true });
 
   let stderr = "";
   child.stderr?.on("data", (d) => (stderr += d));

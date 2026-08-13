@@ -2093,3 +2093,875 @@ unchanged. Additive migration run against a copy of the real live
 `src/state/database-schema.mjs`, `.env`, `.env.example`; new
 `test/continue-on-verify-failure.test.mjs`; UI: `ui/src/api.ts`,
 `ui/src/pages/RunDetailPage.tsx`, `ui/src/App.css`.
+
+### v0.28 — Feature — 2026-08-07 — Fast per-file precheck: catch generation defects in 0.6ms instead of ~60s
+
+**The complaint:** "the same error of verify in Docker failing… it keeps failing
+again and again for the last fourteen days."
+
+**Docker was never the problem.** `docker run (node:20-alpine) [npm ci && npm run
+build] failed` only means the command *inside* the container exited non-zero.
+Docker pulled the image, installed 557 packages and ran `next build` correctly
+every time; `next build` then rejected the generated code. The last run's three
+attempts read:
+
+1. `Can't resolve '../../../../../components/SectionLine'` — an invented import
+2. `Binding element 'children' implicitly has an 'any' type` — untyped props
+3. `export default HeroSection0;"` — **a stray trailing quote**
+
+Setting `VERIFY_DISABLE_DOCKER=true` would reproduce all three on the host and
+reintroduce the Node-version mismatch Docker exists to avoid.
+
+**The actual problem was loop economics.** Logs show `npm ci` taking 54s–1m on
+*every* attempt. Three attempts ≈ 4–5 minutes of compute, whose final verdict was
+"there is one extra quote character" — something detectable in well under a
+millisecond.
+
+**What was built.** New `src/verify/precheck-section-file.mjs` runs three checks
+on each generated file immediately after the agent writes it — before the page is
+composed and long before Docker is invoked:
+
+| Check | Catches | Needs |
+|---|---|---|
+| Syntax | stray quotes, unclosed braces, mid-template EOF | the target repo's own `typescript` |
+| Imports | invented relative paths, missing aliased files, undeclared packages | filesystem + `package.json` |
+| Types | untyped destructured props under `"strict": true` | nothing |
+
+On failure the agent is immediately re-prompted with the exact problem and asked
+to make the smallest fix — a bounded inner loop (`precheckAttempts`, default 2)
+that runs entirely locally. Docker then only ever sees code that already parses,
+resolves and is annotated, so it verifies *integration* rather than typos.
+Measured at **0.6ms per file** against the real repo.
+
+**Design rule: no false positives.** Blocking valid code would be a
+self-inflicted outage; missing a defect merely costs what it already costs.
+A hand-rolled lexer was written first and **rejected** — it flagged
+`<h1>it's "quoted" text</h1>` as an unterminated string, and apostrophes are
+everywhere in marketing copy. It was replaced with the real TypeScript parser
+(`ts.createSourceFile` → `parseDiagnostics`), resolved from the target repo's own
+node_modules. When no parser is resolvable (before the first install) the syntax
+check **skips** rather than guesses. A second false positive was caught the same
+way: `items.map(({ id }) => …)` is contextually typed and legal, so only
+*declared* components (`const X = ({…}) =>`, `function X({…})`) are checked, and
+a type annotation on either the variable or the parameter exempts it.
+
+**Verification:** 227 tests, 219 pass, 8 pre-existing skips, 0 fail (21 new).
+Every "catches" test is a verbatim reproduction of a real failure; the
+no-false-positive tests cover apostrophes in JSX, regex vs. division, template
+literals, callback destructuring and `React.FC` annotations. Validated end to end
+against the real `atss-frontend` clone: all three real defects caught, a valid
+hero passes, 48 declared packages read, TypeScript resolvable.
+
+**Deliberately NOT done:** `node_modules` caching across attempts (still ~60s per
+verify) and raising `MAX_TOKENS` (8192 — the stray trailing quote is consistent
+with truncated output). Both remain open and are probably the next wins.
+
+**Files touched:** new `src/verify/precheck-section-file.mjs`;
+`src/sections/generate-sections.mjs`, `src/pipeline/steps/06-generate-sections.mjs`;
+new `test/precheck-section-file.test.mjs`.
+
+### v0.29 — Bugfix — 2026-08-07 — Orphaned scratch directory killed runs at clone
+
+**Symptom:** `git worktree add … failed (128): fatal: '…/da6987aa-…' already
+exists`, leaving the run at `failed_clone`.
+
+**Root cause.** The run's scratch directory survived as an **orphan**: the repo's
+files were on disk but there was no `.git` file, so git had no record of it
+(`_base/.git/worktrees/` listed only an unrelated run). `git worktree remove
+--force` therefore failed with "is not a working tree" — and the crash-resume
+cleanup added in v0.23 swallowed that with `.catch(() => {})`, so `worktree add`
+then ran straight into the still-present directory. Two defects: no filesystem
+fallback, and a silent catch that hid the reason.
+
+**Fix.** `removeWorktree()` is now defined by its outcome rather than by which
+git command succeeded — the git calls stay best-effort, and if the path still
+exists afterwards it is removed from the filesystem. It returns
+`{ok, reason?}` instead of nothing. The recursive delete is guarded: the target
+must resolve to a sibling of the base clone inside the scratch root and must
+never be the base clone itself, so it cannot be pointed elsewhere. `clone()` no
+longer ignores the result — it throws with the real reason instead of letting
+`worktree add` fail with a far less informative message, and it also clears a
+leftover BRANCH when the directory is already gone (a surviving branch alone
+breaks `add -b`).
+
+**Verification:** 230 tests, 222 pass, 8 pre-existing skips, 0 fail (3 new). The
+new tests reproduce the exact orphaned state (files present, no `.git`), and
+assert the guard refuses both a path outside the scratch root and the base clone
+itself, checking in each case that the files survive. The real stuck directory
+was then cleared using the fixed function — it held no generated files and had no
+`draft_files` rows, so nothing was lost.
+
+**Files touched:** `src/git/clone-and-commit.mjs`,
+`src/pipeline/steps/04-clone-target-repo.mjs`; extended
+`test/clone-and-commit.test.mjs`.
+
+### v0.30 — Bugfix — 2026-08-07 — `npm run dev`'s --watch was killing in-flight campaign runs
+
+**Reported as:** "the codebase fails and restarts during validation of the build."
+
+**Root cause.** `npm run dev` is `node --watch`, which restarts the process
+whenever any file under `src/` changes. A campaign run takes minutes, so editing
+a single source file mid-run kills it — almost always during `verify`, the
+longest stage. The run log then shows a build failure or `failed_clone`, which
+reads like a codegen or Docker problem. The database confirmed it: three
+separate runs carried `resume: service restarted while this run was at stage
+"verify"` / `"clone"`.
+
+Two hypotheses were tested and **disproved** before landing on this: writes into
+`data/` do NOT trigger the watcher (verified — creating files there caused no
+restart), and it was not memory pressure (18 GB RAM, 8 GB swap, no OOM kills).
+Touching `src/config.mjs` with the dev server running produced
+`Restarting 'src/server.mjs'` and a second boot, confirming the real cause.
+
+**Fixes.**
+- The server now prints a loud warning at boot in watch mode. Detection is
+  non-obvious: in watch mode Node runs the script in a *child* process, so
+  `--watch` never appears in that child's `execArgv` — it is marked with the
+  `WATCH_REPORT_DEPENDENCIES` env var instead. A first attempt checking only
+  `execArgv` silently printed nothing; both signals are now checked.
+- `removeWorktree`'s filesystem fallback now retries. A resume failed with
+  `ENOTEMPTY: directory not empty, rmdir '…/node_modules/@tsparticles/…'` —
+  deleting a worktree's node_modules races with writes still flushing from a
+  Docker build whose container outlived the process that started it. Retries
+  with backoff, plus `rm`'s own `maxRetries`.
+- `full_doc.md` gains a prominent troubleshooting entry, since the symptom
+  points at entirely the wrong subsystem.
+
+**Guidance:** use `npm start` for real campaigns; `npm run dev` is for editing
+the service itself.
+
+**Verification:** 230 tests, 222 pass, 8 pre-existing skips, 0 fail; suite run
+three consecutive times clean. Warning confirmed to appear under `npm run dev`
+and to stay silent under `npm start`.
+
+**Files touched:** `src/server.mjs`, `src/git/clone-and-commit.mjs`, `full_doc.md`.
+
+### v0.31 — Root cause found — 2026-08-07 — The TARGET REPO does not build; verify could never have passed
+
+**The finding that explains the whole fortnight.** A verify failure pointed at
+`./src/app/soc-health-check/page.tsx` — a path **outside** `WRITE_PATH_ALLOWLIST`
+(`src/app/campaigns/{slug}/`), which the four-layer write guard makes it
+physically impossible for this service to create. It is pre-existing target-repo
+code, `git ls-files`-tracked, last touched by `siddikAspire` four weeks ago in
+"Merge pull request #4 from dev-aspire/trainingUpdate".
+
+Typechecking the **pristine** base clone (no campaign files present at all)
+confirmed it:
+
+```
+src/app/soc-health-check/page.tsx(22,9): error TS2322:
+  Property 'contents' does not exist on type 'Frame29Props'. Did you mean 'contents1'?
+```
+
+`Frame29Props` requires `contents1` and `contents2`; the page passes `contents`
+and omits both. Of 928 raw `tsc` errors, 926 were `TS2307 "cannot find module
+*.png"` — verified spurious, since those image files exist (an artifact of raw
+tsc without Next's image declarations). **Exactly one was real.**
+
+`next build` runs the type checker, so the target repo's `dev` branch does not
+compile on its own. **No generated code could ever have made verify pass.**
+
+Why it surfaced only now: earlier runs failed on defects in the generated
+sections themselves, so tsc/webpack stopped at ours first. Once v0.28's per-file
+prechecks cleaned those up, the build got far enough to reach the repo's own
+pre-existing error. The identical-looking failure was actually progress.
+
+**Fix (in this service):** verify now distinguishes "our code is broken" from
+"the target repo doesn't build". New `extractAllBlamedFiles()` collects every
+blamed file with no allowlist filter; when a failure blames files but **none**
+are ours, the log says so explicitly rather than letting it read as a codegen
+bug. The composed-page exclusion was also tightened — it previously dropped any
+`*/page.tsx`, which would have hidden this very file; it now excludes only our
+own `${allowlistBase}page.tsx`.
+
+**Fix (in the target repo — not ours to make):** `src/app/soc-health-check/page.tsx`
+must pass `contents1`/`contents2` instead of `contents`. Until then every run
+fails at build no matter what it generates.
+
+**Verification:** 234 tests, 226 pass, 8 pre-existing skips, 0 fail (4 new).
+Classification confirmed against the real report: 0 files ours, 1 file foreign →
+"NOT CAUSED BY THIS RUN".
+
+**Files touched:** `src/verify/failing-files.mjs`,
+`src/pipeline/steps/07-verify.mjs`; extended `test/failing-files.test.mjs`.
+
+### v0.32 — Host npm instead of Docker; the generated page is finally *shown* — 2026-08-07
+
+Three changes, from the same request: stop building in Docker, show the page the
+model actually generated, and make the review UI readable by someone who has not
+read the pipeline source.
+
+**1. Docker is off by default.** `VERIFY_DISABLE_DOCKER` now defaults to **true**
+(new `boolFromEnvDefaultTrue` helper in `config.mjs`), so verify and preview both
+run the target repo's own `npm ci` / `npm run build` / `npm run start` directly on
+this host.
+
+The original reasoning for the container path was sound — build against the Node
+version the repo's own Dockerfile declares, rather than whatever the host has —
+but in practice it was the single largest source of failed runs: image pulls,
+bind-mount permissions, and containers outliving the process that spawned them
+while holding file handles inside a worktree we were then trying to delete
+(`ENOTEMPTY` on `node_modules/@tsparticles/…`, see v0.29). Host npm is the same
+command a human would type, in a directory they can `cd` into.
+
+Set `VERIFY_DISABLE_DOCKER=false` to put the container path back. Note the
+tradeoff this accepts: the host runs Node 24 while the repo's Dockerfile declares
+`node:20-alpine`. Next 14.2 supports both, but a native-module failure that only
+appears on one of them is now possible in a way it wasn't before.
+
+**2. The campaign landing page is embedded in the review UI.** This is what a
+review gate is *for*, and until now the UI showed a link and a list of filenames.
+
+The blocker was not effort — it was `X-Frame-Options: DENY`, which the target
+repo's `next.config.mjs` sends on every route from its `securityHeaders` block.
+A browser renders an iframe of that as a permanently blank box, with the reason
+visible only in the devtools console. That header is correct for production and
+patching the repo to work around our own tooling was not an option.
+
+New `src/preview/frameable-proxy.mjs` — a ~60-line reverse proxy that fronts a
+running preview server and strips `x-frame-options` and
+`content-security-policy` on the way out. It gets its **own port**, not a path
+prefix on the API server, because a Next page references its assets with
+root-absolute URLs (`/_next/static/…`); under a prefix every one of those would
+resolve against the API root and 404. Its own origin means no HTML rewriting and
+nothing to keep in sync with whatever Next emits next. It is bound to 127.0.0.1
+and each instance is pinned to exactly one upstream at construction — a request
+cannot steer it elsewhere (there is a test for that).
+
+`previews` gains `proxy_port` and `embed_url`. `url` still points straight at the
+preview server, so "open in a new tab" and "render in the iframe" stay
+independently meaningful. Proxy handles live in an in-process map keyed by
+preview row id — unlike the preview server there is no pid to persist, and a
+service restart takes them down along with the previews they front, which
+boot-time reconciliation stops anyway.
+
+**3. Preview falls through to `next dev` when `next start` can't serve.** The
+process path now tries every serve script the repo declares, in
+`SERVE_SCRIPT_PREFERENCE` order, instead of only the first. `start` needs a built
+`.next`; when verify failed and `CONTINUE_ON_VERIFY_FAILURE` staged the draft
+anyway, there is no build output, `next start` exits instantly, and the old code
+gave up — so the one run where seeing the page matters most was the run that
+showed nothing. `dev` compiles on demand and renders the page even while an
+unrelated file in the repo won't typecheck. It gets a 120s ready timeout rather
+than 60s, since it compiles the route on first request.
+
+**4. The run detail page is now tabbed, and says what it means.** Page preview /
+Generated code / Plan & checks / Activity log, opening on whichever is
+informative for the run's current state.
+
+- **Page preview** — the live page in an iframe, with desktop/tablet/phone width
+  switching, reload, open-in-new-tab and stop.
+- **Generated code** — the actual source of every staged file, with line numbers,
+  a lightweight three-token highlighter and copy-to-clipboard. It previously
+  showed paths and character counts, which told you a page existed but nothing
+  about what was in it.
+- Every stage now carries a plain-English sentence ("Choosing which sections
+  reuse an existing design and which need AI") instead of only its internal key,
+  in the stepper tooltip, the header line, and the campaign list's stage column.
+  Verify badges gained hover text; "skipped" became "not run".
+- The approve/abandon gate moved to a bar directly under the header, so the
+  decision isn't below a full page of scrolling. It turns red when
+  `verifyBypassed` is set.
+- The log console gained a "problems only" filter.
+- Responsive at 1080/860/720px: the code viewer stacks, the stepper scrolls
+  horizontally rather than wrapping into ragged rows, and the run table drops its
+  two least important columns on a phone.
+
+**Verification:** 244 tests, 236 pass, 8 pre-existing skips, 0 fail (6 new,
+covering header stripping, path/method/body forwarding, absolute-redirect
+rewriting, 502-on-dead-upstream and upstream pinning). `ui`: `tsc -b && vite
+build` clean, `oxlint` clean. Graph compiles; server boots and `/healthz` returns
+200 with the new columns migrated in.
+
+**Files touched:** `src/config.mjs`, `.env`, `src/preview/frameable-proxy.mjs`
+(new), `src/preview/preview-server.mjs`, `src/state/database-schema.mjs`,
+`test/frameable-proxy.test.mjs` (new), `ui/src/api.ts`,
+`ui/src/pages/RunDetailPage.tsx`, `ui/src/pages/CampaignListPage.tsx`,
+`ui/src/pages/NewCampaignPage.tsx`, `ui/src/App.css`.
+
+### v0.33 — Honeypot typed as required broke every lead form — 2026-08-07
+
+A real run (`f2fa8b7d`) burned three consecutive Docker builds on one type
+error in its own generated hero, and the repair loop could not talk its way out
+of it:
+
+```
+interface IFormData { …; company_website: string }        // required
+yup.object().shape({ …, company_website: yup.string() })  // optional
+useForm<IFormData>({ resolver: yupResolver(schema) })
+
+Type 'Resolver<{ company_website?: string | undefined; … }>' is not
+assignable to type 'Resolver<IFormData, any, IFormData>'.
+```
+
+The honeypot is optional **by definition** — a human visitor always leaves it
+empty — so any validation schema will infer it optional, and declaring it
+required in the TypeScript type can never typecheck. The lead form contract
+described the honeypot's markup, styling and submit behaviour in detail but said
+nothing about its *type*, so the model had no reason to get this right.
+
+**Fix 1 — the contract says it now.** `buildLeadFormPromptFragment` states that
+the honeypot must be `company_website?: string`, quotes the exact `tsc` error it
+causes otherwise, and generalises the rule: when a schema is passed to `useForm`
+through a resolver, the type argument must match what the schema infers exactly
+— optional for optional, required for required.
+
+**Fix 2 — a precheck catches it in milliseconds.** New `checkHoneypotOptional()`
+in `precheck-section-file.mjs` flags a non-optional honeypot property, so the
+repair loop gets an instant single-file error instead of paying a full
+`npm ci` + build to learn it. Gated on the file actually importing
+react-hook-form, so a marketing section that legitimately carries a "company
+website" field is never touched — the module's no-false-positives rule. Not
+gated on `strictTypes`: this is a plain assignability error that fails under any
+tsconfig.
+
+Note the check holds even if the mismatch is "fixed" the other way, by making
+the schema require the honeypot — that would typecheck and then silently block
+every genuine visitor from submitting the form.
+
+**Verification:** 250 tests, 242 pass, 8 pre-existing skips, 0 fail (6 new). The
+positive case is the verbatim failing file from run `f2fa8b7d`; the negative
+cases cover an optional honeypot, a yup schema entry, a zod `.optional()`, a
+form-less section, and a commented-out declaration.
+
+**Files touched:** `src/leadform/contract.mjs`,
+`src/verify/precheck-section-file.mjs`, `test/precheck-section-file.test.mjs`.
+
+### v0.34 — The preview was showing the wrong page — 2026-08-07
+
+A runtime error reported from a preview —
+
+```
+Failed to parse src "Francesca Blake" on `next/image`
+```
+
+— turned out to come from the target repo's **home page**, not from anything
+this service generated. Confirmed by exhaustion: the string appears in no file
+in the repo and in none of the six generated files (it is live API data), and
+not one generated file so much as imports `next/image`.
+
+**Root cause: `PAGE_URL_PATH_TEMPLATE` was never set.** With it unset,
+`pageUrlPath` is null, so the preview URL degrades to the bare server root —
+the target repo's home page — and the reviewer is looking at somebody else's
+bug. It also silently disabled hero-fit/SEO/a11y on every run since the
+feature shipped. Now set to `/campaigns/{slug}`, matching the route
+`WRITE_PATH_ALLOWLIST=src/app/campaigns/{slug}/` produces.
+
+**Second bug, found while fixing the first.** Setting that variable would have
+crashed every run, because the three browser-backed checks were never
+survivable: `playwright` is an npm dependency, but the ~150MB browser it drives
+is a separate download that `npm ci` does not fetch. `chromium.launch()` then
+rejects, and that rejection escaped `runFullVerifySuite`'s `Promise.all`
+uncaught — a tool that was simply never installed presenting as a hard pipeline
+failure at verify.
+
+New `verify/browser-availability.mjs` probes once per process (the answer can't
+change mid-lifetime) and caches. When no browser is launchable, the three
+checks report `null` — "not run" — alongside the concrete remedy
+(`npx playwright install chromium`), which is the honest answer: build/lint
+already passed, and a missing optional tool is not a failing page. Run
+`npx playwright install chromium` to turn the checks back on.
+
+**Verification:** 253 tests, 245 pass, 8 pre-existing skips, 0 fail (3 new). The
+skip-path test builds a real minimal Node repo so the suite genuinely passes
+build/lint and *reaches* the browser branch — a fixture that short-circuits
+earlier would prove nothing. It self-skips where chromium is installed.
+
+**Files touched:** `.env`, `src/verify/browser-availability.mjs` (new),
+`src/verify/run-full-verify-suite.mjs`, `test/browser-availability.test.mjs`
+(new), `full_doc.md`.
+
+### v0.35 — Static section wrappers were missing `"use client"` — 2026-08-08
+
+A run failed verify three times with a report that said nothing useful:
+
+```
+uncaughtException TypeError: Unexpected response from worker: undefined
+  at ChildProcessWorker._onMessage (…/next/dist/compiled/jest-worker/index.js)
+```
+
+Fifteen lines, no source file, no compile error. Running the **same** build by
+hand in the same workdir minutes later printed the actual cause:
+
+```
+You're importing a component that needs useState. It only works in a Client
+Component but none of its parents are marked with "use client".
+  ./src/components/frames/landing/analyze/SyllabusAccordionFrame.tsx
+  ./src/app/campaigns/<slug>/sections/CurriculumSection2.tsx
+  ./src/app/campaigns/<slug>/page.tsx
+```
+
+Three separate defects, in decreasing order of importance.
+
+**1. The real bug — `fill-static-frame.mjs` emitted no client boundary.** The
+static-section templater produced a wrapper importing a frame that calls
+`useState`, with neither the wrapper nor the composed page marked
+`"use client"` — so nothing in the chain was a Client Component and webpack
+refused it. Not an LLM slip: this is our own deterministic template, so every
+static section wrapping an interactive frame was broken the same way.
+
+Wrappers now open with `"use client";` unconditionally. Detecting the need
+properly would mean resolving transitive imports — `FaqAccordionFrame` doesn't
+call a hook itself, it imports `Accordion`, which does — so a one-level scan
+would miss half the cases. The asymmetry settles it: a wrapper marked client-side
+that didn't need it costs a slightly larger bundle, while missing one costs a
+failed build and a wasted retry. These wrappers are always the same shape (a
+synchronous component rendering a frame with inline literal data, never async,
+never server-only), so there is nothing `"use client"` can break here.
+
+**2. `Next.js` was reported to the user as a failing file.** `PATH_RE` matches
+any token ending in a source extension, and Next's own version banner
+`▲ Next.js 14.2.35` ends in `.js`. Combined with the `node_modules` path from
+the worker stack trace — which `extractAllBlamedFiles` never filtered, since it
+passes no allowlist — the classifier announced *"the target repository does not
+build on its own: Next.js, …/jest-worker/index.js"*. Both are now excluded:
+dependency internals always, and any token with no `/` in it. The cost is that
+a blamed file at the repo root is no longer detected, which only weakens a hint;
+a fabricated filename actively misleads. Generated files always live under
+`src/app/campaigns/<slug>/` and are unaffected.
+
+**3. The worker crash now explains itself.** Next compiles in child workers and
+pipes their output back to the parent. When a worker dies before replying —
+OOM-killed under memory pressure being the usual reason — the parent crashes on
+the empty message and never prints what the worker had found. `build-and-lint.mjs`
+recognises the signature and appends a note saying it is an infrastructure
+failure rather than a source defect, with the command to re-run by hand.
+
+**Not reproduced end-to-end:** the worktree that exhibited this was abandoned
+(and correctly cleaned up) before the fix landed, so the evidence is the
+reproduced error with its import trace plus unit tests asserting the emitted
+wrapper. The next real run is the confirmation.
+
+**Verification:** 258 tests, 250 pass, 8 pre-existing skips, 0 fail (5 new).
+The `node_modules`/banner tests use the verbatim stored report from run
+`ea209fac`.
+
+**Files touched:** `src/sections/fill-static-frame.mjs`,
+`src/verify/failing-files.mjs`, `src/verify/build-and-lint.mjs`,
+`test/fill-static-frame.test.mjs`, `test/failing-files.test.mjs`.
+
+### v0.36 — Root cause of the fortnight: `node --watch` was breaking every build — 2026-08-08
+
+**The whole thing. Found, reproduced, fixed.**
+
+Running the service with `npm run dev` executes it under `node --watch`, and
+Node's watch mode sets **`WATCH_REPORT_DEPENDENCIES=1`** in the process
+environment. That variable tells a Node process to report every module it loads
+back to its parent by pushing `{ 'watch:require': … }` messages down its IPC
+channel.
+
+It is inherited by every child, and every child of those children. `next build`
+farms compilation and type-checking out to jest-worker child processes connected
+over IPC — which then emit `watch:require` messages into the very channel
+jest-worker uses for its own protocol. jest-worker reads a message shape it has
+never heard of and the parent dies:
+
+```
+uncaughtException TypeError: Unexpected response from worker: undefined
+  at ChildProcessWorker._onMessage (…/next/dist/compiled/jest-worker/index.js)
+```
+
+The parent then exits without printing anything the workers had found, which is
+why every such report was ~15 lines with a stack trace into Next's own bundle
+and no source file in it.
+
+**Reproduced directly**, in a real worktree:
+
+| command | result |
+|---|---|
+| `npm run build` | 71s, compiles, reports the real type error |
+| `WATCH_REPORT_DEPENDENCIES=1 npm run build` | **1.9s**, `Unexpected response from worker: undefined` |
+
+Why it stayed hidden for two weeks: it depends on nothing in the code and
+everything in how the service happened to be launched. `npm start` builds fine;
+`npm run dev` never can. Docker hid it too — a container gets a fresh
+environment — so "verify only fails without Docker" read as an argument about
+Docker rather than about the environment. Every earlier fix (v0.28 prechecks,
+v0.31 target-repo type error, v0.32 host npm, v0.35 `"use client"`) was real and
+necessary, and none of them could have made a run pass while this was in play.
+
+**Fix.** New `src/spawn-env.mjs`: `cleanEnvForChildProcess()` returns
+`process.env` with `WATCH_REPORT_DEPENDENCIES` removed and any `--watch` /
+`--watch-path` stripped out of `NODE_OPTIONS`. Applied at every spawn site —
+`verify/build-and-lint.mjs`, `verify/docker-build.mjs`,
+`verify/ephemeral-server.mjs`, and both process paths in
+`preview/preview-server.mjs`.
+
+A warning already existed telling people not to use `npm run dev`. A warning is
+not a fix; the service is now correct however it is started. The warning stays,
+because the *other* half of the `--watch` problem — a source edit restarting the
+process and killing a run in flight — is untouched by this.
+
+**Verified end-to-end:** with `WATCH_REPORT_DEPENDENCIES=1` deliberately set in
+the parent, `verifyBuild()` against a real worktree now runs the full 45-second
+build and reports the genuine type error in the generated section, instead of
+crashing in 2 seconds.
+
+`build-and-lint.mjs`'s worker-crash annotation was rewritten to name this cause
+first — the symptom is generic enough that a future reader hitting it for some
+other reason should not have to rediscover any of the above.
+
+**Verification:** 265 tests, 257 pass, 8 pre-existing skips, 0 fail (7 new). One
+of them spawns a real child process and asserts the variable genuinely does not
+survive into it, rather than only checking the returned object.
+
+**Files touched:** `src/spawn-env.mjs` (new), `src/verify/build-and-lint.mjs`,
+`src/verify/docker-build.mjs`, `src/verify/ephemeral-server.mjs`,
+`src/preview/preview-server.mjs`, `src/server.mjs`, `test/spawn-env.test.mjs`
+(new).
+
+### v0.37 — Customizability, phases 1–3a: content rules, the plan gate, and copy editing without an AI — 2026-08-08
+
+The service had exactly one point of human control: approve or abandon a
+finished page. Everything else — tone, structure, section list, every word —
+was whatever the model decided, and the only way to change any of it was to ask
+an AI to regenerate a whole section. Three changes, marketing-first.
+
+**1. The brief can state rules, not just facts.** `briefSchema` gains `tone`,
+`brandNotes`, `mustInclude[]`, `avoid[]`, `referenceUrl`, `sectionTypes[]`,
+`pageLength` and `reviewPlan`. New `schemas/content-rules-prompt.mjs` renders
+them as their own labelled, numbered block for both the guide stage and the
+per-section agent, framed as outranking the model's own judgement.
+
+Why named fields rather than more free text: a rule you want honoured every
+time ("never call it cheap") competes for attention with everything else when
+it's buried in one paragraph. The reference URL is explicitly marked as *not
+fetched* — without that the model writes as though it had read the page.
+
+Structural rules go to the guide stage only. The per-section agent can write
+exactly one file, so restating which sections exist just invites it to argue
+with a settled decision.
+
+`aiRequiredSections` and `deadline` were **already accepted by the schema and
+never sent by the form** — working capability, invisible. Now exposed, along
+with everything above, in a four-step wizard. Campaigns can also be duplicated
+(`GET /campaigns/:runId/brief`), which deliberately withholds the old slug.
+
+**2. The plan gate — the centrepiece.** The pipeline now stops after
+`generate_guide` at a new non-terminal status `awaiting_plan_approval`. A human
+edits the hero headline, SEO tags and section list — reorder, retype, add,
+remove, reword — then approves, and only then does anything get generated.
+Editing here is free; the same change afterwards costs an AI run per section.
+
+The implementation is small because the machinery already existed.
+`resumeInterruptedRuns()` re-drives a run by calling `runCodegen()` with the
+persisted research and guide, both of which short-circuit their own LLM calls.
+`approvePlan()` is that same call with the human-edited guide substituted in
+and `planApproved: true`. **No checkpointer, no second graph entry point** —
+one conditional edge on `generate_guide` and a new state channel.
+
+`approve-or-edit-plan.mjs` mirrors `approve-or-abandon-run.mjs`, which is the
+same idea one stage later. Human edits go through the identical
+truncate-then-validate path the model's own output does — a person overruns an
+SEO limit at least as often as a model, and neither should lose their work over
+a cosmetic overage. The hero is pinned first and cannot be removed: it carries
+the lead form, and verify's hero-fit check assumes it is the first thing on the
+page.
+
+`AWAITING_HUMAN_STATUSES` gains the new status, so boot-time reconciliation
+leaves a parked run alone rather than "resuming" it straight past the human
+standing at the gate, and DELETE stays a 409.
+
+**3. Editing copy with no LLM at all.** A static section's content is a plain
+object that `populateFrame` merges over the frame's defaults — so changing a
+word is a data edit, not a code change. New
+`sections/describe-fillable-fields.mjs` walks a candidate's `fillableFields`
+**Zod schema** and emits form descriptors; the new `edit-copy` refine action
+re-runs `populateFrame` with the submitted values, re-verifies and stages a new
+draft version.
+
+Because the form and the validation are derived from the same schema, a form
+that submits is one the server accepts — it is not possible to enter invalid
+data. Instant, free, and the control a marketing user will touch most: before
+this, fixing a typo meant an AI rewrite of the whole section, with a fresh
+chance to break the build.
+
+The walker is deliberately narrow — string, array-of-string, array-of-object —
+and reports anything else as unsupported rather than rendering a control that
+would submit something the schema rejects. A test asserts every real catalog
+candidate produces a fully renderable form, so a future entry using an
+unfamiliar shape fails loudly rather than becoming a silently uneditable
+section.
+
+**Found while building it:** `buildStaticSectionFile` called `populateFrame`
+with **no overrides**, so every static section rendered the frame's stock
+marketing copy regardless of the campaign. It now threads and records
+`dataUsed`, which is also what makes editing persist across edits. Switching
+layout carries matching copy across key by key rather than discarding it.
+
+**Verification:** 294 tests, 286 pass, 8 pre-existing skips, 0 fail (29 new).
+`ui`: `tsc -b && vite build` and `oxlint` clean. Graph compiles; server boots;
+the gate was exercised against a real database — plan read back with per-section
+mode and layout choices, edited, persisted, status unchanged.
+
+**Still to come (phases 3b/4):** draft version history and diffs, code editing
+behind an Advanced toggle, more frame candidates per section type with
+thumbnails, style presets, and token/cost tracking (the `token_usage` table
+still has zero writers).
+
+**Files touched:** `src/schemas/campaign-brief-schema.mjs`,
+`src/schemas/content-rules-prompt.mjs` (new),
+`src/pipeline/approve-or-edit-plan.mjs` (new),
+`src/sections/describe-fillable-fields.mjs` (new),
+`src/pipeline/run-campaign-pipeline.mjs`, `src/pipeline/refine-section.mjs`,
+`src/pipeline/steps/03-generate-guide.mjs`,
+`src/sections/section-agent-prompt.mjs`, `src/sections/generate-sections.mjs`,
+`src/state/sqlite-campaign-repository.mjs`, `src/config.mjs`, `src/server.mjs`,
+`ui/src/api.ts`, `ui/src/pages/NewCampaignPage.tsx`,
+`ui/src/pages/RunDetailPage.tsx`, `ui/src/pages/CampaignListPage.tsx`,
+`ui/src/App.css`, plus four new test files.
+
+### v0.38 — Two broken catalog entries, and a poisoned base branch — 2026-08-09
+
+Found by actually running the pipeline end to end for the first time, which
+also confirmed v0.36: **the jest-worker crash is gone.** Builds now compile and
+report real, specific errors.
+
+**1. Two frame catalog entries had partial `defaultData`.** The file header has
+always said `defaultData` must be a FULL copy of the frame's own default object,
+never partial, because `data` is an all-or-nothing prop with no deep-merge. Two
+entries violated it, and both broke the build of any campaign planning that
+section:
+
+- `instructor / trainer-profiles` declared `{ heading }` while
+  `TrainerProfilesData` also requires `profiles` →
+  *Property 'profiles' is missing in type '{ heading: string; }'*.
+  Each profile carries a `StaticImageData` that exists only as a PNG import
+  inside the target repo, so it cannot be expressed here at all. Overriding
+  just the heading was never possible. Now **bare render**, which is what the
+  header already prescribed for photo-dependent frames.
+- `pricing / pricing-packages-grid` declared three intro-copy fields while
+  `PricingPackagesGridData` also requires `packages` and `consultationUrl`.
+  Completing it faithfully would mean copying Bronze–Titanium, $10,000 to
+  $40,000, each with a live fastpaydirect payment link for one specific
+  certification programme — onto every campaign that plans a pricing section.
+  Pricing is the section that most has to be campaign-specific, so the entry is
+  **removed entirely**; `classifySections` degrades pricing to ai-required and
+  the AI writes one for the campaign actually being run.
+
+Neither was caught because the frames live in the TARGET repo and nothing here
+had ever read them. `test/static-frame-catalog.test.mjs` now does: it parses
+each frame's `*Data` interface out of the base clone and asserts every required
+prop is present in `defaultData`. It skips (loudly) when no base clone exists,
+rather than passing vacuously.
+
+**2. A broken generated page is committed on `dev`.**
+`src/app/campaigns/soc-analyst-fast-track-bootcamp/sections/DetailsSection1.tsx`
+fails with *Property 'icon' does not exist on type '{ text: string; }'*. It
+reached `dev` through the `CONTINUE_ON_VERIFY_FAILURE` escape hatch: verify
+failed, the draft was staged anyway, it was approved, a PR was opened, and the
+PR was merged. It now breaks **every** subsequent run, exactly as
+`soc-health-check/page.tsx` does — the classifier correctly reports
+"NOT CAUSED BY THIS RUN".
+
+This is the escape hatch working as designed and being used past the point it
+was meant for. `CONTINUE_ON_VERIFY_FAILURE=true` is a temporary unblock, not a
+mode to run in: every approval it permits can poison the base branch for
+everything that follows.
+
+**3. A stored error looked like a live one.** The run page rendered `run.error`
+with no date, so a two-day-old failure from an already-fixed bug read exactly
+like something happening now — which is precisely how it was reported. The
+banner now carries "recorded <when>" plus, for finished runs, "this run is
+finished, nothing is still failing", and the header shows the run's age.
+
+**Also observed:** the service was SIGKILLed (exit 137) mid-run on this
+machine, under ~11Gi of 18Gi already in use with a Next build in flight. Not a
+code fault, but worth knowing: a campaign run plus a full `next build` needs
+real headroom.
+
+**Verification:** 295 tests, 287 pass, 8 pre-existing skips, 0 fail (1 new).
+Two live runs against the real target repo: one parked at the plan gate in ~20s
+with content rules honoured (`pageLength: short` → 3 sections, `mustInclude`
+reflected in the section list), was edited over `PATCH /plan`, approved, and ran
+through generation → verify → preview → `staged_for_review`. A second confirmed
+the instructor fix emits `<TrainerProfilesFrame />` with no `data` prop and that
+the campaign's own sections compile — the only remaining type error is in the
+foreign file above.
+
+**Files touched:** `src/design-catalog/static-frame-catalog.mjs`,
+`test/static-frame-catalog.test.mjs`, `ui/src/pages/RunDetailPage.tsx`,
+`ui/src/App.css`.
+
+### v0.39 — Static sections now get AI-authored copy, not the frame's canned defaults — 2026-08-10
+
+Found by inspecting a real run's "Generated code" tab: a campaign called
+"Weekend Photography Starter Course" was rendering a FAQ about Income Share
+Agreements and cybersecurity certifications, and a details section warning
+about data breaches — the exact same words `static-frame-catalog.mjs` carries
+so `fillableFields` has something to validate against. Every static section
+on every campaign has always rendered these identical placeholder words,
+because nothing ever passed campaign copy into `buildStaticSectionFile` as
+`overrides` — `populateFrame` always ran with `overrides: {}`. A static
+section being "static" (no coding agent, pure templating) was never supposed
+to mean "not campaign-specific," only "not code."
+
+**Fix: `sections/generate-static-content.mjs`.** One plain `generateText()`
+call per fillable static section (JSON-in, JSON-out, not a coding-agent run)
+asking for copy shaped like `describeFillableFields(candidate.fillableFields)`
+— the exact schema `populateFrame()` validates the result against, so the
+prompt shape and the validator can never drift apart. Any failure along the
+way (network error, unparsable JSON, a shape the schema rejects) falls back
+to `{}` — the frame's own real `defaultData` wins, exactly the old behavior —
+never worth failing a run over. Bare-render candidates (`testimonials`/
+`instructor`, whose real defaults are photos this service can't source) are
+short-circuited to `{}` before any call is made.
+
+New root doc `static-section-data.md` is the human-readable catalog this
+draws from: for each static-catalog section type, which frame, whether it's
+campaign-fillable, and the exact field shape. Deliberately NOT the runtime
+source of truth (that stays the Zod schema, so the two can't drift) — it's
+there so a human can see the whole shape landscape without reading five
+`.tsx` files in the target repo's `analyze/` folder.
+
+**Wiring, kept opt-in on purpose:** `generateSections()` gained an
+`authorStaticContent` flag, default `false` — every existing test calls it
+directly with no flag and must keep seeing the old, network-free behavior
+(`test/generate-sections.test.mjs`'s "no LLM/network involved" test says so
+explicitly in its own name). `pipeline/steps/06-generate-sections.mjs` (the
+real pipeline entrypoint) passes `authorStaticContent: true` unconditionally.
+`pipeline/refine-section.mjs`'s `"new"` action (adding a fresh static section
+to an existing run) had the identical bug — `populateFrame({ candidate,
+componentName })` with zero overrides — and now calls the same generator.
+`"use-different-frame"` was left alone: every section type today has exactly
+one static candidate, so there is nothing to switch to yet (Module 7 —
+catalog curation — is what would make that path exercised).
+
+**Verification:** 300 tests, 292 pass, 8 pre-existing skips, 0 fail (5 new,
+in `test/generate-static-content.test.mjs`). The new tests cover the pure
+shape-builder and the no-network early-return for bare-render candidates;
+the actual `generateText()` success path is untested directly, same as
+`guide()`/`research()` already were — it needs a real API key and network,
+which this environment doesn't have.
+
+**Files touched:** `src/sections/generate-static-content.mjs` (new),
+`test/generate-static-content.test.mjs` (new), `static-section-data.md`
+(new), `src/sections/generate-sections.mjs`,
+`src/pipeline/steps/06-generate-sections.mjs`,
+`src/pipeline/refine-section.mjs`.
+
+### v0.40 — The guide plans each section separately instead of all at once — 2026-08-10
+
+Follow-up to v0.39, prompted by looking at a real plan-gate screen: the
+section summaries — the actual instruction the later coding/content stage
+writes each section from ("The summary is the instruction the AI writes that
+section from, so being specific pays off," per the UI's own copy) — were
+one generic sentence each, because the whole plan (hero title, SEO copy, AND
+every section's summary) came from ONE `generateText()` call. Asking a model
+to write nine sections' worth of specific content briefs in the same breath
+it's also deciding the page structure produces exactly what you'd expect:
+shallow, interchangeable one-liners. The schema already allowed up to 400
+characters per summary (`LIMITS.sectionSummary`); the prompt just never asked
+for more than 100.
+
+**`pipeline/steps/03-generate-guide.mjs` is now two phases, mirroring the fan-out
+already used for actual section generation** (`sections/generate-sections.mjs`:
+every ai-required section gets its own independent coding-agent run, all
+concurrent, rather than one call writing the whole page):
+
+1. **Outline** (`generateOutline`) — one call, same as before, but now asks
+   only for structure: hero title, SEO copy, and an ordered section list of
+   `{type, theme}`, where `theme` is a short (≤100 char) angle/purpose per
+   section — just enough to keep sections from overlapping each other.
+2. **Elaboration** (`elaborateSection`) — one independent call PER section,
+   all run concurrently via `Promise.all`. Each gets the full campaign
+   context, its own theme, the OTHER sections' themes (so it doesn't repeat
+   their ground), and that section type's design-catalog reference — and is
+   asked for a real 2-4 sentence, up-to-400-character content brief specific
+   enough that "someone with no other context should be able to write the
+   whole section from this brief alone."
+
+The two phases' outputs are assembled into the exact same `{heroTitle,
+heroHasVideo, seoTitle, seoMetaDescription, sections: [{type, summary}]}`
+shape the rest of the pipeline already expects, then pushed through the same
+`truncateGuideFields`/`validateGuide` used before — no schema change, no UI
+change, no change to any downstream consumer (`approve-or-edit-plan.mjs`,
+`sections/section-agent-prompt.mjs`, `sections/generate-static-content.mjs`
+all keep reading `summary` exactly as they did). An elaboration failure for
+one section (network error, bad JSON) never fails the run — it falls back to
+that section's own outline theme as the summary, same "never fail over a
+copy-quality feature" posture as v0.39.
+
+Trade-off, accepted deliberately: this turns 1 LLM call into 1 + N (N = section
+count, ≤9) per plan. Same trade the coding fan-out already made for the same
+reason — more, narrower calls beat one call doing everything shallowly.
+
+**Verification:** 300 tests, 292 pass, 8 pre-existing skips, 0 fail — this
+step has no direct unit test in either version (same as `research()`; both
+need a real network call and API key, which this environment doesn't have),
+so the full suite is what confirms nothing else broke: `content-guide-schema.test.mjs`
+(the schema `guide()` outputs into, unchanged) and everything downstream of
+`state.guide` still pass untouched.
+
+**Files touched:** `src/pipeline/steps/03-generate-guide.mjs`.
+
+### v0.41 — Bugfix — 2026-08-11 — Poisoned sibling campaign no longer fails every run
+
+**Symptom:** Every new campaign failed verify three times, then fell through
+`CONTINUE_ON_VERIFY_FAILURE`, with:
+
+```
+./src/app/campaigns/soc-analyst-fast-track-bootcamp/sections/DetailsSection1.tsx
+Type error: Property 'icon' does not exist on type '{ text: string; }'.
+verify: NOT CAUSED BY THIS RUN — …
+```
+
+The ESLint `useEslintrc` / `extensions` line in the same report is noise —
+Next 14 logs it when ESLint 9 rejects those options, then returns `null` and
+continues; it does not fail the build.
+
+**Root cause:** That DetailsSection1 was merged onto `dev` via the escape hatch
+(verify failed → staged → approved → PR merged). `next build` typechecks the
+whole app, so one broken sibling campaign fails every later run. The classifier
+was already correct; the retry loop was not — it regenerated our sections three
+times against a defect regenerating cannot fix.
+
+**Fix (this service):**
+1. After worktree checkout, quarantine every `src/app/campaigns/*` directory
+   except the slug being generated. Deletions stay local; `commitPaths` only
+   stages what this run wrote, so PRs remain additive.
+2. When verify blames only foreign files, set `verifyForeignFailure` and skip
+   further `generate_sections` retries (still honour `CONTINUE_ON_VERIFY_FAILURE`
+   for staging).
+
+**Fix (target repo):** `./fix-target-repo.sh` now also type-annotates
+`defaultBenefits` in DetailsSection1 so `dev` itself builds again. Run it and
+type `yes` to push.
+
+**Verification:** new quarantine + decide-after-verify tests; related suite
+26/26 pass.
+
+**Files touched:** `src/git/quarantine-sibling-campaigns.mjs`,
+`src/pipeline/decide-after-verify.mjs`, `src/pipeline/steps/04-clone-target-repo.mjs`,
+`src/pipeline/steps/07-verify.mjs`, `src/pipeline/run-campaign-pipeline.mjs`,
+`fix-target-repo.sh`, `test/quarantine-sibling-campaigns.test.mjs`,
+`test/decide-after-verify.test.mjs`, `test/continue-on-verify-failure.test.mjs`.
+
+### v0.42 — Bugfix — 2026-08-11 — Photography course no longer ships cybersecurity sections
+
+**Symptom:** Weekend Photography Starter Course preview showed Aspire Tech
+cybersecurity testimonials, an ISA FAQ, and an Azure/AWS/Splunk syllabus under
+a photography heading/CTA.
+
+**Root cause (three different static-frame failures, one page):**
+1. **Curriculum** — `SyllabusAccordionFrame` only accepts heading/button via
+   `data`; accordion items are hardcoded from shared `FrameData`. AI correctly
+   rewrote the heading and still left cert modules underneath.
+2. **Testimonials** — bare-render photo carousel always ships cyber bank-pro
+   quotes; this service can't source replacement photos.
+3. **FAQ** — fully fillable, but when `generateStaticSectionContent` returned
+   `{}` the pipeline silently merged catalog defaults (ISA copy) onto the page.
+
+**Fix:** Remove `curriculum`, `testimonials`, and `instructor` from the static
+catalog (same treatment as `pricing`) so they classify as ai-required. For
+remaining fillable static sections, require list-body overrides
+(`staticOverridesAreUsable`); incomplete/empty results fall back to an
+ai-required coding-agent section instead of shipping canned cyber copy.
+
+**Verification:** 51 related tests pass.
+
+**Files touched:** `src/design-catalog/static-frame-catalog.mjs`,
+`src/sections/generate-static-content.mjs`, `src/sections/generate-sections.mjs`,
+`static-section-data.md`, `test/generate-static-content.test.mjs`,
+`test/classify-sections.test.mjs`, `test/approve-or-edit-plan.test.mjs`,
+`test/describe-fillable-fields.test.mjs`.

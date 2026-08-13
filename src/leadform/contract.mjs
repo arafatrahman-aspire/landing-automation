@@ -16,6 +16,13 @@
 
 export const HONEYPOT_FIELD_NAME = "company_website";
 
+/** Anchor id every campaign CTA must scroll to. Matches the target repo's
+ *  existing frames (CtaSectionFrame, CertificationInfoFrame, … all use
+ *  `href="#regForm"`). The hero lead form MUST set this id on the same
+ *  element that carries `data-hero-form`. */
+export const LEAD_FORM_ANCHOR_ID = "regForm";
+export const LEAD_FORM_HREF = `#${LEAD_FORM_ANCHOR_ID}`;
+
 export const BASE_FIELDS = [
   { name: "name", label: "Full name", type: "text", required: true },
   { name: "phone", label: "Phone number", type: "tel", required: true },
@@ -49,6 +56,10 @@ Fields, in this order:
 ${fieldList}
 
 Honeypot (bot defense): include one EXTRA hidden text input named \`${HONEYPOT_FIELD_NAME}\`, styled so it's invisible to real visitors (e.g. \`position: absolute; left: -9999px\` or a visually-hidden utility class — never \`display: none\`/\`type="hidden"\`, which some bots skip) and never focusable (\`tabIndex={-1}\`, \`autoComplete="off"\`). Do not label it or mention it to the user. On submit, if this field is non-empty, still show the normal success state to the visitor (never reveal detection) but do not include it as meaningful data.
+
+The honeypot is OPTIONAL and must be typed that way — \`${HONEYPOT_FIELD_NAME}?: string\`, with the \`?\`. A real visitor always leaves it empty, so a validation schema can never mark it required. If you declare it \`${HONEYPOT_FIELD_NAME}: string\` in the form's TypeScript interface while the schema leaves it optional, the two disagree and \`next build\` fails with:
+  Type 'Resolver<{ ${HONEYPOT_FIELD_NAME}?: string | undefined; ... }>' is not assignable to type 'Resolver<IFormData, any, IFormData>'.
+More generally: if you pass a validation schema to \`useForm\` via a resolver (\`yupResolver\`/\`zodResolver\`), the TypeScript type argument to \`useForm<T>\` must match what the schema infers EXACTLY — every field the schema leaves optional must be optional in \`T\`, and every field it requires must be required. The other required fields above are all \`.required()\` in the schema and non-optional in \`T\`.
 
 Client-side validation before submit (basic format checks only, not a replacement for server-side validation): \`email\` must match a standard email shape; \`phone\` must contain at least 7 digits. Show inline errors, don't submit until valid.
 

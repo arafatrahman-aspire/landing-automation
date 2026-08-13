@@ -15,6 +15,7 @@ test("buildSectionAgentSystemPrompt scopes the guardrail to exactly one file", (
   });
   assert.match(prompt, /You may create EXACTLY ONE file: app\/campaigns\/x\/sections\/HeroSection0\.tsx/);
   assert.match(prompt, /data-hero-title/); // hero contract included for hero sections
+  assert.match(prompt, /id="regForm"/); // CTA anchors need this on the lead form
   assert.match(prompt, /export a default React component named HeroSection0/i);
 });
 
@@ -52,6 +53,8 @@ test("buildSectionAgentSystemPrompt omits the hero contract for non-hero section
   });
   assert.doesNotMatch(prompt, /data-hero-title/);
   assert.doesNotMatch(prompt, /company_website/); // lead-form contract only threaded into hero
+  assert.match(prompt, /href="#regForm"/); // still tells CTAs where to link
+  assert.match(prompt, /CALL-TO-ACTION LINKS/);
 });
 
 test("buildSectionAgentSystemPrompt includes verifyReport feedback only when retrying", () => {

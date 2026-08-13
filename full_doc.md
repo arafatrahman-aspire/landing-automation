@@ -147,7 +147,7 @@ worktree harmlessly — it was never staged, so it can never be committed.
 |---|---|
 | **Node.js ≥ 22** | Developed on **v24.16.0**. Requires `node:sqlite` (Node 22+) and `--env-file`. |
 | **git** | Used via `spawn`, no git library. |
-| **Docker** *(optional but recommended)* | If the target repo has a Dockerfile, builds run inside its declared Node image, avoiding host/repo version mismatches. |
+| **Docker** *(not used by default)* | Since v0.32 verify and preview run plain host `npm`. Set `VERIFY_DISABLE_DOCKER=false` to build inside the repo's own declared Node image instead. |
 | **An LLM API key** | Gemini or Anthropic. Both providers are supported and switchable. |
 | **A GitHub token** | Only needed to open real PRs. Not needed in dry-run mode. |
 
@@ -435,7 +435,9 @@ src/
 │   └── database-connection.mjs      One shared connection, WAL mode
 │
 ├── staging/draft-versions.mjs  Versioned generated files (what gets committed)
-├── preview/preview-server.mjs  Long-lived preview (Docker-first)
+├── preview/
+│   ├── preview-server.mjs      Long-lived preview server (host npm by default)
+│   └── frameable-proxy.mjs     Strips X-Frame-Options so the UI can iframe it
 ├── git/clone-and-commit.mjs    All git operations (spawn, no library)
 ├── github/open-pull-request.mjs GitHub REST — PR creation only
 ├── schemas/                    campaign-brief-schema, content-guide-schema
@@ -532,12 +534,13 @@ prevents startup.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `PAGE_URL_PATH_TEMPLATE` | *(unset)* | e.g. `/campaigns/{slug}`. **Unset ⇒ hero-fit/SEO/a11y are skipped entirely** (build/lint still runs). |
-| `VERIFY_DISABLE_DOCKER` | `false` | Force host-based build even when the repo has a usable Dockerfile. |
+| `PAGE_URL_PATH_TEMPLATE` | *(unset)* | e.g. `/campaigns/{slug}` — must match the route `WRITE_PATH_ALLOWLIST` produces. **Unset ⇒ hero-fit/SEO/a11y are skipped entirely** (build/lint still runs) **and the preview opens the target repo's home page instead of the campaign.** Set it. |
+| `VERIFY_DISABLE_DOCKER` | `true` | **Default since v0.32.** Verify and preview run the repo's own `npm ci` / `npm run build` / `npm run start` on this host. Set to `false` to build inside the repo's Dockerfile image instead — sidesteps host/repo Node version mismatches, but was the largest single source of failed runs (image pulls, bind-mount permissions, containers outliving the process that spawned them). |
 | `PACKAGE_MANAGER_OVERRIDE` | *(auto)* | `npm`\|`yarn`\|`pnpm`. Set when lockfile detection picks wrong. |
 | `VERIFY_INSTALL_TIMEOUT_MS` | `300000` | |
 | `VERIFY_BUILD_TIMEOUT_MS` | `600000` | |
 | `VERIFY_SERVER_TIMEOUT_MS` | `30000` | |
+| `REVIEW_PLAN_BEFORE_GENERATING` | `true` | Pause after the plan and before generating, so a human can edit the hero copy, SEO tags and section list. Steering here is free; every change after generation costs an AI run per section. Per-campaign override: the brief's `reviewPlan`. |
 | `CONTINUE_ON_VERIFY_FAILURE` | `false` | ⚠️ Stage an **unbuildable** draft for review anyway. The run is flagged and the UI warns loudly. Approving one opens a PR with code that does not compile. Temporary unblock, not a normal mode. |
 
 ### Preview
@@ -548,6 +551,16 @@ prevents startup.
 | `MAX_CONCURRENT_PREVIEWS` | `3` | Soft cap — the oldest is evicted, not refused. |
 | `PREVIEW_SWEEP_INTERVAL_MS` | `60000` | |
 | `SERVICE_PUBLIC_BASE_URL` | `http://localhost:<PORT>` | Where a previewed page's lead form POSTs. The preview is a *separate process on a different port*, so it can't use a relative path. Set explicitly for any real deployment. |
+
+Every preview also gets a **frameable proxy** on a second port
+(`preview/frameable-proxy.mjs`). The target repo sends `X-Frame-Options: DENY`
+on every route, so the review UI cannot iframe the preview directly — the proxy
+forwards to it and strips that header plus `content-security-policy`. It gets
+its own origin rather than a path prefix on the API server so the page's
+root-absolute asset URLs (`/_next/static/…`) keep resolving. `previews.url`
+points at the real server (open in a new tab); `previews.embed_url` points at
+the proxy (what the iframe loads). Nothing to configure; it starts and stops
+with the preview it fronts.
 
 ### Git / target repo
 
@@ -586,6 +599,11 @@ Every route except `/healthz` and the lead sink requires
 | `GET` | `/campaigns/:runId/draft` | Latest staged draft (paths + contents). |
 | `GET` | `/campaigns/:runId/sections` | Section gallery: each slot's type/mode/frame + available alternatives. |
 | `POST` | `/campaigns/:runId/sections/:slot/refine` | Refine one slot. Body: `{action, ...params}`. |
+| `GET` | `/campaigns/:runId/brief` | The brief a run was created from, for duplicating it (slug withheld). |
+| `GET` | `/campaigns/:runId/plan` | The content plan, with per-section build mode and layout choices. |
+| `PATCH` | `/campaigns/:runId/plan` | Save an edited plan without approving it. 409 outside `awaiting_plan_approval`. |
+| `POST` | `/campaigns/:runId/plan/approve` | Save any final edit and start generating. |
+| `POST` | `/campaigns/:runId/plan/abandon` | End the run at the gate; nothing was generated. |
 | `GET` | `/campaigns/:runId/preview` | Preview status/URL/expiry. |
 | `POST` | `/campaigns/:runId/preview/stop` | Stop the preview. |
 | `POST` | `/campaigns/:runId/approve` | **The gate.** commit → push → open PR. |
@@ -634,7 +652,7 @@ SQLite via `node:sqlite`, WAL mode, one shared connection. The schema is
 | `run_logs` | Every log line. |
 | `draft_files` | **Versioned generated files — what actually gets committed.** Tagged with `section_slot`. |
 | `verify_reports` | Per-attempt verify history (added v0.24). |
-| `previews` | Live preview processes/containers. |
+| `previews` | Live preview processes/containers, plus the frameable proxy's `proxy_port`/`embed_url` (v0.32). |
 | `validation_reports` | Declared, unused (Phase 5 superseded). |
 | `review_decisions` | Declared, unused. |
 | `token_usage` | Declared, **unused** — Phase 10 work. |
@@ -767,6 +785,22 @@ These are worth reading — each looked like something it wasn't.
 whether it's the *same* failure or a new one — that distinction is the single
 most useful diagnostic signal in this project.
 
+### ⚠ The one that wastes the most time: `npm run dev` kills runs
+
+`npm run dev` runs `node --watch`, which **restarts the process whenever any
+file under `src/` changes**. A campaign run takes several minutes (clone → LLM →
+`npm ci` → `next build`), so editing a single source file mid-run kills that run
+— almost always during `verify`, the longest stage.
+
+The symptom is deeply misleading: the run log ends in a build failure or
+`failed_clone`, so it reads like a code-generation or Docker problem. The
+give-away is a `resume: service restarted while this run was at stage "verify"`
+line in the log.
+
+**Use `npm start` when running real campaigns.** `npm run dev` is for editing the
+service itself. The server now prints a warning at boot when it detects watch
+mode.
+
 ### Common gotchas
 
 - **Worktree gone after a failure?** Set `KEEP_WORKDIR_ON_FAILURE=true`. Without
@@ -776,10 +810,34 @@ most useful diagnostic signal in this project.
   not auto-resumed — check GitHub manually.
 - **Can't delete a run?** It must be terminal. `staged_for_review` is not
   terminal — approve or abandon first.
+- **Preview gone after you abandoned a run?** Expected. Abandon makes the run
+  terminal, which stops the preview and removes its worktree. Previews also
+  expire on their own after `PREVIEW_TTL_MS` (30 min by default).
+- **Build fails with `Unexpected response from worker: undefined`?** The cause
+  found in practice (v0.36) is `WATCH_REPORT_DEPENDENCIES`, which `node --watch`
+  (i.e. `npm run dev`) sets and every child inherits — Next's jest-worker
+  children then push Node's `watch:require` IPC messages into jest-worker's own
+  channel and the parent dies before printing anything. `src/spawn-env.mjs`
+  strips it from every process this service spawns, so check it isn't being set
+  some other way. Otherwise suspect a worker OOM. Either way, re-run
+  `npm run build` by hand in the run's workdir to see the real errors.
 - **Browser checks always skipped?** `PAGE_URL_PATH_TEMPLATE` is unset, or the
-  repo isn't Node-servable, or Chromium isn't installed.
-- **Preview won't start after a failed build?** Expected — a production serve
-  script has no build output to serve.
+  repo isn't Node-servable, or Chromium isn't installed. The report says which.
+  `playwright` is an npm dependency but the browser it drives is a separate
+  ~150MB download that `npm ci` does **not** fetch — run
+  `npx playwright install chromium` to enable hero-fit/SEO/a11y.
+- **Preview shows the wrong page?** If it opens the target repo's home page
+  rather than your campaign, `PAGE_URL_PATH_TEMPLATE` is unset — the preview URL
+  falls back to the server root. Any runtime error you see then belongs to the
+  target repo's own pages, not to the generated one.
+- **Preview won't start after a failed build?** It should now: since v0.32 the
+  process path tries every serve script in `SERVE_SCRIPT_PREFERENCE` order, so
+  when `next start` finds no build output it falls through to `next dev`, which
+  compiles on demand. If nothing starts, the log lists what each attempt did.
+- **Preview iframe is blank in the UI?** The page is being loaded from
+  `previews.url` instead of `previews.embed_url`, or the frameable proxy failed
+  to bind — `X-Frame-Options: DENY` is doing exactly what it says. The UI falls
+  back to a link-only panel when `embedUrl` is null.
 
 ---
 

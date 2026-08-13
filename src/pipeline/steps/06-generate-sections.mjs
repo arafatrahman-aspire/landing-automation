@@ -5,6 +5,7 @@ import { PREVIEW_LEAD_SINK_PATH } from "../../leadform/contract.mjs";
 import { findExistingImportExamples } from "./find-existing-imports.mjs";
 import { extractFailingFiles } from "../../verify/failing-files.mjs";
 import { detectTypeScriptStrictness, buildTypeScriptPromptFragment } from "./detect-typescript-strictness.mjs";
+import { readDeclaredPackages } from "../../verify/precheck-section-file.mjs";
 import { logStage } from "./log-helper.mjs";
 
 // Fan-out section generation (new_plan.md §9.5/§9.6, module.md Module 2).
@@ -27,6 +28,8 @@ export async function generateSectionsStep(state) {
   // is a hard build failure.
   const tsStrictness = await detectTypeScriptStrictness(state.workdir);
   const typescriptFragment = buildTypeScriptPromptFragment(tsStrictness);
+  // Feeds the fast per-file precheck: which packages may legitimately be imported.
+  const declaredPackages = await readDeclaredPackages(state.workdir);
 
   // On a retry, repair only the files the build actually blamed and keep every
   // section that already compiled. Regenerating the lot re-rolls sections that
@@ -53,6 +56,9 @@ export async function generateSectionsStep(state) {
     retryFailedPaths,
     previousSectionResults: state.sectionResults ?? null,
     typescriptFragment,
+    strictTypes: tsStrictness.strict,
+    declaredPackages,
+    authorStaticContent: true,
     logger: (msg) => logStage(state.runId, `generate_sections: ${msg}`),
   });
 
