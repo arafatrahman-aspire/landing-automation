@@ -2,7 +2,7 @@ import path from "node:path";
 import { writeFile } from "node:fs/promises";
 import { config } from "../../config.mjs";
 import * as runStore from "../../state/campaign-repository.mjs";
-import { commitPaths, push as gitPush, removeWorktree } from "../../git/clone-and-commit.mjs";
+import { commitPaths, push as gitPush } from "../../git/clone-and-commit.mjs";
 import { createPullRequest } from "../../github/open-pull-request.mjs";
 import { logStage } from "./log-helper.mjs";
 
@@ -47,13 +47,9 @@ export async function openPr(state) {
       prUrl: "(dry-run: no real PR opened — branch was pushed for real, see branchName)",
       status: "completed",
     });
-    // A live preview is still bind-mounting/reading from state.workdir — skip
-    // cleanup here and let the preview's own lifecycle (idle sweep, explicit
-    // stop, or boot reconciliation — preview/preview-server.mjs) remove the
-    // worktree later, instead of deleting it out from under a running preview.
-    if (!config.keepWorkdirOnFailure && !state.previewStarted) {
-      await removeWorktree({ baseDir: state.baseDir, workdir: state.workdir, branchName: state.branchName });
-    }
+    // Worktree deletion happens in approveRun() after this returns: it stops
+    // the preview first, then removes the directory. Doing it here while a
+    // preview still holds the files used to leave multi-hundred-MB trees on disk.
     return { prUrl: null, prNumber: null, status: "completed" };
   }
 
@@ -69,10 +65,6 @@ export async function openPr(state) {
   });
   await runStore.updateRun(state.runId, { prUrl: pr.html_url, prNumber: pr.number, status: "completed" });
   await logStage(state.runId, `open_pr: ${pr.html_url}`);
-  // Same reasoning as the dry-run branch above: don't tear down a workdir a live preview still needs.
-  if (!config.keepWorkdirOnFailure && !state.previewStarted) {
-    await removeWorktree({ baseDir: state.baseDir, workdir: state.workdir, branchName: state.branchName });
-  }
   return { prUrl: pr.html_url, prNumber: pr.number, status: "completed" };
 }
 

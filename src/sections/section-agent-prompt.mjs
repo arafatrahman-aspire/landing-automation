@@ -35,6 +35,7 @@ Explore the repository first (package.json, an existing page or component, the s
 
 SECTION TO BUILD: "${section.type}" — ${section.summary}
 ${section.type === "hero" ? `\n${buildHeroContract({ requiresJobField: Boolean(request.requiresJobField), previewLeadSinkUrl })}\n` : `\n${buildCtaLinkPromptFragment()}\n`}
+${section.type === "timeline" ? `TIMELINE / ProcessExplainerFrame: if you reuse ProcessExplainerFrame, every item MUST include \`image: StaticImageData\` — import a stock asset such as \`@assets/images/frames/landing/frame-4-image-1.png\` and pass \`image: SideImage\`. A JSON-only \`{ title, description, processSteps }\` fails the TypeScript build with "Property 'image' is missing on ProcessExplainerItem". If you are not importing a real image, implement the steps inline instead of wrapping that frame.\n` : ""}
 CAMPAIGN CONTEXT:
 Campaign: ${request.campaignName}
 Offer: ${request.offer}
@@ -49,6 +50,8 @@ IMPORT PATHS MUST BE COPIED FROM REAL USAGE, NEVER GUESSED FROM GENERAL KNOWLEDG
 NEVER IMPORT A PROJECT-LOCAL FILE YOU HAVE NOT OPENED (a real past run failed on exactly this, importing "../../../components/Accordion", which did not exist). A relative or aliased import of another file in this repository is only allowed if you called read_file on that exact path in this session and it returned content. If you want a UI element — accordion, tabs, carousel, modal — and no real component for it exists here, build it INLINE inside your own single file. You are writing ONE self-contained file; it is always correct to implement what you need locally rather than to import something you hope exists.
 
 WRITE THE COMPLETE FILE IN ONE write_file CALL, and make sure it parses: balanced braces and parentheses, every JSX tag closed, no placeholder ellipses, no truncation mid-expression. A file that doesn't parse fails the whole page's build, not just this section.
+
+TYPE THE DEFAULTS YOU FALL BACK TO: \`const items = data?.items || defaults\` infers \`items\` from \`defaults\`. If the JSX later reads a field (e.g. \`item.icon\`), annotate \`defaults\` with the same interface — including optional fields. A real build failed with \`Property 'icon' does not exist on type '{ text: string; }'\` because defaults were unannotated objects with only \`text\`.
 ${typescriptFragment}
 ${importExamples}${verifyReport ? `\nA PREVIOUS ATTEMPT AT THIS PAGE FAILED VERIFICATION (build/lint/layout/SEO/accessibility) — the failure may or may not be caused by this specific section, but check whether it applies here and fix it if so:\n${verifyReport}\n` : ""}`;
 }

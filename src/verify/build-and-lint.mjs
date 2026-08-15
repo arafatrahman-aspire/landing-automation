@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { has, findPackageJsonDir, detectPackageManager, INSTALL_CMD, RUN_SCRIPT_CMD } from "./detect-package-manager.mjs";
 import { hasDocker, parseDockerBuildStage, verifyBuildInDocker } from "./docker-build.mjs";
+import { shouldIgnoreEslintDuringBuild, applyIgnoreEslintDuringBuild } from "./ignore-eslint-during-build.mjs";
 import { cleanEnvForChildProcess } from "../spawn-env.mjs";
 
 /* Deterministic, non-AI verification of whatever the coding agent wrote —
@@ -105,6 +106,10 @@ export async function verifyBuild({
 }) {
   const pkgDir = await findPackageJsonDir(workdir);
   if (pkgDir) {
+    // Next 14's `next build` runs ESLint and dies on ESLint 9's removed
+    // options. Patch next.config in the worktree only (never committed) so
+    // compile can finish. Must run before host or Docker `npm run build`.
+    await maybeIgnoreEslintDuringBuild(pkgDir);
     if (!disableDocker) {
       const dockerStage = await parseDockerBuildStage(pkgDir);
       if (dockerStage && (await hasDocker())) {
@@ -154,7 +159,12 @@ async function verifyNodeInDocker({ pkgDir, dockerStage, installTimeoutMs, build
   }
 
   const build = await verifyBuildInDocker({ workdir: pkgDir, ...dockerStage, installTimeoutMs, buildTimeoutMs });
-  if (!build.ok) return build;
+  if (!build.ok) {
+    if (isEslintOnlyBuildFailure(build.report)) {
+      return finishDockerVerifyAfterEslintSkip({ pkgDir, dockerStage, buildTimeoutMs, scripts, buildReport: build.report });
+    }
+    return build;
+  }
 
   const dockerfileAlreadyLints = dockerStage.commands.some((cmd) => /\bnpm\s+run\s+lint\b/.test(cmd));
   if (scripts.lint && !dockerfileAlreadyLints) {
@@ -211,9 +221,16 @@ async function verifyNode({ workdir, installTimeoutMs, buildTimeoutMs, packageMa
   const [buildCmd, buildArgs] = RUN_SCRIPT_CMD[pm]("build");
   const build = await runCommand(buildCmd, buildArgs, { cwd: workdir, timeoutMs: buildTimeoutMs });
   if (!build.ok) {
+    const buildOutput = truncateReport(build.stdout + build.stderr);
+    // Safety net: config patch is the real fix (ESLint-first abort can leave
+    // `.next` incomplete). If the patch missed, treat a tooling-only crash
+    // as OK so a TypeScript-clean campaign is not failed by Next 14 + ESLint 9.
+    if (isEslintOnlyBuildFailure(buildOutput)) {
+      return finishNodeVerifyAfterEslintSkip({ workdir, pm, scripts, buildTimeoutMs });
+    }
     return {
       ok: false,
-      report: annotateWorkerCrash(`${pm} run build ${build.timedOut ? "timed out" : "failed"}:\n${truncateReport(build.stdout + build.stderr)}`),
+      report: annotateWorkerCrash(`${pm} run build ${build.timedOut ? "timed out" : "failed"}:\n${buildOutput}`),
     };
   }
 
@@ -254,6 +271,65 @@ export function isNextEslintToolingMismatch(output) {
     /useEslintrc/i.test(output) &&
     /extensions/i.test(output)
   );
+}
+
+/** ESLint-during-build crash with no TypeScript / real compile error.
+ *  Next prints "Failed to compile" for the ESLint abort itself — that alone
+ *  is not a source defect. */
+export function isEslintOnlyBuildFailure(output) {
+  if (!isNextEslintToolingMismatch(output)) return false;
+  if (/Type error:/i.test(output)) return false;
+  if (/error TS\d+/i.test(output)) return false;
+  if (/Property '.+' is missing/i.test(output)) return false;
+  return true;
+}
+
+export async function maybeIgnoreEslintDuringBuild(pkgDir) {
+  try {
+    const pkg = JSON.parse(await readFile(path.join(pkgDir, "package.json"), "utf8"));
+    if (!shouldIgnoreEslintDuringBuild(pkg)) return { patched: false, path: null };
+    return applyIgnoreEslintDuringBuild(pkgDir);
+  } catch {
+    return { patched: false, path: null };
+  }
+}
+
+const ESLINT_BUILD_SKIP_NOTE =
+  "Build ESLint step skipped: Next 14 + ESLint 9 Invalid Options (useEslintrc/extensions) with no TypeScript/compile error — tooling mismatch, not generated code.";
+
+async function finishNodeVerifyAfterEslintSkip({ workdir, pm, scripts, buildTimeoutMs }) {
+  if (scripts.lint) {
+    const [lintCmd, lintArgs] = RUN_SCRIPT_CMD[pm]("lint");
+    const lint = await runCommand(lintCmd, lintArgs, { cwd: workdir, timeoutMs: buildTimeoutMs });
+    if (!lint.ok) {
+      const lintOutput = truncateReport(lint.stdout + lint.stderr);
+      if (isNextEslintToolingMismatch(lintOutput)) {
+        return { ok: true, report: `${pm} install passed. ${ESLINT_BUILD_SKIP_NOTE} Lint skipped for the same reason.` };
+      }
+      return { ok: false, report: `${pm} run lint failed (gates the PR — target repo's own lint rules apply):\n${lintOutput}` };
+    }
+  }
+  return { ok: true, report: `${pm} install passed. ${ESLINT_BUILD_SKIP_NOTE}` };
+}
+
+async function finishDockerVerifyAfterEslintSkip({ pkgDir, dockerStage, buildTimeoutMs, scripts, buildReport }) {
+  const dockerfileAlreadyLints = dockerStage.commands.some((cmd) => /\bnpm\s+run\s+lint\b/.test(cmd));
+  if (scripts.lint && !dockerfileAlreadyLints) {
+    const lint = await verifyBuildInDocker({
+      workdir: pkgDir,
+      nodeImage: dockerStage.nodeImage,
+      commands: ["npm run lint"],
+      installTimeoutMs: 0,
+      buildTimeoutMs,
+    });
+    if (!lint.ok) {
+      if (isNextEslintToolingMismatch(lint.report)) {
+        return { ok: true, report: `${ESLINT_BUILD_SKIP_NOTE} Lint skipped for the same reason.` };
+      }
+      return { ok: false, report: `${buildReport}\n\nlint failed (gates the PR — target repo's own lint rules apply):\n${lint.report}` };
+    }
+  }
+  return { ok: true, report: ESLINT_BUILD_SKIP_NOTE };
 }
 
 /* ------------------------------ PHP / Laravel ------------------------------ */

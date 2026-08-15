@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
-import { checkSyntax, checkUntypedProps, checkImports, checkHoneypotOptional, checkLeadFormAnchor, extractImportSpecifiers, precheckSectionFile } from "../src/verify/precheck-section-file.mjs";
+import { checkSyntax, checkUntypedProps, checkImports, checkHoneypotOptional, checkLeadFormAnchor, checkProcessExplainerImage, extractImportSpecifiers, precheckSectionFile } from "../src/verify/precheck-section-file.mjs";
 
 /* The syntax check uses the target repo's own TypeScript. In this service's
  * test environment the only copy available is the UI package's, so it's
@@ -401,4 +401,36 @@ test("hero form with id=regForm on the same tag passes", () => {
 
 test("sections without data-hero-form skip the anchor check", () => {
   assert.equal(checkLeadFormAnchor(`export default function Cta() { return <a href="#regForm">Go</a>; }`).ok, true);
+});
+
+test("ProcessExplainerFrame data without image is reported", () => {
+  const src = `import ProcessExplainerFrame from "@components/frames/landing/analyze/ProcessExplainerFrame";
+const data = [{ title: "Path", description: "Steps", processSteps: ["a"] }];
+export default function TimelineSection3() {
+  return <ProcessExplainerFrame data={data} />;
+}
+`;
+  const result = checkProcessExplainerImage(src);
+  assert.equal(result.ok, false);
+  assert.match(result.problems[0].message, /image: StaticImageData/);
+});
+
+test("ProcessExplainerFrame with image: SideImage passes", () => {
+  const src = `import ProcessExplainerFrame from "@components/frames/landing/analyze/ProcessExplainerFrame";
+import SideImage from "@assets/images/frames/landing/frame-4-image-1.png";
+const copy = { title: "Path", description: "Steps", processSteps: ["a"] };
+export default function TimelineSection3() {
+  return <ProcessExplainerFrame data={[{ ...copy, image: SideImage }]} />;
+}
+`;
+  assert.equal(checkProcessExplainerImage(src).ok, true);
+});
+
+test("bare ProcessExplainerFrame (no data prop) is left alone", () => {
+  const src = `import ProcessExplainerFrame from "@components/frames/landing/analyze/ProcessExplainerFrame";
+export default function TimelineSection3() {
+  return <ProcessExplainerFrame />;
+}
+`;
+  assert.equal(checkProcessExplainerImage(src).ok, true);
 });

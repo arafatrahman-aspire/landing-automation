@@ -32,6 +32,35 @@ function baseCloneDir() {
   return path.join(path.resolve(config.workdirRoot), "_base");
 }
 
+/** True when `workdir` is a per-run scratch tree under WORKDIR_ROOT, not the
+ *  shared `_base` clone and not some other path (tests use temp clones). */
+function isScratchWorktree(workdir) {
+  if (!workdir) return false;
+  const root = path.resolve(config.workdirRoot);
+  const target = path.resolve(workdir);
+  const rel = path.relative(root, target);
+  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel) && target !== path.join(root, "_base");
+}
+
+/** After a PR is opened (or a run is abandoned), the local worktree + its
+ *  `node_modules` are only wasting disk. Stop any preview first so file
+ *  handles are released, then delete the worktree and its local git branch. */
+async function discardScratchWorktree(runId, { workdir, branchName }) {
+  await preview.stopPreview({ runId, baseDir: baseCloneDir() }).catch(() => {});
+  if (!isScratchWorktree(workdir)) return { ok: true, skipped: true };
+  const result = await removeWorktree({ baseDir: baseCloneDir(), workdir, branchName }).catch((err) => ({
+    ok: false,
+    reason: err.message,
+  }));
+  await runStore.updateRun(runId, { workdir: null });
+  if (result?.ok === false) {
+    await runStore.appendLog(runId, "warn", `scratch worktree could not be removed — ${result.reason}`);
+  } else {
+    await runStore.appendLog(runId, "info", `discarded local worktree and branch "${branchName}" to free disk`);
+  }
+  return result;
+}
+
 /** Rebuilds the fields commit()/push()/openPr() (pipeline/steps/)
  *  need, straight from run-store + the latest staged draft — those
  *  functions were written to take a LangGraph-shaped state object, and
@@ -70,10 +99,8 @@ async function reconstructApprovedState(runId) {
 // equivalent safety net for this path.
 const APPROVE_STAGE_FAILURE_STATUS = { committing: "failed", pushing: "failed_push", opening_pr: "failed_push" };
 
-/** Approve: commit -> push -> open PR, reusing the exact same functions the
- *  graph used to call as nodes — same commit message, same PR body, same
- *  dry-run handling, same previewStarted-guarded worktree cleanup. Only
- *  WHEN they're called changed (Phase 7), not what they do. */
+/** Approve: commit -> push -> open PR, then delete the local scratch
+ *  worktree (and stop its preview) so node_modules does not sit on disk. */
 export async function approveRun(runId) {
   const state = await reconstructApprovedState(runId);
   await runStore.updateRun(runId, { status: "approved" });
@@ -81,6 +108,10 @@ export async function approveRun(runId) {
     await commit(state);
     await push(state);
     const result = await openPr(state);
+    // PR is on the remote now — the local worktree (often hundreds of MB of
+    // node_modules) must not linger. Preview is stopped first so it cannot
+    // keep the directory open.
+    await discardScratchWorktree(runId, { workdir: state.workdir, branchName: state.branchName });
     return { ok: true, ...result };
   } catch (err) {
     const current = await runStore.getRun(runId);
@@ -101,13 +132,10 @@ export async function abandonRun(runId) {
     throw new ReviewActionError("wrong_status", `run "${runId}" is already terminal (status "${run.status}")`);
   }
 
-  await preview.stopPreview({ runId, baseDir: baseCloneDir() }).catch(() => {});
-  if (run.workdir) {
-    await removeWorktree({ baseDir: baseCloneDir(), workdir: run.workdir, branchName: run.branchName }).catch(() => {});
-  }
+  await discardScratchWorktree(runId, { workdir: run.workdir, branchName: run.branchName });
   await runStore.updateRun(runId, { status: "abandoned" });
   await runStore.appendLog(runId, "info", "abandoned by human decision — no commit/push/PR happened");
   return { ok: true, status: "abandoned" };
 }
 
-export { ReviewActionError };
+export { ReviewActionError, isScratchWorktree };

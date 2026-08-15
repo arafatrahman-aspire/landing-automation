@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { verifyBuild, detectPackageManager, isNextEslintToolingMismatch } from "../src/verify/build-and-lint.mjs";
+import { verifyBuild, detectPackageManager, isNextEslintToolingMismatch, isEslintOnlyBuildFailure, maybeIgnoreEslintDuringBuild } from "../src/verify/build-and-lint.mjs";
 
 /* Local fixtures only — no network, no real npm install (a real package.json
  * with no dependencies makes `npm ci` a near-instant no-op). */
@@ -28,6 +28,71 @@ test("isNextEslintToolingMismatch detects the Next 14 + ESLint 9 Invalid Options
 - 'extensions' has been removed.`;
   assert.equal(isNextEslintToolingMismatch(sample), true);
   assert.equal(isNextEslintToolingMismatch("error  Unexpected console statement  no-console"), false);
+});
+
+test("isEslintOnlyBuildFailure is true for the ESLint abort and false when types also failed", () => {
+  const eslintOnly = `info  - Linting and checking validity of types ...
+ESLint: Invalid Options:
+- Unknown options: useEslintrc, extensions
+Failed to compile.`;
+  assert.equal(isEslintOnlyBuildFailure(eslintOnly), true);
+
+  const withTypeError = `${eslintOnly}
+
+./app/campaigns/x/sections/TimelineSection3.tsx:12:5
+Type error: Property 'image' is missing in type '{ title: string }' but required in type 'ProcessExplainerItem'.`;
+  assert.equal(isEslintOnlyBuildFailure(withTypeError), false);
+
+  const withMissingProp = `ESLint: Invalid Options: useEslintrc, extensions
+Failed to compile.
+TimelineSection3.tsx: Property 'image' is missing on ProcessExplainerItem`;
+  assert.equal(isEslintOnlyBuildFailure(withMissingProp), false);
+});
+
+test("maybeIgnoreEslintDuringBuild patches next.config only for Next ≤14 + ESLint ≥9", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "verify-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(
+    path.join(root, "next.config.mjs"),
+    "const nextConfig = {\n  reactStrictMode: true,\n};\nexport default nextConfig;\n"
+  );
+
+  await makeFixture(root, { name: "fixture", version: "0.0.0", dependencies: { next: "^15.0.0" }, devDependencies: { eslint: "^9.0.0" } });
+  const skipped = await maybeIgnoreEslintDuringBuild(root);
+  assert.equal(skipped.patched, false);
+
+  await makeFixture(root, { name: "fixture", version: "0.0.0", dependencies: { next: "^14.2.14" }, devDependencies: { eslint: "^9.0.0" } });
+  const applied = await maybeIgnoreEslintDuringBuild(root);
+  assert.equal(applied.patched, true);
+  assert.equal(applied.path, "next.config.mjs");
+});
+
+test("build fail that is only the Next/ESLint tooling mismatch is treated as verify pass", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "verify-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(
+    path.join(root, "fail-eslint.mjs"),
+    "console.error('ESLint: Invalid Options:\\n- Unknown options: useEslintrc, extensions\\nFailed to compile.');\nprocess.exit(1);\n"
+  );
+  await makeFixture(root, { name: "fixture", version: "0.0.0", scripts: { build: "node fail-eslint.mjs" } });
+
+  const result = await verifyBuild({ workdir: root, installTimeoutMs: 60_000, buildTimeoutMs: 60_000 });
+  assert.equal(result.ok, true);
+  assert.match(result.report, /ESLint step skipped|tooling mismatch/i);
+});
+
+test("build fail with ESLint mismatch AND a Type error still fails verify", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "verify-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(
+    path.join(root, "fail-types.mjs"),
+    "console.error(\"ESLint: Invalid Options: useEslintrc, extensions\\nType error: Property 'image' is missing\");\nprocess.exit(1);\n"
+  );
+  await makeFixture(root, { name: "fixture", version: "0.0.0", scripts: { build: "node fail-types.mjs" } });
+
+  const result = await verifyBuild({ workdir: root, installTimeoutMs: 60_000, buildTimeoutMs: 60_000 });
+  assert.equal(result.ok, false);
+  assert.match(result.report, /build/i);
 });
 
 test("build pass + Next/ESLint tooling-mismatch lint failure is treated as verify pass", async (t) => {

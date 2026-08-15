@@ -89,6 +89,31 @@ test("the prompt demands a \"use client\" directive for interactive components (
   assert.match(prompt, /VERY FIRST LINE/);
 });
 
+test("prompt warns that fallback defaults must be typed for optional fields the JSX reads", () => {
+  const [details] = classifySections([{ type: "details", summary: "Benefits" }], { aiRequiredSections: ["details"] });
+  const prompt = buildSectionAgentSystemPrompt(details, {
+    request: { campaignName: "x", offer: "x", audience: "x", cta: "x" },
+    guide: null,
+    filePath: "app/campaigns/x/sections/DetailsSection1.tsx",
+    componentName: "DetailsSection1",
+  });
+  assert.match(prompt, /TYPE THE DEFAULTS YOU FALL BACK TO/);
+  assert.match(prompt, /Property 'icon' does not exist/);
+});
+
+test("timeline prompt warns that ProcessExplainerFrame items need image", () => {
+  const [timeline] = classifySections([{ type: "timeline", summary: "How it works" }], { aiRequiredSections: ["timeline"] });
+  const prompt = buildSectionAgentSystemPrompt(timeline, {
+    request: { campaignName: "x", offer: "x", audience: "x", cta: "x" },
+    guide: null,
+    filePath: "app/campaigns/x/sections/TimelineSection3.tsx",
+    componentName: "TimelineSection3",
+  });
+  assert.match(prompt, /ProcessExplainerFrame/);
+  assert.match(prompt, /image: StaticImageData/);
+  assert.match(prompt, /Property 'image' is missing/);
+});
+
 test("the type-strictness rules reach the section prompt when provided", () => {
   const [heroSection] = classifySections([{ type: "hero", summary: "Title, video, lead form" }]);
   const base = {

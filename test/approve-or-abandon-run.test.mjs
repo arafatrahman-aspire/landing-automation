@@ -22,7 +22,8 @@ setTestConfigEnv({
 
 const runStore = await import("../src/state/campaign-repository.mjs");
 const draftStore = await import("../src/staging/draft-versions.mjs");
-const { approveRun, abandonRun, ReviewActionError } = await import("../src/pipeline/approve-or-abandon-run.mjs");
+const { config } = await import("../src/config.mjs");
+const { approveRun, abandonRun, ReviewActionError, isScratchWorktree } = await import("../src/pipeline/approve-or-abandon-run.mjs");
 
 function git(args, cwd) {
   execFileSync("git", args, { cwd, stdio: "pipe" });
@@ -155,4 +156,13 @@ test("abandonRun rejects a nonexistent run", async () => {
     assert.equal(err.reason, "not_found");
     return true;
   });
+});
+
+test("isScratchWorktree only accepts per-run dirs under WORKDIR_ROOT", () => {
+  const root = path.resolve(config.workdirRoot);
+  assert.equal(isScratchWorktree(path.join(root, "some-run-id")), true);
+  assert.equal(isScratchWorktree(path.join(root, "_base")), false);
+  assert.equal(isScratchWorktree(root), false);
+  assert.equal(isScratchWorktree("/tmp/not-scratch"), false);
+  assert.equal(isScratchWorktree(null), false);
 });

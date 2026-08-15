@@ -320,6 +320,36 @@ export function checkLeadFormAnchor(content) {
 }
 
 /* ------------------------------------------------------------------ *
+ * 6. ProcessExplainerFrame data missing `image` (TypeScript build fail)
+ * ------------------------------------------------------------------ */
+
+/* A real run failed compile with:
+ *   TimelineSection3.tsx: Property 'image' is missing on ProcessExplainerItem
+ * Static emit now attaches a stock asset (fill-static-frame.mjs). AI-required
+ * fallback can still wrap ProcessExplainerFrame with JSON-only
+ * { title, description, processSteps }. Bare `<ProcessExplainerFrame />`
+ * (no data prop) uses the frame's own defaults and is left alone. */
+export function checkProcessExplainerImage(content) {
+  const clean = stripComments(content);
+  if (!/import\s+ProcessExplainerFrame\b/.test(clean)) return { ok: true, problems: [] };
+  if (!/\bdata\s*=\s*\{/.test(clean)) return { ok: true, problems: [] };
+  if (/\bimage\s*:/.test(clean)) return { ok: true, problems: [] };
+  return {
+    ok: false,
+    problems: [
+      {
+        kind: "types",
+        message:
+          `ProcessExplainerFrame's data items require \`image: StaticImageData\`. ` +
+          `Import a stock asset (e.g. \`@assets/images/frames/landing/frame-4-image-1.png\`) ` +
+          `and include \`image: SideImage\` on every item. Omitting it fails the build with ` +
+          `"Property 'image' is missing on ProcessExplainerItem".`,
+      },
+    ],
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * Entry point
  * ------------------------------------------------------------------ */
 
@@ -344,6 +374,7 @@ export async function precheckSectionFile({ content, filePath, workdir, strictTy
     // error that fails the build under any tsconfig, strict or not.
     problems.push(...checkHoneypotOptional(content).problems);
     problems.push(...checkLeadFormAnchor(content).problems);
+    problems.push(...checkProcessExplainerImage(content).problems);
   }
 
   const report = problems.map((p) => `- [${p.kind}] ${p.message}`).join("\n");
