@@ -59,6 +59,7 @@ export async function generateSectionsStep(state) {
     strictTypes: tsStrictness.strict,
     declaredPackages,
     authorStaticContent: true,
+    images: state.researchNotes?.images ?? [],
     logger: (msg) => logStage(state.runId, `generate_sections: ${msg}`),
   });
 

@@ -170,6 +170,27 @@ test("researchNotes round-trip so a resumed run can skip the research call", asy
   assert.deepEqual(run.researchNotes.keywords, ["a", "b"]);
 });
 
+test("updateCampaignBrief persists a mutated colorScheme on the brief", async () => {
+  const runId = "run-recolor-brief";
+  await repo.createRun({
+    runId,
+    slug: "r",
+    campaignName: "R",
+    request: { slug: "r", campaignName: "R", offer: "o", audience: "a", cta: "Go" },
+  });
+  await repo.updateCampaignBrief(runId, {
+    slug: "r",
+    campaignName: "R",
+    offer: "o",
+    audience: "a",
+    cta: "Go",
+    colorScheme: { preset: "custom", primary: "#111111", secondary: "#222222", accent: "#333333" },
+  });
+  const run = await repo.getRun(runId);
+  assert.equal(run.request.colorScheme.preset, "custom");
+  assert.equal(run.request.colorScheme.primary, "#111111");
+});
+
 /* verify_reports had zero writers, so the only record of a failure was
  * runs.error — written once, after retries are exhausted, losing every
  * earlier attempt's report. */

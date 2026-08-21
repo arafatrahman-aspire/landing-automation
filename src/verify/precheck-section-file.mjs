@@ -289,7 +289,84 @@ export function checkHoneypotOptional(content) {
 }
 
 /* ------------------------------------------------------------------ *
- * 5. Hero lead form missing id="regForm" (CTA anchors go nowhere)
+ * 5. autoComplete on a <div> (TypeScript build fail)
+ * ------------------------------------------------------------------ */
+
+/**
+ * `autoComplete` is only valid on <form> and <input> elements. A real run
+ * failed build with "Property 'autoComplete' does not exist on type
+ * 'HTMLDivElement'" because the agent put autoComplete on the honeypot
+ * wrapper <div> instead of on the <input> inside it.
+ */
+export function checkAutoCompleteOnDiv(content) {
+  const clean = stripComments(content);
+  // Match <div ... autoComplete=... (with optional whitespace/newlines between)
+  const divAutoComplete = /<div\b[^>]*\bautoComplete\s*=/s.test(clean) ||
+    // Also catch multi-line JSX where the attribute is on a following line
+    /<div[\s\S]{0,300}?\n\s*autoComplete\s*=/.test(clean);
+  if (!divAutoComplete) return { ok: true, problems: [] };
+  return {
+    ok: false,
+    problems: [
+      {
+        kind: "types",
+        message:
+          "`autoComplete` is not a valid HTML attribute on `<div>` elements (TypeScript error: " +
+          "\"Property 'autoComplete' does not exist on type 'HTMLDivElement'\"). " +
+          "Move `autoComplete=\"off\"` from the wrapper `<div>` to the `<input>` inside it: " +
+          "`<input type=\"text\" autoComplete=\"off\" ... />`.",
+      },
+    ],
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * 5b. Honeypot <input> not tabIndex={-1} (aria-hidden-focus a11y failure)
+ * ------------------------------------------------------------------ */
+
+/* leadform/contract.mjs instructs `aria-hidden="true"` on the honeypot's
+ * wrapper <div> so axe's "label" rule doesn't flag the deliberately-unlabeled
+ * field — but aria-hidden on a container is itself a violation ("aria-hidden-
+ * focus") if anything inside it stays focusable, and a plain <input> always
+ * is regardless of its ancestor's aria-hidden. A real run added aria-hidden
+ * to the wrapper without also tabIndex={-1} on the input and failed exactly
+ * that check — the prose instruction covers both, but the agent only always
+ * reliably follows the part it's tested on, so catch the other half here. */
+export function checkHoneypotAriaHiddenFocus(content) {
+  const clean = stripComments(content);
+  const fieldRe = new RegExp(`register\\(\\s*["']${HONEYPOT_FIELD_NAME}["']`, "g");
+  const problems = [];
+  let m;
+  while ((m = fieldRe.exec(clean)) !== null) {
+    const tagStart = clean.lastIndexOf("<input", m.index);
+    if (tagStart === -1) continue;
+    const tagEnd = clean.indexOf(">", m.index);
+    if (tagEnd === -1) continue;
+    const tag = clean.slice(tagStart, tagEnd + 1);
+    if (/\btabIndex\s*=/.test(tag)) continue; // already correct
+
+    // Only the deliberately-hidden honeypot needs this — require aria-hidden
+    // nearby so an ordinary, unrelated "company website" field (visible,
+    // naturally focusable, no ancestor aria-hidden) is never flagged.
+    const precedingWindow = clean.slice(Math.max(0, tagStart - 300), tagStart);
+    if (!/aria-hidden\s*=\s*["'{]?\s*true/.test(precedingWindow)) continue;
+
+    const line = clean.slice(0, tagStart).split("\n").length;
+    problems.push({
+      kind: "a11y",
+      message:
+        `Line ${line}: the honeypot <input> sits inside an aria-hidden="true" wrapper but has no tabIndex={-1} of its own. ` +
+        `A plain <input> stays natively focusable regardless of an ancestor's aria-hidden, and axe's "aria-hidden-focus" rule ` +
+        `fails a hidden container that contains any focusable element. Add tabIndex={-1} directly on the <input>: ` +
+        `<input type="text" tabIndex={-1} autoComplete="off" {...register("${HONEYPOT_FIELD_NAME}")} />.`,
+    });
+  }
+
+  return { ok: problems.length === 0, problems };
+}
+
+/* ------------------------------------------------------------------ *
+ * 6. Hero lead form missing id="regForm" (CTA anchors go nowhere)
  * ------------------------------------------------------------------ */
 
 /** If the file marks a lead form with data-hero-form, that same element must
@@ -373,6 +450,8 @@ export async function precheckSectionFile({ content, filePath, workdir, strictTy
     // Not gated on strictTypes: the resolver mismatch is a plain assignability
     // error that fails the build under any tsconfig, strict or not.
     problems.push(...checkHoneypotOptional(content).problems);
+    problems.push(...checkHoneypotAriaHiddenFocus(content).problems);
+    problems.push(...checkAutoCompleteOnDiv(content).problems);
     problems.push(...checkLeadFormAnchor(content).problems);
     problems.push(...checkProcessExplainerImage(content).problems);
   }

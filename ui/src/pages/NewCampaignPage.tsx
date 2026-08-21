@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
-import { createCampaign, getCampaignBrief, type CampaignBrief, type PageLength, type Tone } from "../api";
+import { createCampaign, getCampaignBrief, type CampaignBrief, type ColorSchemePreset, type PageLength, type Tone } from "../api";
 
 // Must stay in sync with src/design-catalog/section-types.mjs's SECTION_TYPES —
 // duplicated here since the UI can't import a backend .mjs module directly.
@@ -31,6 +31,8 @@ const LENGTHS: { value: PageLength; label: string; blurb: string }[] = [
   { value: "standard", label: "Standard", blurb: "3–5 sections" },
   { value: "long", label: "Long", blurb: "5–7 sections" },
 ];
+
+const ASPIRE_COLORS = { primary: "#125B80", secondary: "#004aad", accent: "#ea4b0c" };
 
 const STEPS = [
   { id: "campaign", label: "Campaign" },
@@ -168,6 +170,10 @@ export default function NewCampaignPage() {
   const [sectionTypes, setSectionTypes] = useState<string[]>([]);
   const [aiRequiredSections, setAiRequiredSections] = useState<string[]>([]);
   const [pageLength, setPageLength] = useState<PageLength | undefined>();
+  const [colorPreset, setColorPreset] = useState<ColorSchemePreset>("aspire");
+  const [primaryColor, setPrimaryColor] = useState(ASPIRE_COLORS.primary);
+  const [secondaryColor, setSecondaryColor] = useState(ASPIRE_COLORS.secondary);
+  const [accentColor, setAccentColor] = useState(ASPIRE_COLORS.accent);
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -197,6 +203,17 @@ export default function NewCampaignPage() {
         setSectionTypes(b.sectionTypes ?? []);
         setAiRequiredSections(b.aiRequiredSections ?? []);
         setPageLength(b.pageLength);
+        if (b.colorScheme?.preset === "custom") {
+          setColorPreset("custom");
+          setPrimaryColor((b.colorScheme.primary ?? ASPIRE_COLORS.primary).toLowerCase());
+          setSecondaryColor((b.colorScheme.secondary ?? ASPIRE_COLORS.secondary).toLowerCase());
+          setAccentColor((b.colorScheme.accent ?? ASPIRE_COLORS.accent).toLowerCase());
+        } else {
+          setColorPreset("aspire");
+          setPrimaryColor(ASPIRE_COLORS.primary);
+          setSecondaryColor(ASPIRE_COLORS.secondary);
+          setAccentColor(ASPIRE_COLORS.accent);
+        }
       })
       .catch((err) => !cancelled && setError(err instanceof Error ? err.message : String(err)))
       .finally(() => !cancelled && setPrefilling(false));
@@ -251,6 +268,9 @@ export default function NewCampaignPage() {
         ...(sectionTypes.length ? { sectionTypes } : {}),
         ...(aiRequiredSections.length ? { aiRequiredSections } : {}),
         ...(pageLength ? { pageLength } : {}),
+        ...(colorPreset === "custom"
+          ? { colorScheme: { preset: "custom", primary: primaryColor, secondary: secondaryColor, accent: accentColor } }
+          : {}),
       };
       const { runId } = await createCampaign(payload);
       navigate(`/runs/${runId}`);
@@ -431,6 +451,55 @@ export default function NewCampaignPage() {
                       The page is not fetched or scraped — it's passed along as a reference the model may already know.
                     </span>
                   </label>
+                  <fieldset className="section-picker">
+                    <legend>Color scheme</legend>
+                    <p className="field-note">
+                      Aspire TSS is the default. Custom colors apply only to this campaign page — they do not recolor the rest of
+                      the site.
+                    </p>
+                    <div className="choice-grid">
+                      <button
+                        type="button"
+                        className={`choice-card ${colorPreset === "aspire" ? "active" : ""}`}
+                        onClick={() => setColorPreset("aspire")}
+                      >
+                        <strong>Aspire TSS (recommended)</strong>
+                        <span>Primary #125B80 · Secondary #004aad · Accent #ea4b0c</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={`choice-card ${colorPreset === "custom" ? "active" : ""}`}
+                        onClick={() => setColorPreset("custom")}
+                      >
+                        <strong>Custom</strong>
+                        <span>Pick primary, secondary, and accent yourself.</span>
+                      </button>
+                    </div>
+                    <div className="color-swatches" aria-hidden="true">
+                      <span className="color-swatch" style={{ background: colorPreset === "custom" ? primaryColor : ASPIRE_COLORS.primary }} />
+                      <span className="color-swatch" style={{ background: colorPreset === "custom" ? secondaryColor : ASPIRE_COLORS.secondary }} />
+                      <span className="color-swatch" style={{ background: colorPreset === "custom" ? accentColor : ASPIRE_COLORS.accent }} />
+                    </div>
+                    {colorPreset === "custom" && (
+                      <div className="form-row color-pickers">
+                        <label>
+                          Primary
+                          <input type="color" value={primaryColor} onChange={(e) => setPrimaryColor(e.target.value)} />
+                          <input value={primaryColor} onChange={(e) => setPrimaryColor(e.target.value)} maxLength={7} />
+                        </label>
+                        <label>
+                          Secondary
+                          <input type="color" value={secondaryColor} onChange={(e) => setSecondaryColor(e.target.value)} />
+                          <input value={secondaryColor} onChange={(e) => setSecondaryColor(e.target.value)} maxLength={7} />
+                        </label>
+                        <label>
+                          Accent / CTA
+                          <input type="color" value={accentColor} onChange={(e) => setAccentColor(e.target.value)} />
+                          <input value={accentColor} onChange={(e) => setAccentColor(e.target.value)} maxLength={7} />
+                        </label>
+                      </div>
+                    )}
+                  </fieldset>
                 </div>
               )}
 

@@ -1,9 +1,13 @@
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { has, findPackageJsonDir, detectPackageManager, INSTALL_CMD, RUN_SCRIPT_CMD } from "./detect-package-manager.mjs";
 import { hasDocker, parseDockerBuildStage, verifyBuildInDocker } from "./docker-build.mjs";
 import { shouldIgnoreEslintDuringBuild, applyIgnoreEslintDuringBuild } from "./ignore-eslint-during-build.mjs";
+import { applySupabaseImageRemotePattern } from "./allow-supabase-images.mjs";
+import { linkSharedInstall } from "./reuse-base-install.mjs";
+import { applyCampaignTsconfig } from "./narrow-tsconfig-for-campaign.mjs";
+import { quarantineUnrelatedAppRoutes } from "../git/quarantine-unrelated-app-routes.mjs";
 import { cleanEnvForChildProcess } from "../spawn-env.mjs";
 
 /* Deterministic, non-AI verification of whatever the coding agent wrote —
@@ -94,6 +98,8 @@ function truncateReport(text) {
  * @param {string[]} [p.changedPaths] relative paths the agent created (used by the PHP gate)
  * @param {string|null} [p.packageManagerOverride] see package-manager.mjs's detectPackageManager
  * @param {boolean} [p.disableDocker] skip the Docker path even if the repo has a usable Dockerfile
+ * @param {string} [p.campaignSlug]
+ * @param {string|null} [p.campaignsParent]
  * @returns {Promise<{ok: boolean, report: string}>}
  */
 export async function verifyBuild({
@@ -103,6 +109,9 @@ export async function verifyBuild({
   changedPaths = [],
   packageManagerOverride = null,
   disableDocker = false,
+  logger = () => {},
+  campaignSlug = null,
+  campaignsParent = null,
 }) {
   const pkgDir = await findPackageJsonDir(workdir);
   if (pkgDir) {
@@ -110,13 +119,24 @@ export async function verifyBuild({
     // options. Patch next.config in the worktree only (never committed) so
     // compile can finish. Must run before host or Docker `npm run build`.
     await maybeIgnoreEslintDuringBuild(pkgDir);
+    await applySupabaseImageRemotePattern(pkgDir);
+    if (campaignSlug && campaignsParent) {
+      const stash = await quarantineUnrelatedAppRoutes({ workdir: pkgDir, campaignsParent });
+      if (stash.moved.length) {
+        logger(
+          `verify: stashed ${stash.moved.length} unrelated app route(s) so next build compiles this campaign only — ${stash.moved.slice(0, 8).join(", ")}${stash.moved.length > 8 ? ", …" : ""}`
+        );
+      }
+      await applyCampaignTsconfig(pkgDir, { campaignsParent, slug: campaignSlug });
+    }
     if (!disableDocker) {
       const dockerStage = await parseDockerBuildStage(pkgDir);
       if (dockerStage && (await hasDocker())) {
+        logger("verify: building inside Docker (target repo Dockerfile)");
         return verifyNodeInDocker({ pkgDir, dockerStage, installTimeoutMs, buildTimeoutMs });
       }
     }
-    return verifyNode({ workdir: pkgDir, installTimeoutMs, buildTimeoutMs, packageManagerOverride });
+    return verifyNode({ workdir: pkgDir, installTimeoutMs, buildTimeoutMs, packageManagerOverride, logger });
   }
   if (await has(workdir, "composer.json")) {
     return verifyPhp({ workdir, buildTimeoutMs, changedPaths });
@@ -191,7 +211,7 @@ async function verifyNodeInDocker({ pkgDir, dockerStage, installTimeoutMs, build
   return { ok: true, report: `${build.report}${scripts.lint ? " (+ lint passed)" : ""}` };
 }
 
-async function verifyNode({ workdir, installTimeoutMs, buildTimeoutMs, packageManagerOverride = null }) {
+async function verifyNode({ workdir, installTimeoutMs, buildTimeoutMs, packageManagerOverride = null, logger = () => {} }) {
   const pkgPath = path.join(workdir, "package.json");
   let pkg;
   try {
@@ -208,15 +228,33 @@ async function verifyNode({ workdir, installTimeoutMs, buildTimeoutMs, packageMa
   }
 
   const pm = await detectPackageManager(workdir, packageManagerOverride);
-  const [installCmd, installArgs] = INSTALL_CMD[pm];
+  const shared = await linkSharedInstall(workdir);
+  const nodeModulesReady = await access(path.join(workdir, "node_modules")).then(() => true, () => false);
 
-  const install = await runCommand(installCmd, installArgs, { cwd: workdir, timeoutMs: installTimeoutMs });
-  if (!install.ok) {
-    return {
-      ok: false,
-      report: `${pm} install ${install.timedOut ? "timed out" : "failed"}:\n${truncateReport(install.stdout + install.stderr)}`,
-    };
+  if (nodeModulesReady) {
+    logger(
+      shared.nodeModules
+        ? `verify: reusing _base/node_modules (skipped ${pm} install)${shared.nextCache ? "; reusing _base/.next/cache" : ""}`
+        : `verify: node_modules already present — skipped ${pm} install`
+    );
+  } else {
+    const [installCmd, installArgs] = INSTALL_CMD[pm];
+    logger(
+      `verify: ${pm} install starting in ${workdir} (timeout ${Math.round(installTimeoutMs / 60_000)} min) — no shared _base/node_modules to reuse`
+    );
+    const install = await runCommand(installCmd, installArgs, { cwd: workdir, timeoutMs: installTimeoutMs });
+    if (!install.ok) {
+      return {
+        ok: false,
+        report: `${pm} install ${install.timedOut ? "timed out" : "failed"}:\n${truncateReport(install.stdout + install.stderr)}`,
+      };
+    }
+    logger(`verify: ${pm} install finished`);
   }
+
+  logger(
+    `verify: starting ${pm} run build (timeout ${Math.round(buildTimeoutMs / 60_000)} min) — unrelated app routes are stashed so this compiles the campaign, not the whole marketing site`
+  );
 
   const [buildCmd, buildArgs] = RUN_SCRIPT_CMD[pm]("build");
   const build = await runCommand(buildCmd, buildArgs, { cwd: workdir, timeoutMs: buildTimeoutMs });
@@ -233,8 +271,9 @@ async function verifyNode({ workdir, installTimeoutMs, buildTimeoutMs, packageMa
       report: annotateWorkerCrash(`${pm} run build ${build.timedOut ? "timed out" : "failed"}:\n${buildOutput}`),
     };
   }
+  logger(`verify: ${pm} run build finished`);
 
-  if (scripts.lint) {
+  if (scripts.lint && !shouldIgnoreEslintDuringBuild(pkg)) {
     const [lintCmd, lintArgs] = RUN_SCRIPT_CMD[pm]("lint");
     const lint = await runCommand(lintCmd, lintArgs, { cwd: workdir, timeoutMs: buildTimeoutMs });
     if (!lint.ok) {

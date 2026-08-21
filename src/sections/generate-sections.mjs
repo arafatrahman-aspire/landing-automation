@@ -19,13 +19,13 @@ import { precheckSectionFile } from "../verify/precheck-section-file.mjs";
 // classified section has no matching catalog candidate — classify-sections.mjs
 // only ever sets mode:"static" when one exists, so this indicates a caller
 // bug, not a runtime/data condition to handle gracefully.
-export function buildStaticSectionFile(section, { allowlistBase, index, overrides = {} }) {
+export function buildStaticSectionFile(section, { allowlistBase, index, overrides = {}, images = [], colorScheme }) {
   const candidate = getFrameCandidate(section.type, section.frameId);
   if (!candidate) {
     throw new Error(`buildStaticSectionFile: no candidate "${section.frameId}" for section type "${section.type}"`);
   }
   const componentName = sectionComponentName(section.type, index);
-  const { fileContent, dataUsed } = populateFrame({ candidate, overrides, componentName });
+  const { fileContent, dataUsed } = populateFrame({ candidate, overrides, componentName, images, colorScheme });
   // dataUsed comes back so the caller can record what this section actually
   // renders. That record is what the copy editor (sections/describe-fillable-fields.mjs
   // + refine's "edit-copy") starts from — without it, editing a section would
@@ -60,6 +60,7 @@ export function buildStaticSectionFile(section, { allowlistBase, index, override
  *   AI-generated per campaign (generate-static-content.mjs) instead of the frame's
  *   own canned defaultData. Defaults to false so callers that don't opt in (and
  *   every existing test) see the old, network-free behavior unchanged.
+ * @param {Array} [p.images] - researchNotes.images public URLs to inject into frames/prompts
  */
 export async function generateSections({
   classifiedSections,
@@ -80,8 +81,11 @@ export async function generateSections({
   declaredPackages = null,
   precheckAttempts = 2,
   authorStaticContent = false,
+  images = [],
 }) {
   const allowlistBase = allowlist[0];
+  const campaignImages = Array.isArray(images) ? images : [];
+  const colorScheme = request?.colorScheme;
 
   // A targeted repair only happens when the failure named specific files of
   // ours AND we still have last attempt's results to carry forward for the
@@ -105,6 +109,7 @@ export async function generateSections({
         importExamples,
         previewLeadSinkUrl,
         typescriptFragment,
+        images: campaignImages,
       }
     );
 
@@ -187,6 +192,7 @@ export async function generateSections({
               section,
               request,
               guide: guideData,
+              images: campaignImages,
               logger: (msg) => logger(`generate_sections: [${section.type}] ${msg}`),
             })
           : {};
@@ -198,7 +204,7 @@ export async function generateSections({
           return generateAiRequiredSection(section, index, { asFallbackFromStatic: true });
         }
 
-        const built = buildStaticSectionFile(section, { allowlistBase, index, overrides });
+        const built = buildStaticSectionFile(section, { allowlistBase, index, overrides, images: campaignImages, colorScheme });
         const relPath = await writeGuardedFile({ workdir, allowedPrefixes: allowlist, pristineFiles, relPath: built.path, content: built.content });
         logger(`generate_sections: [${section.type}] static — wrote ${relPath}`);
         return {
@@ -218,7 +224,7 @@ export async function generateSections({
   );
 
   const orderedForPage = results.map((r) => ({ componentName: r.componentName }));
-  const pageFile = composePage(orderedForPage, { allowlistBase });
+  const pageFile = composePage(orderedForPage, { allowlistBase, colorScheme, request });
   const pagePath = await writeGuardedFile({ workdir, allowedPrefixes: allowlist, pristineFiles, relPath: pageFile.path, content: pageFile.content });
   logger(`generate_sections: composed ${pagePath} from ${results.length} section(s)`);
 

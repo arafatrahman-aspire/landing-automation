@@ -101,11 +101,24 @@ export interface SectionReference {
   files: { path: string; found: boolean }[];
 }
 
+export interface CampaignImage {
+  slot: string;
+  query: string;
+  source: "pexels" | "serpapi" | string;
+  publicUrl: string;
+  width?: number;
+  height?: number;
+  alt?: string;
+}
+
 export interface ResearchNotes {
   keywords?: string[];
   painPoints?: string[];
   faqQuestions?: string[];
   notes?: string;
+  images?: CampaignImage[];
+  /** LLM-suggested visual search queries per image slot (hero/details/timeline). */
+  imageQueries?: { hero?: string[]; details?: string[]; timeline?: string[] };
 }
 
 export interface RunSummary {
@@ -214,6 +227,14 @@ export async function getRunLog(runId: string): Promise<string> {
 
 export type Tone = "professional" | "friendly" | "urgent" | "technical" | "playful";
 export type PageLength = "short" | "standard" | "long";
+export type ColorSchemePreset = "aspire" | "custom";
+
+export interface ColorScheme {
+  preset: ColorSchemePreset;
+  primary?: string;
+  secondary?: string;
+  accent?: string;
+}
 
 /** Mirrors briefSchema in src/schemas/campaign-brief-schema.mjs. Everything
  *  past `videoUrl` is optional: a brief that sets none of it behaves exactly
@@ -242,6 +263,9 @@ export interface CampaignBrief {
   sectionTypes?: string[];
   pageLength?: PageLength;
   aiRequiredSections?: string[];
+
+  // Omitted = Aspire TSS (#125B80 / #004aad / #ea4b0c).
+  colorScheme?: ColorScheme;
 }
 
 export function createCampaign(brief: CampaignBrief): Promise<{ runId: string; status: string; statusUrl: string }> {
@@ -367,6 +391,45 @@ export function refinePage(runId: string, instructions: string): Promise<RefineP
     method: "POST",
     body: JSON.stringify({ instructions }),
   });
+}
+
+export function recolorCampaign(runId: string, colorScheme: ColorScheme): Promise<RefineResult> {
+  return request<RefineResult>(`/campaigns/${runId}/color-scheme`, {
+    method: "POST",
+    body: JSON.stringify({ colorScheme }),
+  });
+}
+
+export interface UploadedImage {
+  ok: true;
+  slot: string;
+  publicUrl: string;
+  image: CampaignImage;
+}
+
+/**
+ * Upload a raw image file as the campaign photo for a specific slot.
+ * Sends raw bytes — no multipart encoding.
+ */
+export async function uploadCampaignImage(runId: string, slot: string, file: File): Promise<UploadedImage> {
+  const res = await fetch(`${BASE_URL}/campaigns/${runId}/images/${slot}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": file.type,
+      Authorization: `Bearer ${getSecret()}`,
+    },
+    body: file,
+  });
+  if (res.status === 401) {
+    clearSecret();
+    throw new ApiError("Unauthorized", 401);
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}) as Record<string, unknown>);
+    const detail = (body as { message?: string; error?: string }).message ?? (body as { error?: string }).error;
+    throw new ApiError(detail ? String(detail) : `Upload failed (${res.status})`, res.status);
+  }
+  return res.json();
 }
 
 export { ApiError };

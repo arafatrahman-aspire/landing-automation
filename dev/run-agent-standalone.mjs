@@ -2,7 +2,7 @@
  * fixture folder — NOT a git clone, no GitHub involved — so the tool
  * schemas/prompts can be iterated on cheaply against the real LLM API while
  * watching the transcript, before paying for a full clone+verify+push cycle.
- * Uses whichever provider CODING_AGENT_PROVIDER selects (gemini|claude).
+ * Uses whichever provider CODING_AGENT_PROVIDER selects (gemini|claude|omniroute).
  *
  * Run: node --env-file=.env dev/run-agent-standalone.mjs   (from new_approach/) */
 

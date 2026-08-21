@@ -108,8 +108,12 @@ test('every generated wrapper opens with "use client"', () => {
 
 test('the directive comes before the import, not after', () => {
   // Anything above it — even a comment — and Next stops treating it as a
-  // directive, which fails exactly the same way as omitting it.
-  const { fileContent } = populateFrame({ candidate: frameCatalog.faq[0], componentName: "FaqSection" });
+  // directive, which fails exactly the same way as omitting it. Uses a
+  // candidate with no special-cased inline emit (faq-accordion and
+  // cta-section are now always inlined and have no import at all), so this
+  // exercises the plain raw-frame-import path that still has one.
+  const candidate = { component: "TestimonialCarouselFrame", importPath: "@components/frames/landing/analyze/TestimonialCarouselFrame" };
+  const { fileContent } = populateFrame({ candidate, componentName: "Testimonials" });
   const lines = fileContent.split("\n");
   assert.equal(lines[0], '"use client";');
   assert.ok(fileContent.indexOf('"use client"') < fileContent.indexOf("import "));
@@ -142,4 +146,103 @@ test("process-explainer emits a StaticImageData image so TypeScript accepts Proc
   assert.match(fileContent, /ProcessExplainerFrame/);
   // Must not JSON-serialize data without image (the original type error).
   assert.doesNotMatch(fileContent, /const data = \[/);
+});
+
+test("risk-list-with-image uses a remote details URL instead of DummyImage", () => {
+  const candidate = frameCatalog.details.find((c) => c.id === "risk-list-with-image");
+  const { fileContent } = populateFrame({
+    candidate,
+    componentName: "DetailsSection1",
+    images: [
+      {
+        slot: "details",
+        query: "workspace",
+        source: "pexels",
+        publicUrl: "https://abc.supabase.co/storage/v1/object/public/campaign-images/x/details-aaa.jpg",
+        width: 800,
+        height: 600,
+        alt: "workspace desk",
+      },
+    ],
+  });
+  assert.match(fileContent, /https:\/\/abc\.supabase\.co\/storage\/v1\/object\/public\/campaign-images\/x\/details-aaa\.jpg/);
+  assert.match(fileContent, /workspace desk/);
+  assert.match(fileContent, /width=\{800\}/);
+  assert.doesNotMatch(fileContent, /DummyImage/);
+  assert.doesNotMatch(fileContent, /frame-3-image-1/);
+});
+
+test("process-explainer with a timeline URL inlines next/image instead of ProcessExplainerFrame", () => {
+  const candidate = frameCatalog.timeline.find((c) => c.id === "process-explainer");
+  const { fileContent } = populateFrame({
+    candidate,
+    overrides: { title: "Your 3-day path" },
+    componentName: "TimelineSection3",
+    images: [
+      {
+        slot: "timeline",
+        query: "process",
+        source: "serpapi",
+        publicUrl: "https://abc.supabase.co/storage/v1/object/public/campaign-images/x/timeline-bbb.jpg",
+        width: 1024,
+        height: 768,
+        alt: "planning board",
+      },
+    ],
+  });
+  assert.match(fileContent, /planning board/);
+  assert.match(fileContent, /timeline-bbb\.jpg/);
+  assert.doesNotMatch(fileContent, /ProcessExplainerFrame/);
+  assert.doesNotMatch(fileContent, /frame-4-image-1/);
+});
+
+test("custom colorScheme substitutes hex on the inlined details CTA", () => {
+  const candidate = frameCatalog.details.find((c) => c.id === "risk-list-with-image");
+  const { fileContent } = populateFrame({
+    candidate,
+    componentName: "DetailsSection1",
+    colorScheme: { preset: "custom", primary: "#111111", secondary: "#222222", accent: "#333333" },
+  });
+  assert.match(fileContent, /bg-\[#222222\]/);
+  assert.doesNotMatch(fileContent, /bg-\[#004aad\]/);
+});
+
+test("custom colorScheme's hex reaches the redesigned FAQ grid", () => {
+  const { fileContent } = populateFrame({
+    candidate: frameCatalog.faq[0],
+    overrides: { heading: "Photo FAQs" },
+    componentName: "FaqSection2",
+    colorScheme: { preset: "custom", primary: "#111111", secondary: "#222222", accent: "#333333" },
+  });
+  assert.match(fileContent, /Photo FAQs/);
+  assert.match(fileContent, /color: "#111111"/);
+  assert.doesNotMatch(fileContent, /FaqAccordionFrame/);
+});
+
+test("FAQ is always the redesigned card grid (not the raw frame), for every preset", () => {
+  const { fileContent } = populateFrame({
+    candidate: frameCatalog.faq[0],
+    componentName: "FaqSection2",
+    colorScheme: { preset: "aspire" },
+  });
+  assert.doesNotMatch(fileContent, /FaqAccordionFrame/);
+  // 2-column responsive grid, not the old single-column stacked list.
+  assert.match(fileContent, /md:grid-cols-2/);
+  // item.bg_color may still ride along in the JSON data blob (harmless,
+  // unused) but the JSX must never render it as a className/style — that's
+  // the raw frame's footgun (a real run filled it with an invalid bare CSS
+  // custom-property name), and this design has no bg_color usage at all.
+  assert.doesNotMatch(fileContent, /item\.bg_color/);
+});
+
+test("cta-section is always inlined (not the raw frame) — its baked colors fail WCAG AA contrast", () => {
+  const candidate = frameCatalog["footer-cta"].find((c) => c.id === "cta-section");
+  const { fileContent } = populateFrame({
+    candidate,
+    componentName: "FooterCtaSection1",
+    colorScheme: { preset: "aspire" },
+  });
+  assert.doesNotMatch(fileContent, /CtaSectionFrame/);
+  assert.doesNotMatch(fileContent, /text-green-400/);
+  assert.match(fileContent, /font-bold/);
 });

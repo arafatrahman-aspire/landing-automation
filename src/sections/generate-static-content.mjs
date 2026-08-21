@@ -79,7 +79,7 @@ export function staticOverridesAreUsable(candidate, overrides) {
  * @returns {Promise<object>} overrides for populateFrame — {} when the layout
  *   has no fillable copy or on any generation/parsing/validation failure
  */
-export async function generateStaticSectionContent({ candidate, section, request, guide: guideData, logger = () => {} }) {
+export async function generateStaticSectionContent({ candidate, section, request, guide: guideData, logger = () => {}, images = [] }) {
   if (!candidate?.fillableFields) return {}; // no fillable copy on this candidate
 
   const fields = describeFillableFields(candidate.fillableFields);
@@ -111,6 +111,12 @@ ${guideData?.sections ? `Full section plan (context only — you are writing ONL
 Fill in this exact JSON shape with NEW copy written specifically for this campaign. Every string below is a placeholder showing you the field's purpose and rough length, not something to reuse or lightly edit:
 ${JSON.stringify(shape, null, 2)}
 ${mustFill}
+
+Do NOT invent image URLs or remote hosts — photos are injected separately${
+    Array.isArray(images) && images.length
+      ? ` (assigned: ${images.map((i) => `${i.slot}=${i.publicUrl}`).join(", ")})`
+      : ""
+  }. Do not put a URL into any copy field.
 
 Return ONLY a fenced \`\`\`json object matching that shape, no prose outside the fence. Do NOT reuse cybersecurity, SOC, cloud-certification, Income Share Agreement, or Aspire Tech training copy unless this campaign is actually about that.`;
 

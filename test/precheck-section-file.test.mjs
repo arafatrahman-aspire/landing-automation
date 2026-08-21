@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
-import { checkSyntax, checkUntypedProps, checkImports, checkHoneypotOptional, checkLeadFormAnchor, checkProcessExplainerImage, extractImportSpecifiers, precheckSectionFile } from "../src/verify/precheck-section-file.mjs";
+import { checkSyntax, checkUntypedProps, checkImports, checkHoneypotOptional, checkHoneypotAriaHiddenFocus, checkLeadFormAnchor, checkProcessExplainerImage, extractImportSpecifiers, precheckSectionFile } from "../src/verify/precheck-section-file.mjs";
 
 /* The syntax check uses the target repo's own TypeScript. In this service's
  * test environment the only copy available is the UI package's, so it's
@@ -374,6 +374,42 @@ interface IFormData { company_website?: string }
 const X = () => useForm<IFormData>({});
 `;
   assert.equal(checkHoneypotOptional(src).ok, true);
+});
+
+test("honeypot input inside aria-hidden without tabIndex is reported", () => {
+  const src = `export default function Hero() {
+  return (
+    <div style={{ position: "absolute", left: "-9999px" }} tabIndex={-1} aria-hidden="true">
+      <input type="text" autoComplete="off" {...register("company_website")} />
+    </div>
+  );
+}
+`;
+  const result = checkHoneypotAriaHiddenFocus(src);
+  assert.equal(result.ok, false);
+  assert.match(result.problems[0].message, /tabIndex={-1}/);
+});
+
+test("honeypot input with tabIndex={-1} on itself passes", () => {
+  const src = `export default function Hero() {
+  return (
+    <div style={{ position: "absolute", left: "-9999px" }} tabIndex={-1} aria-hidden="true">
+      <input type="text" tabIndex={-1} autoComplete="off" {...register("company_website")} />
+    </div>
+  );
+}
+`;
+  assert.equal(checkHoneypotAriaHiddenFocus(src).ok, true);
+});
+
+test("an ordinary, visible company_website field with no aria-hidden ancestor is left alone", () => {
+  // A company/contact form could legitimately have a real, visible "company
+  // website" input with no ancestor aria-hidden at all — must not be flagged.
+  const src = `export default function ContactForm() {
+  return <input type="text" {...register("company_website")} />;
+}
+`;
+  assert.equal(checkHoneypotAriaHiddenFocus(src).ok, true);
 });
 
 test("hero form missing id=regForm is reported", () => {

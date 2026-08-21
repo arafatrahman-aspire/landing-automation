@@ -1,4 +1,5 @@
 import { SECTION_TYPES } from "../design-catalog/section-types.mjs";
+import { resolveColorScheme } from "../theme/campaign-colors.mjs";
 
 /* Turns the campaign brief's optional content-rule fields (campaign-brief-schema.mjs)
  * into prompt text, for both the guide stage (pipeline/steps/03-generate-guide.mjs)
@@ -14,8 +15,8 @@ import { SECTION_TYPES } from "../design-catalog/section-types.mjs";
  * function that owns its whole slice of the prompt, so callers concatenate
  * fragments instead of growing an ever-longer template literal.
  *
- * Everything here is optional. A brief with none of these set produces an
- * empty string, and the prompts are byte-identical to what they were before. */
+ * Everything here is optional except COLOR THEME, which always resolves to
+ * Aspire TSS when the brief omits colorScheme. */
 
 const TONE_GUIDANCE = {
   professional: "Measured and credible. Plain business English, no slang, no exclamation marks.",
@@ -45,10 +46,20 @@ function numbered(items) {
  *   True for the guide stage, which decides the section list; false for the
  *   per-section coding agent, where the list is already settled and repeating
  *   it would just invite the agent to second-guess a decision it can't act on.
- * @returns {string} prompt text, or "" when the brief sets none of these
+ * @returns {string} prompt text (always includes COLOR THEME; other blocks optional)
  */
 export function buildContentRulesPromptFragment(request, { includeStructure = true } = {}) {
   const blocks = [];
+
+  const palette = resolveColorScheme(request?.colorScheme);
+  blocks.push(
+    `COLOR THEME — use these exact hex values for brand/UI color; do not invent new brand colors:\n` +
+      `  primary: ${palette.primary}\n` +
+      `  secondary: ${palette.secondary}\n` +
+      `  accent/CTA: ${palette.accent}\n` +
+      `Prefer CSS variables --campaign-primary, --campaign-secondary, --campaign-accent (set on the page wrapper) when writing new markup.\n` +
+      `CONTRAST WARNING: accent is usually a bright/saturated brand color (e.g. an orange or bright blue) — it is often NOT safe as a TEXT color on white or on primary/secondary backgrounds (a real run failed WCAG AA contrast, 4.5:1, using accent-colored heading text on a secondary-colored card). Reserve accent/primary/secondary for BACKGROUNDS with plain white or near-white text, never as small/normal-weight body or heading text color. If you do use one as text, only do so at a large size AND bold weight (e.g. text-xl font-bold or bigger) to qualify for the relaxed 3:1 large-text threshold — never at normal weight.`
+  );
 
   if (request.tone) {
     blocks.push(`TONE: ${request.tone} — ${TONE_GUIDANCE[request.tone]}`);

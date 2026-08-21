@@ -1,8 +1,9 @@
 import { config } from "../config.mjs";
 import { TOOL_DEFINITIONS, createToolExecutor } from "./filesystem-tools.mjs";
+import { runOmnirouteCodingAgent } from "./omniroute-coding-agent.mjs";
 
 /* The agentic coding loop. Provider-switchable via CODING_AGENT_PROVIDER
- * (gemini|claude, independent of AI_PROVIDER which governs the one-shot
+ * (gemini|claude|omniroute, independent of AI_PROVIDER which governs the one-shot
  * research/guide stages) — swap providers with one env var, no code changes.
  *
  * Both implementations share the same contract:
@@ -197,6 +198,11 @@ async function runGeminiCodingAgent({ workdir, allowedPrefixes, pristineFiles, m
 export async function runCodingAgent(opts) {
   const maxIterations = opts.maxIterations ?? config.maxAgentIterations;
   const logger = opts.logger ?? (() => {});
-  const run = config.codingAgentProvider === "gemini" ? runGeminiCodingAgent : runClaudeCodingAgent;
+  const agents = {
+    gemini: runGeminiCodingAgent,
+    claude: runClaudeCodingAgent,
+    omniroute: runOmnirouteCodingAgent,
+  };
+  const run = agents[config.codingAgentProvider] ?? runClaudeCodingAgent;
   return run({ ...opts, maxIterations, logger });
 }

@@ -55,6 +55,68 @@ test("requiresJobField defaults to false and can be set explicitly", () => {
   assert.equal(withIt.value.requiresJobField, true);
 });
 
+test("omitted colorScheme is accepted (Aspire default at apply-time)", () => {
+  const result = validateBrief({
+    slug: "x-slug",
+    campaignName: "Some Campaign",
+    offer: "some offer text",
+    audience: "some audience text",
+    cta: "Go",
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.value.colorScheme, undefined);
+});
+
+test("accepts Aspire preset without hex values", () => {
+  const result = validateBrief({
+    slug: "x-slug",
+    campaignName: "Some Campaign",
+    offer: "some offer text",
+    audience: "some audience text",
+    cta: "Go",
+    colorScheme: { preset: "aspire" },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.value.colorScheme.preset, "aspire");
+});
+
+test("accepts a custom colorScheme with three hex values", () => {
+  const result = validateBrief({
+    slug: "x-slug",
+    campaignName: "Some Campaign",
+    offer: "some offer text",
+    audience: "some audience text",
+    cta: "Go",
+    colorScheme: { preset: "custom", primary: "#112233", secondary: "#aabbcc", accent: "#ff6600" },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.value.colorScheme.primary, "#112233");
+});
+
+test("rejects custom colorScheme missing a hex channel", () => {
+  const result = validateBrief({
+    slug: "x-slug",
+    campaignName: "Some Campaign",
+    offer: "some offer text",
+    audience: "some audience text",
+    cta: "Go",
+    colorScheme: { preset: "custom", primary: "#112233" },
+  });
+  assert.equal(result.ok, false);
+});
+
+test("rejects a colorScheme hex that is not #rrggbb", () => {
+  const result = validateBrief({
+    slug: "x-slug",
+    campaignName: "Some Campaign",
+    offer: "some offer text",
+    audience: "some audience text",
+    cta: "Go",
+    colorScheme: { preset: "custom", primary: "navy", secondary: "#004aad", accent: "#ea4b0c" },
+  });
+  assert.equal(result.ok, false);
+});
+
 test("rejects an aiRequiredSections entry outside the fixed section catalog", () => {
   const result = validateBrief({
     slug: "spring-security-sale",

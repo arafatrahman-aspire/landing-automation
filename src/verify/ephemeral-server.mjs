@@ -49,6 +49,33 @@ export async function waitForReady(url, timeoutMs) {
 }
 
 /**
+ * Pre-fetches a specific page path so the framework (e.g. Next.js) compiles
+ * that route before Playwright tries to navigate to it. Without this, all
+ * three parallel Playwright checks race to hit the same cold route at once —
+ * only one wins the compilation; the others time out.
+ *
+ * @param {string} baseUrl - e.g. "http://127.0.0.1:34719"
+ * @param {string} pagePath - e.g. "/campaigns/splunk-course-v4"
+ * @param {number} timeoutMs - how long to keep retrying before giving up
+ * @returns {Promise<boolean>} true if the route responded non-5xx
+ */
+export async function warmUpRoute(baseUrl, pagePath, timeoutMs = 60_000) {
+  const url = `${baseUrl}${pagePath}`;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      // Give each attempt up to 30 s — Next.js cold compilation can be slow.
+      const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+      if (res.status < 500) return true;
+    } catch {
+      /* still compiling or transient error — keep retrying */
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return false;
+}
+
+/**
  * Starts the target repo's own serve command on a free local port.
  * @param {object} p
  * @param {string} p.workdir - directory containing package.json (already built)

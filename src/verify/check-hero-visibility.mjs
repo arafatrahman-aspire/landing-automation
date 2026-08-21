@@ -36,7 +36,9 @@ export async function checkHeroFit({ url }) {
     for (const viewport of VIEWPORTS) {
       const page = await browser.newPage({ viewport: { width: viewport.width, height: viewport.height } });
       try {
-        await page.goto(url, { waitUntil: "networkidle", timeout: 15_000 });
+        // "networkidle" never resolves on Next.js pages that keep open
+        // connections. "load" is sufficient for bounding-box measurements.
+        await page.goto(url, { waitUntil: "load", timeout: 60_000 });
         for (const hook of HERO_HOOKS) {
           const locator = page.locator(`[${hook.attr}]`).first();
           const count = await page.locator(`[${hook.attr}]`).count();

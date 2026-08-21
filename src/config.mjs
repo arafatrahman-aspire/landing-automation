@@ -30,17 +30,26 @@ const envSchema = z
     API_SHARED_SECRET: z.string().min(16, "API_SHARED_SECRET must be set to a real secret (>=16 chars)"),
 
     // One-shot stages (research/guide/file-manifest)
-    AI_PROVIDER: z.enum(["gemini", "claude"]).default("gemini"),
+    AI_PROVIDER: z.enum(["gemini", "claude", "omniroute"]).default("gemini"),
     // The agentic coding loop — independent of AI_PROVIDER so you can e.g.
     // run research on Gemini and coding on Claude, or both on Gemini while
     // no Anthropic key is available. Swap back to "claude" any time.
-    CODING_AGENT_PROVIDER: z.enum(["gemini", "claude"]).default("claude"),
+    CODING_AGENT_PROVIDER: z.enum(["gemini", "claude", "omniroute"]).default("claude"),
 
     GEMINI_API_KEY: z.string().optional(),
     GEMINI_MODEL: z.string().default("gemini-2.5-flash"),
     ANTHROPIC_API_KEY: z.string().optional(),
     CLAUDE_MODEL: z.string().default("claude-sonnet-5"),
     CODING_AGENT_MODEL: z.string().optional(),
+
+    // Local OmniRoute gateway (OpenAI-compatible). Used when AI_PROVIDER or
+    // CODING_AGENT_PROVIDER is "omniroute". Key is optional — a default local
+    // install accepts unauthenticated /v1/chat/completions.
+    OMNIROUTE_BASE_URL: z.string().default("http://localhost:20128/v1"),
+    OMNIROUTE_API_KEY: z.string().optional(),
+    // `auto` lets the gateway pick; its free pool (Felo / OpenCode) often 400/401.
+    // Pin a model id that works in the OmniRoute dashboard for this pipeline.
+    OMNIROUTE_MODEL: z.string().default("auto"),
 
     // Pause after the AI plans the page and BEFORE any section is generated,
     // so a human can edit the hero copy, SEO tags and section list first.
@@ -78,6 +87,13 @@ const envSchema = z
     VERIFY_DISABLE_DOCKER: boolFromEnvDefaultTrue,
     VERIFY_INSTALL_TIMEOUT_MS: intFromEnv(300_000),
     VERIFY_BUILD_TIMEOUT_MS: intFromEnv(600_000),
+    // Per-check opt-outs for the two browser-driven Layer-1 checks — set to
+    // "false" to stop a specific check from ever failing a run (it's simply
+    // not run, same as when no browser is available; not the same as it
+    // silently passing). Independent of each other and of seo-lint, which has
+    // no such flag since it hasn't needed one.
+    ENABLE_HERO_FIT_CHECK: boolFromEnvDefaultTrue,
+    ENABLE_A11Y_CHECK: boolFromEnvDefaultTrue,
     // How the layout/SEO/a11y checks reach the new page once it's served —
     // e.g. "/campaigns/{slug}" for Next.js app-router. Framework routing
     // conventions vary too much to derive this automatically (and for a
@@ -151,6 +167,14 @@ const envSchema = z
     // reachable base URL. Defaults to localhost at this service's own port,
     // which only works for local dev; set explicitly for any real deployment.
     SERVICE_PUBLIC_BASE_URL: z.string().url().optional(),
+
+    // Campaign stock photos (optional). Missing any of these skips image
+    // search/upload and the campaign still generates with dummy frame assets.
+    PEXELS_API_KEY: z.string().optional(),
+    SERPAPI_API_KEY: z.string().optional(),
+    SUPABASE_URL: z.string().url().optional(),
+    SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
+    SUPABASE_STORAGE_BUCKET: z.string().default("campaign-images"),
   })
   .superRefine((env, ctx) => {
     if (env.AI_PROVIDER === "gemini" && !env.GEMINI_API_KEY) {
@@ -164,6 +188,9 @@ const envSchema = z
     }
     if (env.CODING_AGENT_PROVIDER === "claude" && !env.ANTHROPIC_API_KEY) {
       ctx.addIssue({ code: "custom", path: ["ANTHROPIC_API_KEY"], message: "required when CODING_AGENT_PROVIDER=claude" });
+    }
+    if ((env.AI_PROVIDER === "omniroute" || env.CODING_AGENT_PROVIDER === "omniroute") && !String(env.OMNIROUTE_BASE_URL || "").trim()) {
+      ctx.addIssue({ code: "custom", path: ["OMNIROUTE_BASE_URL"], message: "required when a provider is omniroute" });
     }
     if (!env.DRY_RUN_NO_PR && !env.GITHUB_TOKEN) {
       ctx.addIssue({ code: "custom", path: ["GITHUB_TOKEN"], message: "required unless DRY_RUN_NO_PR=true" });
@@ -180,7 +207,12 @@ function loadConfig() {
   }
   const env = result.data;
   const codingAgentModel =
-    env.CODING_AGENT_MODEL || (env.CODING_AGENT_PROVIDER === "gemini" ? env.GEMINI_MODEL : env.CLAUDE_MODEL);
+    env.CODING_AGENT_MODEL ||
+    (env.CODING_AGENT_PROVIDER === "gemini"
+      ? env.GEMINI_MODEL
+      : env.CODING_AGENT_PROVIDER === "omniroute"
+        ? env.OMNIROUTE_MODEL
+        : env.CLAUDE_MODEL);
 
   return {
     port: env.PORT,
@@ -193,6 +225,9 @@ function loadConfig() {
     anthropicApiKey: env.ANTHROPIC_API_KEY,
     claudeModel: env.CLAUDE_MODEL,
     codingAgentModel,
+    omnirouteBaseUrl: env.OMNIROUTE_BASE_URL,
+    omnirouteApiKey: env.OMNIROUTE_API_KEY || null,
+    omnirouteModel: env.OMNIROUTE_MODEL,
 
     maxAgentIterations: env.MAX_AGENT_ITERATIONS,
     maxCodeAttempts: env.MAX_CODE_ATTEMPTS,
@@ -201,6 +236,8 @@ function loadConfig() {
     verifyDisableDocker: env.VERIFY_DISABLE_DOCKER,
     verifyInstallTimeoutMs: env.VERIFY_INSTALL_TIMEOUT_MS,
     verifyBuildTimeoutMs: env.VERIFY_BUILD_TIMEOUT_MS,
+    enableHeroFitCheck: env.ENABLE_HERO_FIT_CHECK,
+    enableA11yCheck: env.ENABLE_A11Y_CHECK,
     pageUrlPathTemplate: env.PAGE_URL_PATH_TEMPLATE || null,
     verifyServerTimeoutMs: env.VERIFY_SERVER_TIMEOUT_MS,
 
@@ -233,6 +270,12 @@ function loadConfig() {
     resumeInterruptedRuns: env.RESUME_INTERRUPTED_RUNS,
 
     servicePublicBaseUrl: env.SERVICE_PUBLIC_BASE_URL || `http://localhost:${env.PORT}`,
+
+    pexelsApiKey: env.PEXELS_API_KEY || null,
+    serpApiKey: env.SERPAPI_API_KEY || null,
+    supabaseUrl: env.SUPABASE_URL || null,
+    supabaseServiceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY || null,
+    supabaseStorageBucket: env.SUPABASE_STORAGE_BUCKET,
   };
 }
 

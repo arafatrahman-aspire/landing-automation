@@ -152,13 +152,16 @@ All vars are loaded and validated in `src/config.mjs` at process start. Modules 
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `AI_PROVIDER` | no | `gemini` | One-shot stages: research, guide, static copy (`gemini` \| `claude`) |
-| `CODING_AGENT_PROVIDER` | no | `claude` | Agentic section coding loop |
+| `AI_PROVIDER` | no | `gemini` | One-shot stages: research, guide, static copy (`gemini` \| `claude` \| `omniroute`) |
+| `CODING_AGENT_PROVIDER` | no | `claude` | Agentic section coding loop (`gemini` \| `claude` \| `omniroute`) |
 | `GEMINI_API_KEY` | if either provider is gemini | — | Google AI key |
 | `ANTHROPIC_API_KEY` | if either provider is claude | — | Anthropic key |
 | `GEMINI_MODEL` | no | `gemini-2.5-flash` | Model for Gemini one-shot calls |
 | `CLAUDE_MODEL` | no | `claude-sonnet-5` | Model for Claude one-shot calls |
 | `CODING_AGENT_MODEL` | no | follows coding provider | Override model for the coding agent only |
+| `OMNIROUTE_BASE_URL` | if either provider is omniroute | `http://localhost:20128/v1` | OmniRoute OpenAI-compatible base URL |
+| `OMNIROUTE_API_KEY` | no | unset | Dashboard key if the gateway requires auth |
+| `OMNIROUTE_MODEL` | no | `auto` | Model id OmniRoute should route. **Pin a working id** from the OmniRoute dashboard — `auto` tries free Felo/OpenCode backends that often 400/401 |
 | `SKIP_RESEARCH` | no | off | Skip research LLM call |
 | `REVIEW_PLAN_BEFORE_GENERATING` | no | **on** | Pause for human plan edit before codegen (overridable per campaign via `reviewPlan`) |
 
@@ -189,6 +192,8 @@ All vars are loaded and validated in `src/config.mjs` at process start. Modules 
 | `MAX_AGENT_ITERATIONS` | no | `40` | Max tool-loop turns per section agent |
 | `MAX_CODE_ATTEMPTS` | no | `3` | Verify → regenerate retries |
 | `CONTINUE_ON_VERIFY_FAILURE` | no | off | Stage draft even if verify still fails (dangerous in prod) |
+| `ENABLE_HERO_FIT_CHECK` | no | **true** | Set `false` to skip the hero above-the-fold check entirely (never fails a run) |
+| `ENABLE_A11Y_CHECK` | no | **true** | Set `false` to skip the axe-core accessibility check entirely (never fails a run) |
 
 ### Preview sandboxes
 
@@ -207,6 +212,31 @@ All vars are loaded and validated in `src/config.mjs` at process start. Modules 
 | `KEEP_WORKDIR_ON_FAILURE` | no | off | Keep worktrees after failed runs (debug) |
 | `RESUME_INTERRUPTED_RUNS` | no | **on** | On boot, resume mid-generation runs |
 
+### Campaign images (optional)
+
+Stock photos for campaign pages. **All of these are optional** — if any required piece is missing, research skips images and the campaign still generates (static frames fall back to dummy assets in the target repo).
+
+Search order is **Pexels first**, then **SerpAPI Google Images** if Pexels returns nothing usable. Bytes are downloaded and uploaded to a **public** Supabase Storage bucket; only the public URL is written into campaign source under `src/app/campaigns/{slug}/`. Image binaries are never committed to the target repo.
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `PEXELS_API_KEY` | for photos | — | [Pexels API](https://www.pexels.com/api/) key (`Authorization` header) |
+| `SERPAPI_API_KEY` | fallback | — | [SerpAPI](https://serpapi.com/) key for `engine=google_images` |
+| `SUPABASE_URL` | for photos | — | Project URL, e.g. `https://xxxx.supabase.co` |
+| `SUPABASE_SERVICE_ROLE_KEY` | for photos | — | Service role key (server-side upload only; never expose to the UI) |
+| `SUPABASE_STORAGE_BUCKET` | no | `campaign-images` | Bucket name. Create it in Supabase Storage and set it **public** so `next/image` can fetch the objects |
+
+Setup:
+
+1. Create a Supabase project. In Storage, create bucket `campaign-images` (or your `SUPABASE_STORAGE_BUCKET` value) and mark it **public**.
+2. Set `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` from Project Settings → API.
+3. Set `PEXELS_API_KEY`. Optionally set `SERPAPI_API_KEY` so Google Images can fill gaps.
+4. Restart the API — config is validated at process start.
+
+Copyright: Pexels photos are licensed for free use (attribution appreciated). SerpAPI Google Images results may include copyrighted photos — prefer Pexels hits, and review assigned URLs on the Plan tab before you publish. This service does not clear rights for you.
+
+Slots (one photo each, skipped independently if search/upload fails): `details`, `timeline`, and `hero` only when the brief has no `videoUrl`. Testimonials and instructor sections never receive stock faces.
+
 ### UI
 
 | Variable | Required | Default | Meaning |
@@ -223,7 +253,7 @@ The UI also needs the same `API_SHARED_SECRET` entered in the browser (Authoriza
 
 1. Generate a strong `API_SHARED_SECRET` (≥16 chars; use a long random string).
 2. Set `SERVICE_PUBLIC_BASE_URL` to the **public HTTPS** origin of the API (not localhost). Preview lead forms POST to `{SERVICE_PUBLIC_BASE_URL}/internal/preview-lead-sink`.
-3. Put `GITHUB_TOKEN`, AI keys, and the shared secret in your secret manager — not in git.
+3. Put `GITHUB_TOKEN`, AI keys, and the shared secret in your secret manager — not in git. If campaign photos are enabled, also store `PEXELS_API_KEY`, optional `SERPAPI_API_KEY`, and `SUPABASE_SERVICE_ROLE_KEY` there.
 4. Build the UI with `VITE_API_BASE_URL=https://api.your-domain.example`.
 
 ### B. Process model
@@ -253,7 +283,7 @@ Use a process manager (systemd, PM2, Kubernetes) that:
 - Expose the API only over HTTPS.
 - Require `Authorization: Bearer <API_SHARED_SECRET>` on all campaign routes.
 - The preview lead sink (`POST /internal/preview-lead-sink`) is intentionally **unauthenticated** (called from the previewed page). It is a no-op logger — do not treat it as production lead intake.
-- Restrict egress if your environment requires it: GitHub API, Gemini/Anthropic APIs, and clone URLs must remain reachable.
+- Restrict egress if your environment requires it: GitHub API, Gemini/Anthropic APIs, clone URLs, and (if campaign photos are enabled) Pexels, SerpAPI, and your Supabase project must remain reachable.
 - Preview servers bind to local ports on the API host; put them behind the frameable proxy the service already starts, or firewall them from the public internet.
 
 ### D. Production-safe flags
@@ -290,7 +320,21 @@ Update `GITHUB_BASE_BRANCH`, clear `data/.scratch`, restart.
 
 ### Changing AI vendor/model
 
-Swap `AI_PROVIDER` / `CODING_AGENT_PROVIDER` and keys/models. No code change required. Restart the API.
+Swap `AI_PROVIDER` / `CODING_AGENT_PROVIDER` (`gemini` \| `claude` \| `omniroute`) and keys/models. No code change required. Restart the API.
+
+For OmniRoute, run the gateway locally first (`npx omniroute`, default `http://localhost:20128`), then:
+
+```bash
+AI_PROVIDER=omniroute
+CODING_AGENT_PROVIDER=omniroute
+OMNIROUTE_BASE_URL=http://localhost:20128/v1
+OMNIROUTE_MODEL=auto
+# OMNIROUTE_API_KEY=...   # only if the gateway dashboard issued a key
+```
+
+`auto` is not a reliable default for this pipeline. If research fails with `Felo thread creation failed` / OpenCode `401`, pin `OMNIROUTE_MODEL` to a model that succeeds in the OmniRoute dashboard (or `GET /v1/models`), then restart this API.
+
+Gemini/Claude implementations are unchanged. OmniRoute does not attach Gemini-style web search; research still runs using the routed model.
 
 ### Adding or retuning section types
 

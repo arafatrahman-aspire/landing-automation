@@ -7,6 +7,16 @@ import { chromium } from "playwright";
 const TITLE_MAX = 70;
 const META_DESC_MAX = 200;
 
+// compose-page.mjs wraps every generated section in this attribute — the one
+// reliable boundary between content this campaign generated and the target
+// repo's own shared header/footer, which the page renders inside of but
+// never wrote. A real run's <img> and <h1> checks blamed this campaign for a
+// pre-existing, decorative alt="" on the site's shared footer logo — a bug
+// living outside this campaign's allowlist that no retry could ever fix.
+// <title>/meta/canonical/OG/viewport stay page-wide: those are legitimately
+// document-level, not scoped to any one container.
+const CAMPAIGN_CONTENT_SELECTOR = "[data-campaign-theme]";
+
 /**
  * @param {object} p
  * @param {string} p.url - already-served page URL to check
@@ -16,7 +26,10 @@ export async function checkSeo({ url }) {
   const browser = await chromium.launch();
   try {
     const page = await browser.newPage();
-    await page.goto(url, { waitUntil: "networkidle", timeout: 15_000 });
+    // "networkidle" never resolves on Next.js pages that keep open connections
+    // (analytics, RSC polling, etc.). "load" waits for the load event — DOM +
+    // subresources — which is all SEO tag checks need.
+    await page.goto(url, { waitUntil: "load", timeout: 60_000 });
     const problems = [];
 
     const title = await page.title();
@@ -33,11 +46,11 @@ export async function checkSeo({ url }) {
       problems.push(`meta description is ${metaDesc.length} chars, over the ${META_DESC_MAX}-char recommended max.`);
     }
 
-    const h1Count = await page.locator("h1").count();
+    const h1Count = await page.locator(`${CAMPAIGN_CONTENT_SELECTOR} h1`).count();
     if (h1Count === 0) problems.push("No <h1> found.");
     else if (h1Count > 1) problems.push(`${h1Count} <h1> elements found — should be exactly one.`);
 
-    const images = await page.locator("img").all();
+    const images = await page.locator(`${CAMPAIGN_CONTENT_SELECTOR} img`).all();
     let missingAlt = 0;
     for (const img of images) {
       const alt = await img.getAttribute("alt");

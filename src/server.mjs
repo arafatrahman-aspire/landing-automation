@@ -1,9 +1,11 @@
+import dns from "node:dns";
 import express from "express";
 import cors from "cors";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { rm } from "node:fs/promises";
 import { config } from "./config.mjs";
+import { ensureOmnirouteQueueWait } from "./llm/omniroute.mjs";
 import { validateBrief } from "./schemas/campaign-brief-schema.mjs";
 import * as runStore from "./state/campaign-repository.mjs";
 import * as draftStore from "./staging/draft-versions.mjs";
@@ -12,9 +14,16 @@ import { runCodegen } from "./pipeline/run-campaign-pipeline.mjs";
 import { resumeInterruptedRuns } from "./pipeline/resume-interrupted-runs.mjs";
 import { approveRun, abandonRun, ReviewActionError } from "./pipeline/approve-or-abandon-run.mjs";
 import { getPlan, savePlan, approvePlan, abandonAtPlan, PlanActionError } from "./pipeline/approve-or-edit-plan.mjs";
-import { listSections, refineSection, refinePage, RefineActionError } from "./pipeline/refine-section.mjs";
+import { listSections, refineSection, refinePage, recolorDraft, RefineActionError } from "./pipeline/refine-section.mjs";
 import { removeWorktree } from "./git/clone-and-commit.mjs";
 import { HONEYPOT_FIELD_NAME, PREVIEW_LEAD_SINK_PATH } from "./leadform/contract.mjs";
+import { uploadManualImage, IMAGE_SLOTS, extFromContentType } from "./assets/campaign-images.mjs";
+
+try {
+  dns.setDefaultResultOrder("ipv4first");
+} catch {
+  /* Node < 16 */
+}
 
 const baseDir = path.join(path.resolve(config.workdirRoot), "_base");
 
@@ -98,6 +107,100 @@ app.get("/campaigns/:runId/draft", isAuthorized, async (req, res) => {
   if (!draft) return res.status(404).json({ error: "not_found" });
   res.json(draft);
 });
+
+/* Manual campaign-image upload (review UI).
+ * Content-Type: image/jpeg | image/png | image/webp  (raw binary body).
+ * Replaces the Pexels/SerpAPI image for the given slot, updates
+ * researchNotes, and patches all staged draft files so the new URL is
+ * immediately reflected in the preview without a full regeneration. */
+app.post(
+  "/campaigns/:runId/images/:slot",
+  isAuthorized,
+  express.raw({ type: ["image/jpeg", "image/jpg", "image/png", "image/webp"], limit: "10mb" }),
+  async (req, res) => {
+    const { runId, slot } = req.params;
+    if (!IMAGE_SLOTS.includes(slot)) {
+      return res.status(400).json({ error: "invalid_slot", message: `Slot must be one of: ${IMAGE_SLOTS.join(", ")}` });
+    }
+
+    const run = await runStore.getRun(runId);
+    if (!run) return res.status(404).json({ error: "not_found" });
+
+    const mime = req.headers["content-type"]?.split(";")[0].trim() ?? "";
+    const mimeInfo = extFromContentType(mime);
+    if (!mimeInfo) {
+      return res.status(400).json({ error: "unsupported_type", message: "Supported types: image/jpeg, image/png, image/webp" });
+    }
+
+    if (!config.supabaseUrl || !config.supabaseServiceRoleKey) {
+      return res.status(503).json({ error: "no_storage", message: "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not configured." });
+    }
+
+    const bytes = req.body;
+    if (!Buffer.isBuffer(bytes) || bytes.length < 100) {
+      return res.status(400).json({ error: "empty_body", message: "Request body must be raw image bytes." });
+    }
+
+    let publicUrl;
+    try {
+      publicUrl = await uploadManualImage({
+        bytes,
+        mime: mimeInfo.mime,
+        slug: run.slug ?? runId,
+        slot,
+        supabaseUrl: config.supabaseUrl,
+        supabaseServiceRoleKey: config.supabaseServiceRoleKey,
+        supabaseStorageBucket: config.supabaseStorageBucket,
+      });
+    } catch (err) {
+      console.error(`POST /campaigns/${runId}/images/${slot} — upload error:`, err.message);
+      return res.status(502).json({ error: "upload_failed", message: err.message });
+    }
+
+    // Build the updated image record for this slot.
+    const newImage = {
+      slot,
+      query: "manual-upload",
+      source: "manual",
+      publicUrl,
+      width: 1200,
+      height: 800,
+      alt: `${slot} image`,
+    };
+
+    // Update researchNotes.images — replace existing slot entry or append.
+    const notes = run.researchNotes ?? {};
+    const existingImages = Array.isArray(notes.images) ? notes.images : [];
+    const oldEntry = existingImages.find((img) => img?.slot === slot);
+    const oldUrl = oldEntry?.publicUrl ?? null;
+    const updatedImages = [...existingImages.filter((img) => img?.slot !== slot), newImage];
+    await runStore.updateRun(runId, { researchNotes: { ...notes, images: updatedImages } });
+
+    // Patch staged draft files: replace old URL with new one so the preview
+    // updates without a full regeneration.
+    if (oldUrl && oldUrl !== publicUrl) {
+      try {
+        const draft = await draftStore.getLatestVersion(runId);
+        if (draft) {
+          const patched = draft.files.map((f) => ({
+            ...f,
+            content: f.content.includes(oldUrl) ? f.content.split(oldUrl).join(publicUrl) : f.content,
+          }));
+          const changed = patched.filter((f, i) => f.content !== draft.files[i].content);
+          if (changed.length > 0) {
+            await draftStore.stageNewVersion({ runId, files: patched });
+            console.log(`POST /campaigns/${runId}/images/${slot} — patched ${changed.length} draft file(s) with new URL`);
+          }
+        }
+      } catch (patchErr) {
+        console.warn(`POST /campaigns/${runId}/images/${slot} — draft patch failed (non-fatal): ${patchErr.message}`);
+      }
+    }
+
+    console.log(`POST /campaigns/${runId}/images/${slot} — uploaded ${bytes.length} bytes → ${publicUrl}`);
+    res.json({ ok: true, slot, publicUrl, image: newImage });
+  }
+);
 
 app.get("/campaigns/:runId/preview", isAuthorized, async (req, res) => {
   const p = await preview.getPreview(req.params.runId);
@@ -224,6 +327,20 @@ app.post("/campaigns/:runId/refine-page", isAuthorized, async (req, res) => {
       return res.status(status).json({ error: err.reason, message: err.message });
     }
     res.status(500).json({ error: "refine_failed", message: err.message });
+  }
+});
+
+app.post("/campaigns/:runId/color-scheme", isAuthorized, async (req, res) => {
+  console.log(`POST /campaigns/${req.params.runId}/color-scheme`);
+  try {
+    const result = await recolorDraft(req.params.runId, req.body?.colorScheme);
+    res.json(result);
+  } catch (err) {
+    if (err instanceof RefineActionError) {
+      const status = err.reason === "not_found" ? 404 : err.reason === "wrong_status" ? 409 : err.reason === "verify_failed" ? 422 : 400;
+      return res.status(status).json({ error: err.reason, message: err.message });
+    }
+    res.status(500).json({ error: "recolor_failed", message: err.message });
   }
 });
 
@@ -412,4 +529,7 @@ app.listen(config.port, () => {
   console.log(`campaign-codegen-pr-service listening on :${config.port}`);
   console.log(`Target repo: ${config.github.owner}/${config.github.repo}@${config.github.baseBranch}`);
   console.log(`AI providers: research=${config.aiProvider}  coding-agent=${config.codingAgentProvider}`);
+  if (config.aiProvider === "omniroute" || config.codingAgentProvider === "omniroute") {
+    ensureOmnirouteQueueWait().catch(() => {});
+  }
 });

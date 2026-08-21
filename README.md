@@ -50,8 +50,8 @@ Fill in `.env`:
 | Var | Notes |
 |---|---|
 | `API_SHARED_SECRET` | any long random string — required on every request |
-| `AI_PROVIDER` | `gemini` \| `claude` — for the research/guide/file-manifest stages |
-| `CODING_AGENT_PROVIDER` | `gemini` \| `claude` — for the agentic coding loop. **Independent of `AI_PROVIDER` above** — run research on one provider and coding on the other if you like. Only the API key for whichever provider(s) you actually select are required |
+| `AI_PROVIDER` | `gemini` \| `claude` \| `omniroute` — for the research/guide/file-manifest stages. If `omniroute`, pin `OMNIROUTE_MODEL` to a dashboard model that actually works — `auto` often dies on free Felo/OpenCode (HTTP 400/401) |
+| `CODING_AGENT_PROVIDER` | `gemini` \| `claude` \| `omniroute` — for the agentic coding loop. **Independent of `AI_PROVIDER` above** — run research on one provider and coding on the other if you like. Only the API key for whichever provider(s) you actually select are required (OmniRoute needs the local gateway at `OMNIROUTE_BASE_URL`) |
 | `GITHUB_TOKEN` | a token scoped to the **target** repo only (fine-grained PAT: contents + pull-requests, that one repo). Not required if `DRY_RUN_NO_PR=true` |
 | `GITHUB_TARGET_OWNER` / `GITHUB_TARGET_REPO` / `GITHUB_BASE_BRANCH` | the external repo this service pushes into |
 | `WRITE_PATH_ALLOWLIST` | **set this by hand** after looking at the target repo's real structure, e.g. `app/campaigns/{slug}/,components/campaigns/{slug}/` — deliberately not auto-derived from what the AI discovers |

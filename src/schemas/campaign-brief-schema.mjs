@@ -3,6 +3,26 @@ import { sectionTypeSchema } from "../design-catalog/section-types.mjs";
 
 /* Validates POST /campaigns request bodies (src/server.mjs). */
 
+const hexColor = z
+  .string()
+  .regex(/^#[0-9a-fA-F]{6}$/, "must be a 6-digit hex color like #125B80");
+
+const colorSchemeSchema = z
+  .object({
+    preset: z.enum(["aspire", "custom"]),
+    primary: hexColor.optional(),
+    secondary: hexColor.optional(),
+    accent: hexColor.optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.preset !== "custom") return;
+    for (const key of ["primary", "secondary", "accent"]) {
+      if (!value[key]) {
+        ctx.addIssue({ code: "custom", path: [key], message: "required when colorScheme.preset is custom" });
+      }
+    }
+  });
+
 export const briefSchema = z.object({
   slug: z
     .string()
@@ -71,6 +91,10 @@ export const briefSchema = z.object({
   // B2B/professional courses, off for consumer campaigns. Threaded into the
   // hero's lead-form contract (leadform/contract.mjs).
   requiresJobField: z.boolean().optional().default(false),
+
+  // Palette applied only under src/app/campaigns/{slug}/. Omitted (the default)
+  // is Aspire TSS (#125B80 / #004aad / #ea4b0c). Custom requires all three hex.
+  colorScheme: colorSchemeSchema.optional(),
 });
 
 /** @returns {{ok: true, value: object} | {ok: false, errors: string}} */

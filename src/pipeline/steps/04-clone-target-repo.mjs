@@ -7,6 +7,7 @@ import {
   campaignsParentFromAllowlistTemplate,
   quarantineSiblingCampaigns,
 } from "../../git/quarantine-sibling-campaigns.mjs";
+import { ensureSharedNodeModules } from "../../verify/reuse-base-install.mjs";
 import { logStage } from "./log-helper.mjs";
 
 // A fresh network clone every run is slow and wasteful. Instead, a single
@@ -52,8 +53,23 @@ export async function clone(state) {
       await syncBaseToLatest({
         dir: baseDir,
         branch: config.github.baseBranch,
+        // Use the install budget as a generous ceiling for the fetch — both
+        // are "slow network" operations and 300 s is already configured for
+        // the former. The old implicit 60 s default was too tight on VPS links.
+        timeoutMs: config.verifyInstallTimeoutMs,
         logger: (msg) => logStage(state.runId, `clone: ${msg}`),
       });
+    }
+    const sharedInstall = await ensureSharedNodeModules(baseDir, {
+      timeoutMs: config.verifyInstallTimeoutMs,
+      packageManagerOverride: config.packageManagerOverride,
+      logger: (msg) => logStage(state.runId, msg),
+    });
+    if (sharedInstall.reason === "failed" || sharedInstall.reason === "timed-out") {
+      await logStage(
+        state.runId,
+        `clone: shared _base/node_modules install ${sharedInstall.reason} — this run will install inside the worktree instead`
+      );
     }
   });
 

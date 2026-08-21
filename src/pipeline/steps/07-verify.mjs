@@ -4,6 +4,7 @@ import { runFullVerifySuite } from "../../verify/run-full-verify-suite.mjs";
 import { summarizeVerifyReport } from "../../verify/summarize-report.mjs";
 import { extractFailingFiles, extractAllBlamedFiles } from "../../verify/failing-files.mjs";
 import { isNextEslintToolingMismatch } from "../../verify/build-and-lint.mjs";
+import { campaignsParentFromAllowlistTemplate } from "../../git/quarantine-sibling-campaigns.mjs";
 import { logStage } from "./log-helper.mjs";
 
 export async function verify(state) {
@@ -12,11 +13,16 @@ export async function verify(state) {
     return {};
   }
   await runStore.heartbeat(state.runId, "verify");
-  await logStage(state.runId, "verify: validating the new files (build/lint + hero-fit/seo/a11y, ecosystem-aware)");
+  await logStage(
+    state.runId,
+    `verify: validating the new files (build/lint + hero-fit/seo/a11y). ` +
+      `Reuses _base/node_modules when present and compiles this campaign route only (not the whole site).`
+  );
   const changedPaths = [...state.writtenByAgent];
   const pageUrlPath = config.pageUrlPathTemplate
     ? config.pageUrlPathTemplate.replaceAll("{slug}", state.request.slug)
     : null;
+  const campaignsParent = campaignsParentFromAllowlistTemplate(config.writePathAllowlistTemplates[0] ?? "");
   const result = await runFullVerifySuite({
     workdir: state.workdir,
     installTimeoutMs: config.verifyInstallTimeoutMs,
@@ -26,6 +32,11 @@ export async function verify(state) {
     serverTimeoutMs: config.verifyServerTimeoutMs,
     packageManagerOverride: config.packageManagerOverride,
     disableDocker: config.verifyDisableDocker,
+    logger: (msg) => logStage(state.runId, msg),
+    campaignSlug: state.request.slug,
+    campaignsParent,
+    enableHeroFitCheck: config.enableHeroFitCheck,
+    enableA11yCheck: config.enableA11yCheck,
   });
   const verifyAttempts = state.verifyAttempts + 1;
 

@@ -17,6 +17,7 @@ import { writeGuardedFile } from "../sections/write-guarded-file.mjs";
 import { PREVIEW_LEAD_SINK_PATH } from "../leadform/contract.mjs";
 import { detectTypeScriptStrictness, buildTypeScriptPromptFragment } from "./steps/detect-typescript-strictness.mjs";
 import { generateText, extractJson } from "../llm/generate-text.mjs";
+import { rewritePaletteInSource, resolveColorScheme, isHexColor } from "../theme/campaign-colors.mjs";
 
 /* Per-section refinement (new_plan.md §9.7, module.md Module 4) — THIS is
  * the review step, not a separate approve/edit/reject workflow. Every
@@ -100,12 +101,24 @@ function previewLeadSinkUrl() {
   return `${config.servicePublicBaseUrl}${PREVIEW_LEAD_SINK_PATH}`;
 }
 
+function campaignImagesFrom(run) {
+  return run?.researchNotes?.images ?? [];
+}
+
 async function runSectionAgent({ runId, run, workdir, allowlist, sectionType, summary, filePath, componentName, instructions }) {
   const typescriptFragment = buildTypeScriptPromptFragment(await detectTypeScriptStrictness(workdir));
   const systemPrompt =
     buildSectionAgentSystemPrompt(
       { type: sectionType, summary },
-      { request: run.request, guide: run.guide, filePath, componentName, previewLeadSinkUrl: previewLeadSinkUrl(), typescriptFragment }
+      {
+        request: run.request,
+        guide: run.guide,
+        filePath,
+        componentName,
+        previewLeadSinkUrl: previewLeadSinkUrl(),
+        typescriptFragment,
+        images: campaignImagesFrom(run),
+      }
     ) + (instructions ? `\n\nHUMAN REFINEMENT INSTRUCTIONS — apply these on top of everything above, this is a direct request from the reviewer:\n${instructions}` : "");
 
   const result = await runCodingAgent({
@@ -198,7 +211,7 @@ Return JSON: { "slots": ["section-N", ...] } — only slots that need to change 
 async function finalizeRefine({ runId, run, workdir, allowlistBase, allowlist, newSections, logLabel, removedPaths = [] }) {
   const pageFile = composePage(
     newSections.map((s) => ({ componentName: s.componentName })),
-    { allowlistBase }
+    { allowlistBase, colorScheme: run.request?.colorScheme, request: run.request }
   );
   await writeGuardedFile({ workdir, allowedPrefixes: allowlist, pristineFiles: new Set(), relPath: pageFile.path, content: pageFile.content });
 
@@ -212,6 +225,8 @@ async function finalizeRefine({ runId, run, workdir, allowlistBase, allowlist, n
     serverTimeoutMs: config.verifyServerTimeoutMs,
     packageManagerOverride: config.packageManagerOverride,
     disableDocker: config.verifyDisableDocker,
+    enableHeroFitCheck: config.enableHeroFitCheck,
+    enableA11yCheck: config.enableA11yCheck,
   });
   await runStore.appendLog(runId, "info", `${logLabel}: verify ${verifyResult.ok ? "PASSED" : "FAILED"} — ${verifyResult.report.slice(0, 500)}`);
   if (!verifyResult.ok) {
@@ -270,6 +285,7 @@ export async function refineSection(runId, slot, action, params = {}) {
   const allowlist = resolveAllowlist(config.writePathAllowlistTemplates, run.slug);
   const allowlistBase = allowlist[0];
   const workdir = run.workdir;
+  const frameOpts = { images: campaignImagesFrom(run), colorScheme: run.request?.colorScheme };
 
   let updated;
 
@@ -290,7 +306,7 @@ export async function refineSection(runId, slot, action, params = {}) {
 
     let built;
     try {
-      built = populateFrame({ candidate, overrides: params.data ?? {}, componentName: current.componentName });
+      built = populateFrame({ candidate, overrides: params.data ?? {}, componentName: current.componentName, ...frameOpts });
     } catch (err) {
       throw new RefineActionError("invalid_action", `the submitted copy doesn't fit this layout — ${err.message}`);
     }
@@ -306,7 +322,7 @@ export async function refineSection(runId, slot, action, params = {}) {
       throw new RefineActionError("invalid_action", `"${params.frameId}" is not a valid static candidate for section type "${current.type}"`);
     }
     const carried = candidate.fillableFields ? pickAcceptedFields(candidate, current.data) : {};
-    const { fileContent, dataUsed } = populateFrame({ candidate, overrides: carried, componentName: current.componentName });
+    const { fileContent, dataUsed } = populateFrame({ candidate, overrides: carried, componentName: current.componentName, ...frameOpts });
     await writeGuardedFile({ workdir, allowedPrefixes: allowlist, pristineFiles: new Set(), relPath: current.path, content: fileContent });
     updated = { ...current, frameId: candidate.id, data: dataUsed };
   } else if (action === "modify" || action === "redesign") {
@@ -341,6 +357,7 @@ export async function refineSection(runId, slot, action, params = {}) {
         section: { type: newType, summary },
         request: run.request,
         guide: run.guide,
+        images: frameOpts.images,
         logger: (msg) => runStore.appendLog(runId, "info", `refine: ${msg}`),
       });
       if (!staticOverridesAreUsable(candidate, overrides)) {
@@ -357,7 +374,7 @@ export async function refineSection(runId, slot, action, params = {}) {
         });
         updated = { type: newType, mode: "ai-required", path: newPath, componentName, slot, finished: true };
       } else {
-        const { fileContent, dataUsed } = populateFrame({ candidate, overrides, componentName });
+        const { fileContent, dataUsed } = populateFrame({ candidate, overrides, componentName, ...frameOpts });
         await writeGuardedFile({ workdir, allowedPrefixes: allowlist, pristineFiles: new Set(), relPath: newPath, content: fileContent });
         updated = { type: newType, mode, path: newPath, componentName, slot, frameId: candidate.id, data: dataUsed, finished: true };
       }
@@ -477,4 +494,116 @@ export async function refinePage(runId, { instructions } = {}, deps = {}) {
     logLabel: "refine[page]",
   });
   return { ...result, slots: plan.slots, planSource: plan.source };
+}
+
+function fillableOverridesFrom(candidate, data) {
+  if (!candidate?.fillableFields) return {};
+  const source = candidate.mergeStrategy && Array.isArray(data) ? data[0] : data;
+  return pickAcceptedFields(candidate, source);
+}
+
+function parseSubmittedColorScheme(colorScheme) {
+  if (!colorScheme || typeof colorScheme !== "object") {
+    throw new RefineActionError("invalid_action", "colorScheme is required");
+  }
+  if (colorScheme.preset === "aspire") {
+    return { preset: "aspire" };
+  }
+  if (colorScheme.preset !== "custom") {
+    throw new RefineActionError("invalid_action", 'colorScheme.preset must be "aspire" or "custom"');
+  }
+  for (const key of ["primary", "secondary", "accent"]) {
+    if (!isHexColor(colorScheme[key])) {
+      throw new RefineActionError("invalid_action", `colorScheme.${key} must be a #rrggbb hex color`);
+    }
+  }
+  return {
+    preset: "custom",
+    primary: colorScheme.primary,
+    secondary: colorScheme.secondary,
+    accent: colorScheme.accent,
+  };
+}
+
+/**
+ * Deterministic recolor of an existing staged draft: re-emit static sections
+ * with the new palette (so custom inlines FAQ/CTA), hex-rewrite AI section
+ * files, then verify / stage / refresh preview.
+ *
+ * @param {string} runId
+ * @param {object} colorScheme
+ */
+export async function recolorDraft(runId, colorScheme) {
+  const stored = parseSubmittedColorScheme(colorScheme);
+  const run = await runStore.getRun(runId);
+  if (!run) throw new RefineActionError("not_found", `no such run "${runId}"`);
+  if (run.status !== "staged_for_review") {
+    throw new RefineActionError("wrong_status", `cannot recolor run "${runId}" — status is "${run.status}", not "staged_for_review"`);
+  }
+
+  const fromPalette = resolveColorScheme(run.request?.colorScheme);
+  const toPalette = resolveColorScheme(stored);
+  const allowlist = resolveAllowlist(config.writePathAllowlistTemplates, run.slug);
+  const allowlistBase = allowlist[0];
+  const workdir = run.workdir;
+  const images = campaignImagesFrom(run);
+  const sections = run.sectionResults ?? [];
+
+  const newSections = [];
+  for (const section of sections) {
+    if (section.mode === "static" && section.frameId) {
+      const candidate = getFrameCandidate(section.type, section.frameId);
+      if (candidate?.fillableFields) {
+        const { fileContent, dataUsed } = populateFrame({
+          candidate,
+          overrides: fillableOverridesFrom(candidate, section.data),
+          componentName: section.componentName,
+          images,
+          colorScheme: stored,
+        });
+        await writeGuardedFile({
+          workdir,
+          allowedPrefixes: allowlist,
+          pristineFiles: new Set(),
+          relPath: section.path,
+          content: fileContent,
+        });
+        newSections.push({ ...section, data: dataUsed });
+        continue;
+      }
+    }
+
+    const existing = await readFile(path.join(workdir, section.path), "utf8").catch(() => null);
+    if (existing != null) {
+      const rewritten = rewritePaletteInSource(existing, fromPalette, toPalette);
+      if (rewritten !== existing) {
+        await writeGuardedFile({
+          workdir,
+          allowedPrefixes: allowlist,
+          pristineFiles: new Set(),
+          relPath: section.path,
+          content: rewritten,
+        });
+      }
+    }
+    newSections.push(section);
+  }
+
+  const nextRequest = { ...run.request, colorScheme: stored };
+  await runStore.updateCampaignBrief(runId, nextRequest);
+  await runStore.appendLog(
+    runId,
+    "info",
+    `recolor: ${fromPalette.primary}/${fromPalette.secondary}/${fromPalette.accent} → ${toPalette.primary}/${toPalette.secondary}/${toPalette.accent}`
+  );
+
+  return finalizeRefine({
+    runId,
+    run: { ...run, request: nextRequest },
+    workdir,
+    allowlistBase,
+    allowlist,
+    newSections,
+    logLabel: "recolor",
+  });
 }

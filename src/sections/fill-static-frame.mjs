@@ -1,4 +1,6 @@
 import { LEAD_FORM_HREF, LEAD_FORM_ANCHOR_ID } from "../leadform/contract.mjs";
+import { imageForSlot } from "../assets/campaign-images.mjs";
+import { resolveColorScheme } from "../theme/campaign-colors.mjs";
 
 /* Static section population (new_plan.md §9.4 — Hybrid Section Assembly).
  *
@@ -38,20 +40,53 @@ function defaultMerge(defaultData, overrides) {
   return { ...defaultData, ...overrides };
 }
 
+function jsxString(value) {
+  return JSON.stringify(value ?? "");
+}
+
+/**
+ * Emit a Next.js <Image> that fills a sized container div.
+ * Using `fill` + `object-cover` instead of explicit width/height prevents
+ * the raw Pexels intrinsic dimensions (e.g. 4912x3264) from blowing out
+ * the layout when the image is placed inside a flex/grid column.
+ *
+ * @param {object}  image          - campaign image record (publicUrl, alt, …)
+ * @param {string}  containerClass - Tailwind classes for the wrapper div
+ */
+function remoteImageJsx(
+  image,
+  containerClass = "relative w-full md:w-1/2 aspect-[4/3] rounded-xl overflow-hidden flex-shrink-0"
+) {
+  return (
+    `<div className="${containerClass}">` +
+    `<Image src=${jsxString(image.publicUrl)} alt=${jsxString(image.alt || "illustration")} fill className="object-cover" />` +
+    `</div>`
+  );
+}
+
 /** RiskListWithImageFrame's button is a dead `<Button>` with no href/onClick.
  *  Emitting the stock frame would leave "GET INSTANT ACCESS" unclickable.
  *  Re-implement the layout here with the same data shape, linking the CTA to
  *  the hero lead form (`#regForm` — LEAD_FORM_HREF). */
-function buildRiskListWithWorkingCta(componentName, dataUsed) {
-  return `${USE_CLIENT}import Image from "next/image";
-import DummyImage from "@assets/images/frames/landing/frame-3-image-1.png";
-
+function buildRiskListWithWorkingCta(componentName, dataUsed, { image, palette }) {
+  const imageImport = image
+    ? `import Image from "next/image";\n`
+    : `import Image from "next/image";\nimport DummyImage from "@assets/images/frames/landing/frame-3-image-1.png";\n`;
+  // Dummy image uses a fixed-size wrapper so it also doesn't overflow.
+  // alt must be non-empty — the SEO check flags `alt=""` as missing alt text
+  // even though it's a legitimate "decorative" marker in plain HTML/a11y terms.
+  const dummyEl =
+    `<div className="relative w-full md:w-1/2 aspect-[4/3] rounded-xl overflow-hidden flex-shrink-0">` +
+    `<Image src={DummyImage} alt=${jsxString(dataUsed?.heading || "illustration")} fill className="object-cover" />` +
+    `</div>`;
+  const imageEl = image ? remoteImageJsx(image) : dummyEl;
+  return `${USE_CLIENT}${imageImport}
 const data = ${JSON.stringify(dataUsed, null, 2)};
 
 export default function ${componentName}() {
   return (
     <section className="flex flex-col md:flex-row items-center justify-between gap-8 px-6 md:px-16 lg:px-32 py-16 md:py-20">
-      <Image src={DummyImage} alt="" className="max-w-full h-auto" />
+      ${imageEl}
       <div className="flex flex-col gap-8 max-w-xl">
         <h3 className="text-2xl md:text-3xl font-bold">{data.heading}</h3>
         <ul className="text-lg md:text-xl flex flex-col gap-4">
@@ -64,7 +99,7 @@ export default function ${componentName}() {
         </ul>
         <a
           href="${LEAD_FORM_HREF}"
-          className="inline-flex w-fit items-center justify-center rounded-md bg-[#004aad] px-8 py-4 text-xl font-semibold text-white hover:opacity-90"
+          className="inline-flex w-fit items-center justify-center rounded-md bg-[${palette.secondary}] px-8 py-4 text-xl font-semibold text-white hover:opacity-90"
         >
           {data.buttonText}
         </a>
@@ -77,9 +112,10 @@ export default function ${componentName}() {
 
 /** ProcessExplainerFrame requires `image: StaticImageData` on every item.
  *  JSON defaultData cannot carry a Next image import, so the stock wrapper
- *  (`data={JSON}`) always type-fails. Attach a stock side image at emit time;
- *  fillable copy (title/description/steps) stays campaign-specific. */
-function buildProcessExplainerWithImage(componentName, importPath, dataUsed) {
+ *  (`data={JSON}`) always type-fails. A remote campaign URL also cannot be
+ *  typed as StaticImageData — inline the layout when we have one. Otherwise
+ *  attach a stock side image at emit time; fillable copy stays campaign-specific. */
+function buildProcessExplainerWithImage(componentName, importPath, dataUsed, { image }) {
   const item = Array.isArray(dataUsed) ? dataUsed[0] : dataUsed;
   if (!item || typeof item !== "object") {
     throw new Error("buildProcessExplainerWithImage: expected array/object data");
@@ -89,6 +125,31 @@ function buildProcessExplainerWithImage(componentName, importPath, dataUsed) {
     description: item.description,
     processSteps: item.processSteps,
   };
+
+  if (image) {
+    return `${USE_CLIENT}import Image from "next/image";
+
+const copy = ${JSON.stringify(copy, null, 2)};
+
+export default function ${componentName}() {
+  return (
+    <section className="flex flex-col md:flex-row items-center justify-between gap-8 px-6 md:px-16 lg:px-32 py-16 md:py-20">
+      ${remoteImageJsx(image, "relative w-full md:w-5/12 aspect-[4/3] rounded-xl overflow-hidden flex-shrink-0")}
+      <div className="flex flex-col gap-6 max-w-xl">
+        <h3 className="text-2xl md:text-3xl font-bold">{copy.title}</h3>
+        <p className="text-lg md:text-xl">{copy.description}</p>
+        <ol className="text-lg md:text-xl flex flex-col gap-3 list-decimal list-inside">
+          {copy.processSteps.map((step, index) => (
+            <li key={index}>{step}</li>
+          ))}
+        </ol>
+      </div>
+    </section>
+  );
+}
+`;
+  }
+
   return `${USE_CLIENT}import ProcessExplainerFrame from "${importPath}";
 import SideImage from "@assets/images/frames/landing/frame-4-image-1.png";
 
@@ -100,18 +161,111 @@ export default function ${componentName}() {
 `;
 }
 
+/** Custom palettes cannot recolor shared analyze/ frames. Inline the FAQ
+ *  accordion so hex comes from the campaign scheme. */
+/** Redesigned FAQ layout: a responsive 2-column card grid (1 column on
+ * mobile) instead of a single stacked list, using native <details>/<summary>
+ * for the accordion — free keyboard/ARIA semantics from the browser, no
+ * useState needed. An inline SVG chevron marks open/closed state instead of
+ * a literal glyph: axe's color-contrast rule checks TEXT nodes, and the
+ * accent color is borderline against white at small text sizes (~3.8:1,
+ * under the 4.5:1 normal-text minimum) — a vector path sidesteps that rule
+ * entirely rather than needing a large/bold carve-out.
+ *
+ * Colors are set directly on each element (heading, summary, body text),
+ * never left to inherit from a wrapper: this repo's globals.css fixes
+ * `h1`-`h6` to a dark navy in @layer base, which always wins over an
+ * inherited color regardless of Tailwind's layer order — see
+ * buildCtaSectionInlined below for the real run that failed on exactly this. */
+function buildFaqAccordionInlined(componentName, dataUsed, { palette }) {
+  return `${USE_CLIENT}const data = ${JSON.stringify(dataUsed, null, 2)};
+
+export default function ${componentName}() {
+  return (
+    <section className="px-6 md:px-16 lg:px-32 py-16 md:py-20">
+      <h3 className="text-2xl md:text-3xl font-bold mb-10 text-center" style={{ color: "${palette.primary}" }}>
+        {data.heading}
+      </h3>
+      <div className="grid gap-4 max-w-5xl mx-auto md:grid-cols-2">
+        {data.items.map((item, index) => (
+          <details
+            key={index}
+            className="group rounded-xl border border-gray-200 bg-white px-5 py-4 shadow-sm open:shadow-md transition-shadow duration-200"
+          >
+            <summary className="flex cursor-pointer list-none items-center justify-between gap-4 font-semibold text-gray-900">
+              {item.title}
+              <svg
+                className="h-5 w-5 shrink-0 transition-transform duration-200 group-open:rotate-180"
+                style={{ color: "${palette.accent}" }}
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                strokeWidth={2}
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+              </svg>
+            </summary>
+            <p className="mt-3 text-base text-gray-600">{item.content}</p>
+          </details>
+        ))}
+      </div>
+    </section>
+  );
+}
+`;
+}
+
+/** Reimplements CtaSectionFrame instead of importing it verbatim: its own
+ * baked colors (white text on the accent button, text-green-400 on a dark
+ * background) fail WCAG AA contrast, and custom palettes can't recolor it
+ * anyway. text-xl font-bold on the button is deliberate, not decorative — at
+ * 20px/700-weight it clears WCAG's "large text" 3:1 threshold with the
+ * default Aspire accent (#ea4b0c on white is ~3.8:1, under the 4.5:1 normal-
+ * text minimum but over 3:1 for large/bold text).
+ *
+ * text-white is repeated directly on the <h3>, not left to inherit from the
+ * section: the target repo's own globals.css sets `h3 { color: ... }` in
+ * @layer base, and a directly-targeted rule always wins over an inherited
+ * one regardless of Tailwind's layer order — `text-white` on an ancestor
+ * does nothing for a heading tag. A real run rendered this h3 in the site's
+ * fixed dark navy on this same dark-blue background, failing contrast. */
+function buildCtaSectionInlined(componentName, dataUsed, { palette }) {
+  return `${USE_CLIENT}const data = ${JSON.stringify(dataUsed, null, 2)};
+
+export default function ${componentName}() {
+  return (
+    <section className="px-6 md:px-16 lg:px-32 py-16 md:py-20 text-center text-white bg-[${palette.primary}]">
+      <h3 className="text-2xl md:text-3xl font-bold text-white">{data.headings}</h3>
+      <p className="mt-4 text-lg md:text-xl max-w-3xl mx-auto">{data.contents}</p>
+      <a
+        href="${LEAD_FORM_HREF}"
+        className="inline-flex mt-8 items-center justify-center rounded-md bg-[${palette.accent}] px-8 py-4 text-xl font-bold text-white hover:opacity-90"
+      >
+        {data.btnName}
+      </a>
+      <p className="mt-3 text-sm md:text-base opacity-90">{data.btnDis}</p>
+    </section>
+  );
+}
+`;
+}
+
 /**
  * @param {object} p
  * @param {import("../design-catalog/static-frame-catalog.mjs").frameCatalog[string][number]} p.candidate
  * @param {object} [p.overrides] - guide-produced content for this slot's fillable fields
  * @param {string} p.componentName - PascalCase name for the generated wrapper component
+ * @param {Array} [p.images] - researchNotes.images public URLs
+ * @param {object} [p.colorScheme] - brief.colorScheme (omitted = Aspire)
  * @returns {{ fileContent: string, dataUsed: unknown }}
  */
-export function populateFrame({ candidate, overrides = {}, componentName }) {
+export function populateFrame({ candidate, overrides = {}, componentName, images = [], colorScheme }) {
   if (!candidate) throw new Error("populateFrame: candidate is required");
   if (typeof componentName !== "string" || !PASCAL_CASE.test(componentName)) {
     throw new Error(`populateFrame: componentName must be PascalCase, got ${JSON.stringify(componentName)}`);
   }
+
+  const palette = resolveColorScheme(colorScheme);
 
   let dataUsed = null;
   if (candidate.fillableFields && candidate.defaultData !== undefined) {
@@ -124,16 +278,45 @@ export function populateFrame({ candidate, overrides = {}, componentName }) {
   // that links to the hero lead form. CtaSectionFrame already uses
   // href="#regForm" — once the hero sets id="regForm", that path works.
   if (candidate.id === "risk-list-with-image" && dataUsed) {
-    return { fileContent: buildRiskListWithWorkingCta(componentName, dataUsed), dataUsed };
+    return {
+      fileContent: buildRiskListWithWorkingCta(componentName, dataUsed, {
+        image: imageForSlot(images, "details"),
+        palette,
+      }),
+      dataUsed,
+    };
   }
 
   // Timeline frame requires a StaticImageData `image` field TypeScript cannot
-  // accept from a JSON literal — wire a stock asset in at emit time.
+  // accept from a JSON literal — wire a stock asset (or a remote URL via an
+  // inlined layout) in at emit time.
   if (candidate.id === "process-explainer" && dataUsed) {
     return {
-      fileContent: buildProcessExplainerWithImage(componentName, candidate.importPath, dataUsed),
+      fileContent: buildProcessExplainerWithImage(componentName, candidate.importPath, dataUsed, {
+        image: imageForSlot(images, "timeline"),
+      }),
       dataUsed,
     };
+  }
+
+  // Always inlined (not just for custom themes) — a redesigned 2-column card
+  // grid, requested to replace the raw FaqAccordionFrame's plain stacked
+  // white/checkmark rows. Also sidesteps a real defect in the raw frame's
+  // free-text per-item `bg_color` field: static content authoring picked
+  // "--campaign-primary" (a bare custom-property NAME, not a valid
+  // background value) for it in a real run, which is silently a no-op —
+  // this design has no per-item bg_color at all.
+  if (candidate.id === "faq-accordion" && dataUsed) {
+    return { fileContent: buildFaqAccordionInlined(componentName, dataUsed, { palette }), dataUsed };
+  }
+
+  // Always inlined (not just for custom themes): the raw CtaSectionFrame's
+  // baked colors (white text on its orange button, text-green-400 on its
+  // dark-blue background) are a real WCAG AA contrast failure — a real run's
+  // a11y-lint failed on exactly this, every attempt, because it's baked into
+  // the frame's own markup, not anything a coding agent retry could reach.
+  if (candidate.id === "cta-section" && dataUsed) {
+    return { fileContent: buildCtaSectionInlined(componentName, dataUsed, { palette }), dataUsed };
   }
 
   const fileContent =

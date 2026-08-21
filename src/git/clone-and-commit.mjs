@@ -83,7 +83,7 @@ export async function clearStaleGitLocks(dir) {
   return { removed, active };
 }
 
-export async function syncBaseToLatest({ dir, branch, timeoutMs = 60_000, logger = () => {} }) {
+export async function syncBaseToLatest({ dir, branch, timeoutMs = 180_000, logger = () => {} }) {
   const { removed, active } = await clearStaleGitLocks(dir);
   if (removed.length > 0) {
     logger(`cleared abandoned git lock(s) in the base clone: ${removed.join(", ")} — a previous process was interrupted mid-operation`);

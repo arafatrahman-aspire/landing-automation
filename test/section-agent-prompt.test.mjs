@@ -114,6 +114,29 @@ test("timeline prompt warns that ProcessExplainerFrame items need image", () => 
   assert.match(prompt, /Property 'image' is missing/);
 });
 
+test("section prompt includes assigned public image URLs and forbids dummy imports when provided", () => {
+  const [details] = classifySections([{ type: "details", summary: "Benefits" }], { aiRequiredSections: ["details"] });
+  const prompt = buildSectionAgentSystemPrompt(details, {
+    request: { campaignName: "x", offer: "x", audience: "x", cta: "x" },
+    guide: null,
+    filePath: "app/campaigns/x/sections/DetailsSection1.tsx",
+    componentName: "DetailsSection1",
+    images: [
+      {
+        slot: "details",
+        publicUrl: "https://abc.supabase.co/storage/v1/object/public/campaign-images/x/details-aaa.jpg",
+        width: 800,
+        height: 600,
+        alt: "desk",
+      },
+    ],
+  });
+  assert.match(prompt, /CAMPAIGN IMAGES/);
+  assert.match(prompt, /details-aaa\.jpg/);
+  assert.match(prompt, /do not invent other remote hosts/i);
+  assert.match(prompt, /Do not assign stock photos of people/);
+});
+
 test("the type-strictness rules reach the section prompt when provided", () => {
   const [heroSection] = classifySections([{ type: "hero", summary: "Title, video, lead form" }]);
   const base = {

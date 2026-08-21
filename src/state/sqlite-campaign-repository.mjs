@@ -107,6 +107,19 @@ export async function getRun(runId) {
   return rowToRun(campaignRow, runRow, logTail);
 }
 
+/** Persist a mutated brief (e.g. a recolor after generation). Campaigns.brief_json
+ *  is otherwise immutable after createRun. */
+export async function updateCampaignBrief(runId, request) {
+  const db = getDb();
+  const exists = db.prepare("SELECT 1 FROM campaigns WHERE run_id = ?").get(runId);
+  if (!exists) throw new Error(`updateCampaignBrief: no such run "${runId}"`);
+  db.prepare("UPDATE campaigns SET brief_json = ? WHERE run_id = ?").run(
+    request == null ? null : JSON.stringify(request),
+    runId
+  );
+  return getRun(runId);
+}
+
 export async function updateRun(runId, patch) {
   const db = getDb();
   const exists = db.prepare("SELECT 1 FROM runs WHERE run_id = ?").get(runId);

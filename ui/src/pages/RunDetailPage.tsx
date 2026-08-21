@@ -13,10 +13,12 @@ import {
   getSections,
   refineSection,
   refinePage,
+  recolorCampaign,
   getPlan,
   savePlan,
   approvePlan,
   abandonPlan,
+  uploadCampaignImage,
   type RunSummary,
   type Draft,
   type DraftFile,
@@ -29,6 +31,8 @@ import {
   type Plan,
   type ResearchNotes,
   type CampaignBrief,
+  type ColorScheme,
+  type CampaignImage,
 } from "../api";
 
 // Must stay in sync with src/design-catalog/section-types.mjs's SECTION_TYPES — duplicated
@@ -640,17 +644,106 @@ function BulletList({ items, empty }: { items?: string[] | null; empty?: string 
   );
 }
 
+const IMAGE_SLOT_LABELS: Record<string, string> = {
+  hero: "Hero section",
+  details: "Details section",
+  timeline: "Timeline section",
+};
+
+function AssignedPhotos({
+  runId,
+  images,
+  onImageUploaded,
+}: {
+  runId: string;
+  images: CampaignImage[];
+  onImageUploaded: (slot: string, image: CampaignImage) => void;
+}) {
+  const [uploading, setUploading] = useState<Record<string, boolean>>({});
+  const [uploadErrors, setUploadErrors] = useState<Record<string, string>>({});
+  const fileInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+
+  const SLOTS = ["hero", "details", "timeline"];
+
+  async function handleFileChange(slot: string, e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    // Reset so same file can be re-selected after an error
+    e.target.value = "";
+    setUploadErrors((prev) => ({ ...prev, [slot]: "" }));
+    setUploading((prev) => ({ ...prev, [slot]: true }));
+    try {
+      const result = await uploadCampaignImage(runId, slot, file);
+      onImageUploaded(slot, result.image);
+    } catch (err) {
+      setUploadErrors((prev) => ({ ...prev, [slot]: err instanceof Error ? err.message : "Upload failed" }));
+    } finally {
+      setUploading((prev) => ({ ...prev, [slot]: false }));
+    }
+  }
+
+  return (
+    <ul className="research-photos">
+      {SLOTS.map((slot) => {
+        const img = images.find((i) => i.slot === slot);
+        const isUploading = uploading[slot] ?? false;
+        const error = uploadErrors[slot];
+        return (
+          <li key={slot} className="research-photo">
+            {img ? (
+              <img src={img.publicUrl} alt={img.alt || slot} />
+            ) : (
+              <div className="research-photo-placeholder">
+                <span>{IMAGE_SLOT_LABELS[slot] ?? slot}</span>
+                <span className="empty">No image assigned</span>
+              </div>
+            )}
+            <span className="research-photo-meta">
+              <strong>{IMAGE_SLOT_LABELS[slot] ?? slot}</strong>
+              {img ? ` · ${img.source}` : ""}
+            </span>
+            {error ? <span className="research-photo-error">{error}</span> : null}
+            <input
+              ref={(el) => { fileInputRefs.current[slot] = el; }}
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              style={{ display: "none" }}
+              onChange={(e) => handleFileChange(slot, e)}
+            />
+            <button
+              className="button button-secondary research-photo-upload-btn"
+              disabled={isUploading}
+              onClick={() => fileInputRefs.current[slot]?.click()}
+            >
+              {isUploading ? "Uploading\u2026" : img ? "Replace photo" : "Upload photo"}
+            </button>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
 function hasResearchContent(notes: ResearchNotes | null | undefined): boolean {
   if (!notes) return false;
   return Boolean(
     (notes.keywords && notes.keywords.length) ||
       (notes.painPoints && notes.painPoints.length) ||
       (notes.faqQuestions && notes.faqQuestions.length) ||
-      (notes.notes && notes.notes.trim())
+      (notes.notes && notes.notes.trim()) ||
+      (notes.images && notes.images.length)
   );
 }
 
-function ResearchInsightsCard({ notes }: { notes: ResearchNotes | null | undefined }) {
+function ResearchInsightsCard({
+  notes,
+  runId,
+  onImageUploaded,
+}: {
+  notes: ResearchNotes | null | undefined;
+  runId?: string;
+  onImageUploaded?: (slot: string, image: CampaignImage) => void;
+}) {
   if (!hasResearchContent(notes)) {
     return (
       <div className="section-block card insight-card">
@@ -662,6 +755,15 @@ function ResearchInsightsCard({ notes }: { notes: ResearchNotes | null | undefin
           <p className="empty insight-empty">
             Research appears here after the Research step finishes (or immediately if research was skipped).
           </p>
+          {runId && onImageUploaded ? (
+            <div className="insight-block insight-block-wide" style={{ marginTop: 16 }}>
+              <h4>Campaign photos</h4>
+              <p className="insight-hint">
+                Upload your own images for each section slot. They will be stored and applied to the draft instantly.
+              </p>
+              <AssignedPhotos runId={runId} images={[]} onImageUploaded={onImageUploaded} />
+            </div>
+          ) : null}
         </div>
       </div>
     );
@@ -676,6 +778,7 @@ function ResearchInsightsCard({ notes }: { notes: ResearchNotes | null | undefin
             notes!.keywords?.length ? `${notes!.keywords.length} keywords` : null,
             notes!.painPoints?.length ? `${notes!.painPoints.length} pain points` : null,
             notes!.faqQuestions?.length ? `${notes!.faqQuestions.length} FAQs` : null,
+            notes!.images?.length ? `${notes!.images.length} photos` : null,
           ]
             .filter(Boolean)
             .join(" · ")}
@@ -703,6 +806,21 @@ function ResearchInsightsCard({ notes }: { notes: ResearchNotes | null | undefin
             <p className="insight-notes">{notes!.notes}</p>
           </div>
         ) : null}
+        {runId && onImageUploaded ? (
+          <div className="insight-block insight-block-wide">
+            <h4>Campaign photos</h4>
+            <p className="insight-hint">
+              Stock photos fetched for this campaign. Click "Replace photo" or "Upload photo" to swap any slot with your own image — it uploads to storage and updates the draft instantly.
+            </p>
+            <AssignedPhotos runId={runId} images={notes?.images ?? []} onImageUploaded={onImageUploaded} />
+          </div>
+        ) : notes?.images && notes.images.length > 0 ? (
+          <div className="insight-block insight-block-wide">
+            <h4>Assigned photos</h4>
+            <p className="insight-hint">Stock photos searched for this campaign (Pexels, then Google Images).</p>
+            <AssignedPhotos runId="" images={notes.images} onImageUploaded={() => {}} />
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -720,6 +838,14 @@ function BriefSummaryCard({ brief }: { brief: CampaignBrief | null | undefined }
     { label: "Video", value: brief.videoUrl ? <a href={brief.videoUrl} target="_blank" rel="noreferrer">{brief.videoUrl}</a> : null },
     { label: "Reference page", value: brief.referenceUrl ? <a href={brief.referenceUrl} target="_blank" rel="noreferrer">{brief.referenceUrl}</a> : null },
     { label: "Job title on form", value: brief.requiresJobField ? "Required" : brief.requiresJobField === false ? "Not required" : null },
+    {
+      label: "Colors",
+      value: brief.colorScheme?.preset === "custom"
+        ? `Custom ${brief.colorScheme.primary} / ${brief.colorScheme.secondary} / ${brief.colorScheme.accent}`
+        : brief.colorScheme?.preset === "aspire"
+          ? "Aspire TSS"
+          : null,
+    },
   ].filter((r) => r.value != null && r.value !== "");
 
   return (
@@ -871,7 +997,7 @@ function PlanEditor({
       )}
 
       <BriefSummaryCard brief={brief} />
-      <ResearchInsightsCard notes={researchNotes} />
+      <ResearchInsightsCard notes={researchNotes} runId={runId} onImageUploaded={onChanged} />
 
       <div className="section-block card plan-card">
         <div className="card-header">
@@ -1496,8 +1622,102 @@ function PageAskPanel({ runId, onRefined }: { runId: string; onRefined: () => vo
   );
 }
 
+const ASPIRE_REVIEW_COLORS = { primary: "#125B80", secondary: "#004aad", accent: "#ea4b0c" };
+
+function RecolorPanel({
+  runId,
+  current,
+  onRefined,
+}: {
+  runId: string;
+  current?: ColorScheme | null;
+  onRefined: () => void;
+}) {
+  const [preset, setPreset] = useState<"aspire" | "custom">(current?.preset === "custom" ? "custom" : "aspire");
+  const [primary, setPrimary] = useState(current?.primary ?? ASPIRE_REVIEW_COLORS.primary);
+  const [secondary, setSecondary] = useState(current?.secondary ?? ASPIRE_REVIEW_COLORS.secondary);
+  const [accent, setAccent] = useState(current?.accent ?? ASPIRE_REVIEW_COLORS.accent);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [ok, setOk] = useState<string | null>(null);
+
+  async function submit() {
+    setBusy(true);
+    setError(null);
+    setOk(null);
+    try {
+      const colorScheme: ColorScheme =
+        preset === "custom"
+          ? { preset: "custom", primary, secondary, accent }
+          : { preset: "aspire" };
+      await recolorCampaign(runId, colorScheme);
+      setOk("Colors updated. Preview refreshed.");
+      onRefined();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="page-ask card">
+      <div className="card-header">
+        <h3>Page colors</h3>
+      </div>
+      <div className="card-body">
+        <p className="tab-hint" style={{ marginTop: 0 }}>
+          Swaps the campaign palette in the generated files (no AI). Shared site frames keep Aspire colors unless this
+          campaign already inlined them.
+        </p>
+        <div className="choice-grid">
+          <button type="button" className={`choice-card ${preset === "aspire" ? "active" : ""}`} disabled={busy} onClick={() => setPreset("aspire")}>
+            <strong>Aspire TSS</strong>
+            <span>#125B80 · #004aad · #ea4b0c</span>
+          </button>
+          <button type="button" className={`choice-card ${preset === "custom" ? "active" : ""}`} disabled={busy} onClick={() => setPreset("custom")}>
+            <strong>Custom</strong>
+            <span>Pick three hex colors</span>
+          </button>
+        </div>
+        {preset === "custom" && (
+          <div className="form-row color-pickers">
+            <label>
+              Primary
+              <input type="color" value={primary} onChange={(e) => setPrimary(e.target.value)} disabled={busy} />
+            </label>
+            <label>
+              Secondary
+              <input type="color" value={secondary} onChange={(e) => setSecondary(e.target.value)} disabled={busy} />
+            </label>
+            <label>
+              Accent
+              <input type="color" value={accent} onChange={(e) => setAccent(e.target.value)} disabled={busy} />
+            </label>
+          </div>
+        )}
+        {error && <div className="error">{error}</div>}
+        {ok && !error && <div className="page-ask-success">{ok}</div>}
+        <div className="form-actions">
+          <button type="button" className="button" disabled={busy} onClick={submit}>
+            {busy ? "Updating colors…" : "Apply colors"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /** Gallery of sections + page-level AI ask. Only meaningful during review. */
-function SectionsPanel({ runId, onRefined }: { runId: string; onRefined: () => void }) {
+function SectionsPanel({
+  runId,
+  brief,
+  onRefined,
+}: {
+  runId: string;
+  brief?: CampaignBrief | null;
+  onRefined: () => void;
+}) {
   const [sections, setSections] = useState<SectionSummary[] | null>(null);
   const [openSlot, setOpenSlot] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1524,6 +1744,14 @@ function SectionsPanel({ runId, onRefined }: { runId: string; onRefined: () => v
     <div className="review-tools">
       <PageAskPanel
         runId={runId}
+        onRefined={() => {
+          load();
+          onRefined();
+        }}
+      />
+      <RecolorPanel
+        runId={runId}
+        current={brief?.colorScheme}
         onRefined={() => {
           load();
           onRefined();
@@ -1924,7 +2152,11 @@ export default function RunDetailPage() {
           ) : (
             <>
               <BriefSummaryCard brief={run.request} />
-              <ResearchInsightsCard notes={run.researchNotes} />
+              <ResearchInsightsCard
+                notes={run.researchNotes}
+                runId={run.runId}
+                onImageUploaded={() => refetchRun()}
+              />
 
               {run.verifyChecks && (
                 <div className="section-block card">
@@ -1944,7 +2176,9 @@ export default function RunDetailPage() {
                 </div>
               )}
 
-              {run.status === "staged_for_review" && <SectionsPanel runId={run.runId} onRefined={refetchAfterRefine} />}
+              {run.status === "staged_for_review" && (
+                <SectionsPanel runId={run.runId} brief={run.request} onRefined={refetchAfterRefine} />
+              )}
 
               {run.guide ? (
                 <div className="section-block card">

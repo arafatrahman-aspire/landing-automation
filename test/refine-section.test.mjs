@@ -12,7 +12,7 @@ setTestConfigEnv({ DB_PATH: path.join(mkdtempSync(path.join(tmpdir(), "refine-ac
 
 const runStore = await import("../src/state/campaign-repository.mjs");
 const draftStore = await import("../src/staging/draft-versions.mjs");
-const { listSections, refineSection, RefineActionError } = await import("../src/pipeline/refine-section.mjs");
+const { listSections, refineSection, recolorDraft, RefineActionError } = await import("../src/pipeline/refine-section.mjs");
 
 const SLUG = "test-slug";
 const ALLOWLIST_BASE = `app/campaigns/${SLUG}/`;
@@ -98,8 +98,9 @@ test("refineSection use-different-frame: regenerates a static slot, stages a new
   assert.equal(result.version, 2); // v1 was the initial stage in makeStagedRun
 
   // The refined slot's file now has REAL populateFrame() content, not the placeholder.
+  // faq-accordion is always inlined (the redesigned card grid), not imported.
   const newContent = await readFile(path.join(workdir, faqSlot.path), "utf8");
-  assert.match(newContent, /import FaqAccordionFrame from/);
+  assert.match(newContent, /md:grid-cols-2/);
   assert.doesNotMatch(newContent, /placeholder/);
 
   // The OTHER slot's file is completely untouched.
@@ -111,7 +112,7 @@ test("refineSection use-different-frame: regenerates a static slot, stages a new
   const latest = await draftStore.getLatestVersion(runId);
   assert.equal(latest.version, 2);
   const bySlot = Object.fromEntries(latest.files.map((f) => [f.path, f]));
-  assert.match(bySlot[faqSlot.path].content, /FaqAccordionFrame/);
+  assert.match(bySlot[faqSlot.path].content, /md:grid-cols-2/);
   assert.equal(bySlot[faqSlot.path].sectionSlot, "section-0");
   assert.match(bySlot[ctaSlot.path].content, /placeholder v1/);
 
@@ -190,6 +191,15 @@ test("refineSection use-different-frame rejects an unknown frameId", async (t) =
   await assert.rejects(() => refineSection(runId, "section-0", "use-different-frame", { frameId: "not-a-real-frame" }), (err) => {
     assert.ok(err instanceof RefineActionError);
     assert.equal(err.reason, "invalid_action");
+    return true;
+  });
+});
+
+test("recolorDraft rejects a custom scheme missing hex channels before touching the run", async () => {
+  await assert.rejects(() => recolorDraft("missing-run", { preset: "custom", primary: "#111111" }), (err) => {
+    assert.ok(err instanceof RefineActionError);
+    assert.equal(err.reason, "invalid_action");
+    assert.match(err.message, /hex/i);
     return true;
   });
 });

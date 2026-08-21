@@ -11,11 +11,13 @@ test("passes a clean, labeled, well-contrasted page", { skip }, async (t) => {
 <html lang="en">
 <head><meta charset="utf-8"><title>Spring Sale</title></head>
 <body>
-  <h1>Spring Sale</h1>
-  <form>
-    <label for="email">Email</label>
-    <input id="email" type="email" name="email">
-  </form>
+  <div data-campaign-theme="">
+    <h1>Spring Sale</h1>
+    <form>
+      <label for="email">Email</label>
+      <input id="email" type="email" name="email">
+    </form>
+  </div>
 </body>
 </html>`);
   t.after(server.close);
@@ -24,15 +26,17 @@ test("passes a clean, labeled, well-contrasted page", { skip }, async (t) => {
   assert.equal(result.ok, true);
 });
 
-test("fails and reports a violation for an unlabeled form field", { skip }, async (t) => {
+test("fails and reports a violation for an unlabeled, unnamed form field", { skip }, async (t) => {
   const server = await serveHtml(`<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Spring Sale</title></head>
 <body>
-  <h1>Spring Sale</h1>
-  <form>
-    <input type="email" name="email" placeholder="Email">
-  </form>
+  <div data-campaign-theme="">
+    <h1>Spring Sale</h1>
+    <form>
+      <input type="email">
+    </form>
+  </div>
 </body>
 </html>`);
   t.after(server.close);
@@ -40,4 +44,25 @@ test("fails and reports a violation for an unlabeled form field", { skip }, asyn
   const result = await checkAccessibility({ url: server.url });
   assert.equal(result.ok, false);
   assert.match(result.report, /violations found/i);
+});
+
+test("ignores a violation outside [data-campaign-theme] (the target repo's own header/footer)", { skip }, async (t) => {
+  const server = await serveHtml(`<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Spring Sale</title></head>
+<body>
+  <nav><a href="https://example.com"><img src="x.png"></a></nav>
+  <div data-campaign-theme="">
+    <h1>Spring Sale</h1>
+    <form>
+      <label for="email">Email</label>
+      <input id="email" type="email" name="email">
+    </form>
+  </div>
+</body>
+</html>`);
+  t.after(server.close);
+
+  const result = await checkAccessibility({ url: server.url });
+  assert.equal(result.ok, true);
 });

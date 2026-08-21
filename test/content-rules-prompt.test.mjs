@@ -22,10 +22,14 @@ function brief(extra) {
   return result.value;
 }
 
-test("a brief with no content rules produces nothing at all", () => {
-  // The whole point of the optional fields: an old-style brief must leave the
-  // prompts byte-identical to what they were before this existed.
-  assert.equal(buildContentRulesPromptFragment(brief({})), "");
+test("a brief with no extra content rules still includes the default Aspire COLOR THEME", () => {
+  const fragment = buildContentRulesPromptFragment(brief({}));
+  assert.match(fragment, /COLOR THEME/);
+  assert.match(fragment, /primary: #125B80/);
+  assert.match(fragment, /secondary: #004aad/);
+  assert.match(fragment, /accent\/CTA: #ea4b0c/);
+  assert.doesNotMatch(fragment, /TONE:/);
+  assert.doesNotMatch(fragment, /MUST APPEAR/);
 });
 
 test("tone is expanded into concrete guidance, not passed through as an adjective", () => {
@@ -74,6 +78,16 @@ test("the rules are framed as outranking the model's own judgement", () => {
   const fragment = buildContentRulesPromptFragment(brief({ brandNotes: "Never write 'cheap'." }));
   assert.match(fragment, /outrank your own judgement/);
   assert.match(fragment, /Never write 'cheap'\./);
+});
+
+test("a custom colorScheme reaches the COLOR THEME block instead of Aspire hex", () => {
+  const fragment = buildContentRulesPromptFragment(
+    brief({ colorScheme: { preset: "custom", primary: "#111111", secondary: "#222222", accent: "#333333" } })
+  );
+  assert.match(fragment, /primary: #111111/);
+  assert.match(fragment, /secondary: #222222/);
+  assert.match(fragment, /accent\/CTA: #333333/);
+  assert.doesNotMatch(fragment, /#125B80/);
 });
 
 test("the schema rejects rule lists that are too long or empty-stringed", () => {
