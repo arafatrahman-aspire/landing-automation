@@ -8,6 +8,7 @@ import { config } from "./config.mjs";
 import { ensureOmnirouteQueueWait } from "./llm/omniroute.mjs";
 import { validateBrief } from "./schemas/campaign-brief-schema.mjs";
 import * as runStore from "./state/campaign-repository.mjs";
+import { runEventsSseHandler } from "./state/run-events-sse.mjs";
 import * as draftStore from "./staging/draft-versions.mjs";
 import * as preview from "./preview/preview-server.mjs";
 import { runCodegen } from "./pipeline/run-campaign-pipeline.mjs";
@@ -81,6 +82,10 @@ app.get("/campaigns/:runId/log", isAuthorized, async (req, res) => {
   if (log === null) return res.status(404).json({ error: "not_found" });
   res.type("text/plain").send(log);
 });
+
+// Real-time alternative to polling GET /campaigns/:runId + .../log — see
+// state/run-events-sse.mjs for the event contract.
+app.get("/campaigns/:runId/events", isAuthorized, runEventsSseHandler);
 
 app.get("/campaigns/:runId", isAuthorized, async (req, res) => {
   const run = await runStore.getRun(req.params.runId);

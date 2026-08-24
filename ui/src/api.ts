@@ -213,6 +213,88 @@ export function getRun(runId: string): Promise<RunSummary> {
   return request<RunSummary>(`/campaigns/${runId}`);
 }
 
+export interface RunLogEntry {
+  ts: string;
+  level: string;
+  message: string;
+}
+
+export interface RunEventHandlers {
+  /** Fired once on connect with the full current run + log. */
+  onInit?: (data: { run: RunSummary; log: string }) => void;
+  /** Fired whenever the run record changes (status/stage/etc.). */
+  onRun?: (run: RunSummary) => void;
+  /** Fired once per new log line — append it, don't refetch the whole log. */
+  onLog?: (entry: RunLogEntry) => void;
+  /** Fired if the stream drops or fails to open; the caller decides how to recover. */
+  onError?: (err: unknown) => void;
+}
+
+/**
+ * Opens a real-time event stream for one run (GET /campaigns/:runId/events —
+ * see src/state/run-events-sse.mjs) using `fetch` and a hand-rolled SSE
+ * parser rather than the browser's native `EventSource`: EventSource can't
+ * set the `Authorization` header this API requires on every route, and this
+ * keeps a single auth mechanism instead of adding a second, weaker one
+ * (e.g. a token query param) just for this endpoint.
+ *
+ * Returns a function that closes the stream. Safe to call multiple times.
+ */
+export function watchRunEvents(runId: string, handlers: RunEventHandlers): () => void {
+  const controller = new AbortController();
+
+  (async () => {
+    try {
+      const res = await fetch(`${BASE_URL}/campaigns/${runId}/events`, {
+        headers: { Authorization: `Bearer ${getSecret()}` },
+        signal: controller.signal,
+      });
+      if (res.status === 401) {
+        clearSecret();
+        throw new ApiError("Unauthorized", 401);
+      }
+      if (!res.ok || !res.body) {
+        throw new ApiError(`Failed to open event stream (${res.status})`, res.status);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let sep: number;
+        while ((sep = buffer.indexOf("\n\n")) !== -1) {
+          const rawEvent = buffer.slice(0, sep);
+          buffer = buffer.slice(sep + 2);
+
+          let eventName = "message";
+          const dataLines: string[] = [];
+          for (const line of rawEvent.split("\n")) {
+            if (line.startsWith("event:")) eventName = line.slice(6).trim();
+            else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+            // Anything else (e.g. ": ping" heartbeat comments) is ignored.
+          }
+          if (dataLines.length === 0) continue;
+
+          const data = JSON.parse(dataLines.join("\n"));
+          if (eventName === "init") handlers.onInit?.(data);
+          else if (eventName === "run") handlers.onRun?.(data);
+          else if (eventName === "log") handlers.onLog?.(data);
+        }
+      }
+    } catch (err) {
+      if (controller.signal.aborted) return; // closed on purpose — not an error
+      handlers.onError?.(err);
+    }
+  })();
+
+  return () => controller.abort();
+}
+
 export async function getRunLog(runId: string): Promise<string> {
   const res = await fetch(`${BASE_URL}/campaigns/${runId}/log`, {
     headers: { Authorization: `Bearer ${getSecret()}` },

@@ -19,6 +19,7 @@ import {
   approvePlan,
   abandonPlan,
   uploadCampaignImage,
+  watchRunEvents,
   type RunSummary,
   type Draft,
   type DraftFile,
@@ -1890,6 +1891,15 @@ export default function RunDetailPage() {
   const { runId } = useParams<{ runId: string }>();
   const navigate = useNavigate();
   const [run, setRun] = useState<RunSummary | null>(null);
+  // Mirrors `run` for synchronous reads inside the poll loop below, which
+  // needs the LATEST status to decide whether to keep polling — `run` state
+  // itself can be one render behind at that point, since it's now updated by
+  // the separate real-time event stream, not by that loop.
+  const runRef = useRef<RunSummary | null>(null);
+  function applyRun(next: RunSummary) {
+    runRef.current = next;
+    setRun(next);
+  }
   const [log, setLog] = useState("");
   const [draft, setDraft] = useState<Draft | null>(null);
   const [preview, setPreview] = useState<Preview | null>(null);
@@ -1898,22 +1908,21 @@ export default function RunDetailPage() {
   const [deleting, setDeleting] = useState(false);
   const [tab, setTab] = useState<TabId | null>(null);
 
+  // Run status + log now arrive over a real-time event stream
+  // (GET /campaigns/:runId/events — src/state/run-events-sse.mjs) instead of
+  // being polled. Draft/preview/plan don't publish onto that stream (they
+  // change via separate refine/preview actions), so they're still polled
+  // here, just decoupled from run/log.
   useEffect(() => {
     if (!runId) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
+    runRef.current = null;
 
-    async function poll() {
+    async function pollSideChannels() {
       try {
-        const [runData, logData, draftData, previewData] = await Promise.all([
-          getRun(runId!),
-          getRunLog(runId!),
-          getRunDraft(runId!),
-          getPreview(runId!),
-        ]);
+        const [draftData, previewData] = await Promise.all([getRunDraft(runId!), getPreview(runId!)]);
         if (cancelled) return;
-        setRun(runData);
-        setLog(logData);
         setDraft(draftData);
         setPreview(previewData);
 
@@ -1925,27 +1934,59 @@ export default function RunDetailPage() {
           .catch(() => {});
         // A preview can still be alive well after the run itself finishes
         // (that's the point) — keep polling until both the run AND any
-        // preview are done, not just the run.
-        const runActive = !TERMINAL.has(runData.status);
+        // preview are done, not just the run. runRef, not `run` state, since
+        // this closure doesn't re-run on every run-event.
+        const runActive = !runRef.current || !TERMINAL.has(runRef.current.status);
         const previewActive = previewData?.status === "running";
         if (runActive || previewActive) {
-          timer = setTimeout(poll, 2000);
+          timer = setTimeout(pollSideChannels, 2000);
         }
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
       }
     }
-    poll();
+    pollSideChannels();
+
+    const closeStream = watchRunEvents(runId, {
+      onInit: ({ run: runData, log: logData }) => {
+        if (cancelled) return;
+        applyRun(runData);
+        setLog(logData);
+      },
+      onRun: (runData) => {
+        if (cancelled) return;
+        applyRun(runData);
+      },
+      onLog: (entry) => {
+        if (cancelled) return;
+        setLog((prev) => `${prev}[${entry.ts}] [${entry.level}] ${entry.message}\n`);
+      },
+      onError: (err) => {
+        if (cancelled) return;
+        console.warn("run event stream dropped, falling back to a one-off refresh:", err);
+        // The stream is gone for this effect's lifetime (it doesn't retry
+        // itself) — a single refresh keeps the page from going stale;
+        // reloading is the full recovery path.
+        getRun(runId!)
+          .then((r) => !cancelled && applyRun(r))
+          .catch(() => {});
+        getRunLog(runId!)
+          .then((l) => !cancelled && setLog(l))
+          .catch(() => {});
+      },
+    });
+
     return () => {
       cancelled = true;
       clearTimeout(timer);
+      closeStream();
     };
   }, [runId]);
 
   async function refetchRun() {
     if (!runId) return;
     try {
-      setRun(await getRun(runId));
+      applyRun(await getRun(runId));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -1959,7 +2000,7 @@ export default function RunDetailPage() {
     if (!runId) return;
     try {
       const [runData, draftData, previewData] = await Promise.all([getRun(runId), getRunDraft(runId), getPreview(runId)]);
-      setRun(runData);
+      applyRun(runData);
       setDraft(draftData);
       setPreview(previewData);
     } catch (err) {

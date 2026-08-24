@@ -1,4 +1,5 @@
 import { getDb } from "./database-connection.mjs";
+import { publish } from "./run-events.mjs";
 
 /* SQLite-backed replacement for the old flat-JSON run-store — same function
  * names/signatures as before (createRun, getRun, updateRun, heartbeat,
@@ -141,7 +142,11 @@ export async function updateRun(runId, patch) {
   }
   params.push(runId);
   db.prepare(`UPDATE runs SET ${sets.join(", ")} WHERE run_id = ?`).run(...params);
-  return getRun(runId);
+  const run = await getRun(runId);
+  // Real-time push for state/run-events-sse.mjs — see run-events.mjs's own
+  // doc comment for why an in-process EventEmitter is enough here.
+  publish(runId, { type: "run", run });
+  return run;
 }
 
 /** Per-attempt verify history. A failing run never reaches stage_draft and its
@@ -184,6 +189,9 @@ export async function appendLog(runId, level, message) {
   const now = new Date().toISOString();
   db.prepare("INSERT INTO run_logs (run_id, ts, level, message) VALUES (?, ?, ?, ?)").run(runId, now, level, message);
   db.prepare("UPDATE runs SET updated_at = ? WHERE run_id = ?").run(now, runId);
+  // Incremental push — just the new line, not the whole log — so a long,
+  // chatty run doesn't re-send its entire history on every message.
+  publish(runId, { type: "log", entry: { ts: now, level, message } });
   return getRun(runId);
 }
 
