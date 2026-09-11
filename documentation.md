@@ -13,26 +13,51 @@ phase, as it happens.
 
 ---
 
-## Architecture overview (as of this phase)
+## Architecture overview (as of v0.43 — see `runbook.md` for the full current picture)
+
+> **This section was last accurate around v0.5** (the original linear
+> pipeline, auto-commit on verify pass, no human gate). It's kept here for
+> historical contrast with the rest of this changelog rather than deleted.
+> **[`runbook.md`](runbook.md) is now the canonical, up-to-date architecture
+> reference** — full flow diagrams, the complete env var reference, the HTTP
+> API, the database schema, and a condensed phase-by-phase history. Use this
+> file (`documentation.md`) for the detailed narrative behind any individual
+> version below; use `runbook.md` for "what does the system look like and do
+> right now."
+
+The pipeline as it actually stands today (Hybrid Section Assembly, the plan
+gate, and Phase 7's removal of commit/push/open_pr from the graph itself):
 
 ```
 POST /campaigns (brief)
-   -> intake -> research -> generate_guide -> file_manifest -> clone -> code
-                                                                          |
-                                                                  (retry on failure,
-                                                                   capped)
-                                                                          v
-                                                                       verify
-                                                                          |
-                                                                     pass v
-                                                              commit -> push -> open_pr -> END
+   -> intake -> research -> clone -> generate_guide
+                                          |
+                             (REVIEW_PLAN_BEFORE_GENERATING=true, default)
+                                          v
+                          awaiting_plan_approval  ---- human edits/approves ----+
+                                          |                                     |
+                                          v                                     v
+                                  classify_sections  <-------------------------+
+                                          |
+                                          v
+                                 generate_sections  <---+
+                                          |              | retry (targeted repair,
+                                          v              |  codeAttempts < MAX)
+                                       verify  ----------+
+                                          |
+                                     pass v
+                              stage_draft -> preview_build -> END (staged_for_review)
+                                          |
+                        human: approve ---+--- human: abandon
+                                          |
+                              commit -> push -> open_pr -> completed
 ```
 
-This is still the **original linear pipeline** — it auto-commits/pushes/opens
-a PR the moment `verify` passes, with no human review gate yet. That gate
-(the whole point of `new_plan.md`) arrives in Phase 6. Until then, every
-phase stays a complete, runnable, PR-producing demo — new capabilities get
-added *alongside* this flow before the flow itself is restructured.
+Commit/push/open_pr are **not graph nodes** — they only ever run from a
+separate, later HTTP request (`POST /campaigns/:runId/approve`) after a
+human reviews the live preview. See `runbook.md` §4 for the annotated
+Mermaid version of this diagram and §10.3 for the most recent addition
+(real-time run updates over Server-Sent Events, v0.43).
 
 Two processes make up the system:
 - **`src/`** — the Express + LangGraph orchestrator service (`npm start`,
@@ -2965,3 +2990,69 @@ ai-required coding-agent section instead of shipping canned cyber copy.
 `static-section-data.md`, `test/generate-static-content.test.mjs`,
 `test/classify-sections.test.mjs`, `test/approve-or-edit-plan.test.mjs`,
 `test/describe-fillable-fields.test.mjs`.
+
+### v0.43 — Feature — 2026-08-24 — Real-time run updates over Server-Sent Events
+
+The UI polled `GET /campaigns/:runId` and `.../log` every 2 seconds for a
+run's entire lifetime — correct, but a fixed delay between something
+happening and a reviewer seeing it, and steadily growing request volume the
+longer a run (or an open tab watching one) lives.
+
+**Added `GET /campaigns/:runId/events`** (`src/state/run-events-sse.mjs`), a
+Server-Sent Events stream: one `init` event with the full current run + log
+on connect, then incremental `run` events (full record, on any status/stage
+change) and `log` events (one new line, not the whole log — so a long,
+chatty run doesn't resend its history on every message).
+
+**Wiring, deliberately minimal-surface:** `src/state/run-events.mjs` is a
+small in-process pub/sub (`node:events`' `EventEmitter`, keyed by `runId`) —
+matching this service's existing single-always-on-process design (no
+checkpointer, no cross-process resume; see `sqlite-campaign-repository.mjs`'s
+own `reconcileCrashedRuns` doc comment). `publish()` never throws even if a
+listener does, so a broken SSE write can never take down a state-persisting
+write. `sqlite-campaign-repository.mjs`'s `updateRun()`/`appendLog()` each
+gained one `publish()` call, with **zero changes to their signatures or
+return values** — every one of their ~30 existing call sites across the
+codebase needed no changes at all. `server.mjs` gained two lines mounting
+the route behind the same Bearer auth as every other route.
+
+**Why not the browser's native `EventSource`:** it can't send the
+`Authorization` header this API requires on every route. Rather than add a
+second, weaker auth path (a token query parameter) just for this one
+endpoint, `ui/src/api.ts`'s new `watchRunEvents()` opens the stream with
+`fetch` and a hand-rolled SSE parser instead, keeping one auth mechanism for
+the whole API. `ui/src/pages/RunDetailPage.tsx` now gets run/log in real
+time from this stream; draft/preview/plan aren't published onto it (they
+change via separate refine/preview actions, not run-status updates) and
+stay on the existing 2s poll, just decoupled from run/log.
+
+**Verification:** 2 new test files — 5 tests for the pub/sub module, 3 for
+the real HTTP SSE endpoint (mounted exactly as `server.mjs` mounts it,
+exercised over a real HTTP server with real `fetch`). Caught and fixed a
+real bug while writing them: holding a stream reader across multiple manual
+`.next()` calls without releasing it deadlocked cleanup with `ReadableStream
+is locked`. Full suite re-run afterward: 421 tests, 415 pass — the same 4
+pre-existing failures present on an unmodified checkout (confirmed via `git
+stash` + re-run), zero new failures. `ui`: `npm run build` (tsc + vite)
+clean. Live smoke test: booted the real server against a scratch env/DB,
+created a real run through the real `POST /campaigns` → LangGraph pipeline
+(which failed fast on a deliberately-fake API key — a real status
+transition, not a mock), and streamed the endpoint live — confirmed `init`,
+`log`, and `run` events all arrived correctly through the actual production
+code path, not just the isolated test harness.
+
+Also produced this session: [`runbook.md`](runbook.md) (new) — a
+comprehensive, current-as-of-today architecture and operations reference
+(env var reference, full HTTP API, DB schema, setup-to-run guide, flow
+diagrams, condensed phase history) intended to supersede this file's stale
+top-of-file architecture summary (now corrected to point here) as the
+first thing a new developer reads. `.env.example` was also brought back
+into exact sync with `src/config.mjs` (it was missing
+`REVIEW_PLAN_BEFORE_GENERATING`, `SERVICE_PUBLIC_BASE_URL`, and the entire
+campaign-imagery block).
+
+**Files touched:** `src/state/run-events.mjs` (new),
+`src/state/run-events-sse.mjs` (new), `src/state/sqlite-campaign-repository.mjs`,
+`src/server.mjs`, `ui/src/api.ts`, `ui/src/pages/RunDetailPage.tsx`,
+`test/run-events.test.mjs` (new), `test/run-events-sse.test.mjs` (new),
+`.env.example`, `runbook.md` (new), this file.

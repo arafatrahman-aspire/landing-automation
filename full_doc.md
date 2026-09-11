@@ -2,19 +2,6 @@
 
 Everything a new developer needs to understand, run, debug, and extend this
 project, starting from zero knowledge.
-
-**Related docs and when to read them instead of this one:**
-
-| File | What it's for |
-|---|---|
-| `full_doc.md` (this file) | The single onboarding + reference doc. Start here. |
-| `codeflow.md` | A guided walk through the code in execution order. Read after §4. |
-| `documentation.md` | Versioned changelog (v0.1 → v0.27). Read to learn *why* something changed. |
-| `new_plan.md` | The original architecture plan and phase table. |
-| `module.md` | Day-by-day module breakdown of remaining work. |
-| `README.md` | Short quickstart. |
-| `workflow.md` | ⚠️ Partly stale — still describes the pre-v0.16 pipeline. |
-
 ---
 
 ## Table of contents
