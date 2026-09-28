@@ -2,13 +2,18 @@ import { createHash } from "node:crypto";
 import dns from "node:dns";
 import http from "node:http";
 import https from "node:https";
+import { FallbackImageGenerator } from "./image-gen/fallback-generator.mjs";
+import { buildGenerationPrompt } from "./image-gen/prompt.mjs";
+import { GENERATED_IMAGE_HEIGHT, GENERATED_IMAGE_WIDTH } from "./image-gen/ports.mjs";
 
-/* Campaign stock photos: Pexels first, SerpAPI Google Images fallback, then
- * upload bytes to Supabase Storage and return the public URL.
+/* Campaign images: AI generation first (Cloudflare / Nano Banana / Leonardo /
+ * PromptGone / Journey, ordered by IMAGE_GENERATOR_ORDER), then Pexels, then
+ * SerpAPI Google Images. Bytes upload to Supabase Storage; only the public
+ * URL is returned.
  *
- * Missing API keys skip images and log; the campaign still generates.
- * Binaries are NEVER written into the target repo (WRITE_PATH_ALLOWLIST is
- * campaign source only). */
+ * Missing API keys skip that provider / skip images entirely and log; the
+ * campaign still generates. Binaries are NEVER written into the target repo
+ * (WRITE_PATH_ALLOWLIST is campaign source only). */
 
 // Pexels sits behind Cloudflare. Popular one-word searches are cached and
 // return in <1s (cf-cache-status: HIT). Unique phrases — campaign titles,
@@ -125,10 +130,22 @@ export function buildImageQueries({ campaignName, offer, keywords = [], imageQue
   return candidates.slice(0, 8);
 }
 
-export function isImageSearchConfigured({ pexelsApiKey, serpApiKey, supabaseUrl, supabaseServiceRoleKey }) {
-  const hasSearch = Boolean(pexelsApiKey || serpApiKey);
+export function isImagePipelineConfigured({
+  pexelsApiKey,
+  serpApiKey,
+  supabaseUrl,
+  supabaseServiceRoleKey,
+  imageGenerator,
+}) {
   const hasStore = Boolean(supabaseUrl && supabaseServiceRoleKey);
-  return hasSearch && hasStore;
+  const hasSearch = Boolean(pexelsApiKey || serpApiKey);
+  const hasGen = Boolean(imageGenerator?.configured);
+  return hasStore && (hasSearch || hasGen);
+}
+
+/** @deprecated use isImagePipelineConfigured */
+export function isImageSearchConfigured(creds) {
+  return isImagePipelineConfigured(creds);
 }
 
 function abortSignal(ms) {
@@ -357,17 +374,25 @@ async function uploadToSupabase({
   const hash = createHash("sha256").update(bytes).digest("hex").slice(0, 12);
   const objectPath = `${slug}/${slot}-${hash}.${ext}`;
   const endpoint = `${String(supabaseUrl).replace(/\/+$/, "")}/storage/v1/object/${supabaseStorageBucket}/${objectPath}`;
-  const res = await fetchImpl(endpoint, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${supabaseServiceRoleKey}`,
-      apikey: supabaseServiceRoleKey,
-      "Content-Type": mime,
-      "x-upsert": "true",
-    },
-    body: bytes,
-    signal: abortSignal(DOWNLOAD_TIMEOUT_MS),
-  });
+  let res;
+  try {
+    res = await fetchImpl(endpoint, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${supabaseServiceRoleKey}`,
+        apikey: supabaseServiceRoleKey,
+        "Content-Type": mime,
+        "x-upsert": "true",
+      },
+      body: bytes,
+      signal: abortSignal(DOWNLOAD_TIMEOUT_MS),
+    });
+  } catch (err) {
+    if ([err?.code, err?.cause?.code].some((code) => code === "ENOTFOUND" || code === "EAI_AGAIN")) {
+      throw new Error(`Cannot resolve the image storage host (${new URL(supabaseUrl).hostname}). Check SUPABASE_URL and its matching SUPABASE_SERVICE_ROLE_KEY in the landing .env, then restart the backend.`, { cause: err });
+    }
+    throw err;
+  }
   if (!res.ok && res.status !== 409) {
     const detail = await res.text().catch(() => "");
     throw new Error(`supabase upload ${res.status}${detail ? `: ${detail.slice(0, 180)}` : ""}`);
@@ -402,8 +427,45 @@ async function searchOnePhoto(query, { pexelsApiKey, serpApiKey, fetchImpl, logg
   return null;
 }
 
+function resolveImageGenerator({ imageGenerator, imageGenEnv, fetchImpl, logger }) {
+  if (imageGenerator) return imageGenerator;
+  if (!imageGenEnv) return null;
+  return new FallbackImageGenerator({ env: imageGenEnv, fetchImpl, logger });
+}
+
+async function uploadAssigned({
+  bytes,
+  mime,
+  ext,
+  slug,
+  slot,
+  supabaseUrl,
+  supabaseServiceRoleKey,
+  supabaseStorageBucket,
+  fetchImpl,
+  query,
+  source,
+  width,
+  height,
+  alt,
+}) {
+  const publicUrl = await uploadToSupabase({
+    bytes,
+    mime,
+    ext,
+    slug,
+    slot,
+    supabaseUrl,
+    supabaseServiceRoleKey,
+    supabaseStorageBucket,
+    fetchImpl,
+  });
+  return { slot, query, source, publicUrl, width, height, alt };
+}
+
 /**
- * Assign at most one photo per slot. Hero is skipped when a videoUrl is set.
+ * Assign at most one photo per slot. Tries AI generation first, then stock
+ * search (Pexels → SerpAPI). Hero is skipped when a videoUrl is set.
  * Failures skip that slot; they never abort the campaign.
  *
  * @returns {Promise<Array<{ slot: string, query: string, source: string, publicUrl: string, width: number, height: number, alt: string }>>}
@@ -412,20 +474,25 @@ export async function assignCampaignImages({
   slug,
   campaignName,
   offer,
+  audience = "",
   videoUrl,
   keywords = [],
   imageQueries = null,   // { hero: string[], details: string[], timeline: string[] } from research LLM
+  imagePrompts = null,   // { hero, details, timeline } generation prompts from research LLM
   pexelsApiKey,
   serpApiKey,
   supabaseUrl,
   supabaseServiceRoleKey,
   supabaseStorageBucket = "campaign-images",
+  imageGenEnv = null,
+  imageGenerator = null,
   logger = () => {},
   fetchImpl = ipv4Fetch,
 }) {
-  const creds = { pexelsApiKey, serpApiKey, supabaseUrl, supabaseServiceRoleKey };
-  if (!isImageSearchConfigured(creds)) {
-    logger("campaign images: skipped (PEXELS_API_KEY / SERPAPI_API_KEY / SUPABASE_* not configured)");
+  const generator = resolveImageGenerator({ imageGenerator, imageGenEnv, fetchImpl, logger });
+  const creds = { pexelsApiKey, serpApiKey, supabaseUrl, supabaseServiceRoleKey, imageGenerator: generator };
+  if (!isImagePipelineConfigured(creds)) {
+    logger("campaign images: skipped (no image generator / PEXELS_API_KEY / SERPAPI_API_KEY, or SUPABASE_* not configured)");
     return [];
   }
 
@@ -438,6 +505,42 @@ export async function assignCampaignImages({
   const usedKeys = new Set();
 
   for (const slot of slots) {
+    const genPrompt = buildGenerationPrompt({
+      slot,
+      campaignName,
+      offer,
+      audience,
+      imagePrompts,
+      imageQueries,
+    });
+
+    if (generator?.configured) {
+      try {
+        const generated = await generator.generate(genPrompt);
+        assigned.push(
+          await uploadAssigned({
+            bytes: generated.bytes,
+            mime: generated.mime,
+            ext: generated.ext,
+            slug,
+            slot,
+            supabaseUrl,
+            supabaseServiceRoleKey,
+            supabaseStorageBucket,
+            fetchImpl,
+            query: genPrompt,
+            source: generated.provider,
+            width: GENERATED_IMAGE_WIDTH,
+            height: GENERATED_IMAGE_HEIGHT,
+            alt: String(imageQueries?.[slot]?.[0] || campaignName || slot).slice(0, 160),
+          })
+        );
+        continue;
+      } catch (err) {
+        logger(`campaign images: generation failed for slot "${slot}" (${err.message}) — trying stock search`);
+      }
+    }
+
     const queries = buildImageQueries({ campaignName, offer, keywords, imageQueries, slot });
     let found = null;
     for (const query of queries) {
@@ -454,28 +557,25 @@ export async function assignCampaignImages({
         logger(`campaign images: download failed for slot "${slot}"`);
         continue;
       }
-      const publicUrl = await uploadToSupabase({
-        bytes: downloaded.bytes,
-        mime: downloaded.mime,
-        ext: downloaded.ext,
-        slug,
-        slot,
-        supabaseUrl,
-        supabaseServiceRoleKey,
-        supabaseStorageBucket,
-        fetchImpl,
-      });
-      // Mark the photo as used so subsequent slots can't pick the same one.
       usedKeys.add(found.key ?? found.url);
-      assigned.push({
-        slot,
-        query: found.query,
-        source: found.source,
-        publicUrl,
-        width: found.width,
-        height: found.height,
-        alt: found.alt,
-      });
+      assigned.push(
+        await uploadAssigned({
+          bytes: downloaded.bytes,
+          mime: downloaded.mime,
+          ext: downloaded.ext,
+          slug,
+          slot,
+          supabaseUrl,
+          supabaseServiceRoleKey,
+          supabaseStorageBucket,
+          fetchImpl,
+          query: found.query,
+          source: found.source,
+          width: found.width,
+          height: found.height,
+          alt: found.alt,
+        })
+      );
     } catch (err) {
       logger(`campaign images: upload failed for slot "${slot}" (${err.message})`);
     }

@@ -1,6 +1,6 @@
 import dns from "node:dns";
 import express from "express";
-import cors from "cors";
+import { createSessionAuth, readAuthConfig } from "./auth/session.mjs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { rm } from "node:fs/promises";
@@ -29,9 +29,6 @@ try {
 const baseDir = path.join(path.resolve(config.workdirRoot), "_base");
 
 const app = express();
-// The UI (Vite dev server on a different origin) needs to send the
-// Authorization header cross-origin — reflect the origin, allow that header.
-app.use(cors({ origin: true, allowedHeaders: ["Content-Type", "Authorization"] }));
 app.use(express.json());
 
 app.use((req, _res, next) => {
@@ -39,26 +36,30 @@ app.use((req, _res, next) => {
   next();
 });
 
-function isAuthorized(req, res, next) {
-  const header = req.headers.authorization ?? "";
-  if (header !== `Bearer ${config.apiSharedSecret}`) {
-    console.warn(`${new Date().toISOString()} AUTH FAILED from ${req.ip}`);
-    return res.status(401).json({ error: "unauthorized" });
+const authConfig = readAuthConfig();
+// Share the validated, isolated preview hostname with preview subprocess helpers.
+process.env.PREVIEW_PUBLIC_HOST = authConfig.previewHost;
+const auth = createSessionAuth(authConfig);
+app.use("/auth", auth.router);
+// All campaign routes are centrally protected, including future additions.
+app.use("/campaigns", auth.requireSession, (req, res, next) => {
+  if (!["GET", "HEAD", "OPTIONS"].includes(req.method)) {
+    res.on("finish", () => console.log(JSON.stringify({ event: "campaign_action", userId: req.user.id, method: req.method, path: req.baseUrl + req.path, status: res.statusCode })));
   }
   next();
-}
+});
 
 app.get("/healthz", (_req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/campaigns", isAuthorized, async (_req, res) => {
+app.get("/campaigns", async (_req, res) => {
   const runs = await runStore.listRuns();
   runs.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
   res.json(runs);
 });
 
-app.post("/campaigns", isAuthorized, async (req, res) => {
+app.post("/campaigns", async (req, res) => {
   const result = validateBrief(req.body);
   if (!result.ok) {
     console.log(`POST /campaigns — validation failed: ${result.errors}`);
@@ -77,7 +78,7 @@ app.post("/campaigns", isAuthorized, async (req, res) => {
   res.status(202).json({ runId, status: "queued", statusUrl: `/campaigns/${runId}` });
 });
 
-app.get("/campaigns/:runId/log", isAuthorized, async (req, res) => {
+app.get("/campaigns/:runId/log", async (req, res) => {
   const log = await runStore.getFullLog(req.params.runId);
   if (log === null) return res.status(404).json({ error: "not_found" });
   res.type("text/plain").send(log);
@@ -85,9 +86,9 @@ app.get("/campaigns/:runId/log", isAuthorized, async (req, res) => {
 
 // Real-time alternative to polling GET /campaigns/:runId + .../log — see
 // state/run-events-sse.mjs for the event contract.
-app.get("/campaigns/:runId/events", isAuthorized, runEventsSseHandler);
+app.get("/campaigns/:runId/events", runEventsSseHandler);
 
-app.get("/campaigns/:runId", isAuthorized, async (req, res) => {
+app.get("/campaigns/:runId", async (req, res) => {
   const run = await runStore.getRun(req.params.runId);
   if (!run) return res.status(404).json({ error: "not_found" });
   res.json(run);
@@ -98,7 +99,7 @@ app.get("/campaigns/:runId", isAuthorized, async (req, res) => {
  * and retyping every field was the sharpest daily friction in the old flow.
  * Deliberately returns the brief ALONE rather than reusing GET /campaigns/:runId
  * — duplicating pulls in nothing about the previous run's outcome. */
-app.get("/campaigns/:runId/brief", isAuthorized, async (req, res) => {
+app.get("/campaigns/:runId/brief", async (req, res) => {
   const run = await runStore.getRun(req.params.runId);
   if (!run?.request) return res.status(404).json({ error: "not_found" });
   // The slug is unique per campaign page: handing back the old one would
@@ -107,10 +108,11 @@ app.get("/campaigns/:runId/brief", isAuthorized, async (req, res) => {
   res.json(reusable);
 });
 
-app.get("/campaigns/:runId/draft", isAuthorized, async (req, res) => {
+app.get("/campaigns/:runId/draft", async (req, res) => {
   const draft = await draftStore.getLatestVersion(req.params.runId);
-  if (!draft) return res.status(404).json({ error: "not_found" });
-  res.json(draft);
+  if (!draft && !(await runStore.getRun(req.params.runId))) return res.status(404).json({ error: "not_found" });
+  // An existing run can legitimately have no draft yet.
+  res.json(draft ?? null);
 });
 
 /* Manual campaign-image upload (review UI).
@@ -120,7 +122,6 @@ app.get("/campaigns/:runId/draft", isAuthorized, async (req, res) => {
  * immediately reflected in the preview without a full regeneration. */
 app.post(
   "/campaigns/:runId/images/:slot",
-  isAuthorized,
   express.raw({ type: ["image/jpeg", "image/jpg", "image/png", "image/webp"], limit: "10mb" }),
   async (req, res) => {
     const { runId, slot } = req.params;
@@ -207,17 +208,18 @@ app.post(
   }
 );
 
-app.get("/campaigns/:runId/preview", isAuthorized, async (req, res) => {
+app.get("/campaigns/:runId/preview", async (req, res) => {
   const p = await preview.getPreview(req.params.runId);
-  if (!p) return res.status(404).json({ error: "not_found" });
-  res.json(p);
+  if (!p && !(await runStore.getRun(req.params.runId))) return res.status(404).json({ error: "not_found" });
+  // Absent/expired previews are normal, rather than missing campaigns.
+  res.json(p ?? null);
 });
 
 // Phase 8 (new_plan.md §4.8/§6) — where every generated hero's lead form
 // POSTs in preview mode (leadform/contract.mjs's prompt fragment tells the
 // coding agent to target this exact URL). Deliberately NO auth — it's
 // called from a browser rendering the previewed page, which has no access
-// to API_SHARED_SECRET — and deliberately a no-op: logs the submission and
+// to the application session — and deliberately a no-op: logs the submission and
 // returns success, never delivers anywhere. Real delivery to the parent
 // platform's lead-intake pipeline is a separate, external dependency, not
 // built here (new_plan.md §4.8).
@@ -238,7 +240,7 @@ app.post(PREVIEW_LEAD_SINK_PATH, async (req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/campaigns/:runId/preview/stop", isAuthorized, async (req, res) => {
+app.post("/campaigns/:runId/preview/stop", async (req, res) => {
   const result = await preview.stopPreview({ runId: req.params.runId, baseDir });
   if (!result.ok) return res.status(404).json({ error: "not_found" });
   res.status(204).send();
@@ -247,7 +249,7 @@ app.post("/campaigns/:runId/preview/stop", isAuthorized, async (req, res) => {
 /* Restart a preview after it expired or was stopped. Available once a draft
  * has been staged and the scratch worktree is still on disk (approve/abandon
  * remove it). Auto-start at the end of a run is unchanged. */
-app.post("/campaigns/:runId/preview/start", isAuthorized, async (req, res) => {
+app.post("/campaigns/:runId/preview/start", async (req, res) => {
   const run = await runStore.getRun(req.params.runId);
   if (!run) return res.status(404).json({ error: "not_found" });
   if (run.status !== "staged_for_review") {
@@ -291,7 +293,7 @@ app.post("/campaigns/:runId/preview/start", isAuthorized, async (req, res) => {
 
 // Phase 9 / module.md Module 4 (new_plan.md §9.7) — per-section refinement
 // IS the review step: no separate raw-file editor, just these two routes.
-app.get("/campaigns/:runId/sections", isAuthorized, async (req, res) => {
+app.get("/campaigns/:runId/sections", async (req, res) => {
   try {
     const sections = await listSections(req.params.runId);
     res.json(sections);
@@ -303,7 +305,7 @@ app.get("/campaigns/:runId/sections", isAuthorized, async (req, res) => {
   }
 });
 
-app.post("/campaigns/:runId/sections/:slot/refine", isAuthorized, async (req, res) => {
+app.post("/campaigns/:runId/sections/:slot/refine", async (req, res) => {
   const { action, ...params } = req.body ?? {};
   console.log(`POST /campaigns/${req.params.runId}/sections/${req.params.slot}/refine — action=${action}`);
   try {
@@ -320,7 +322,7 @@ app.post("/campaigns/:runId/sections/:slot/refine", isAuthorized, async (req, re
 
 // Page-level AI edit — one plain-language request can rewrite several sections,
 // then verify / stage / refresh preview once (marketing review loop).
-app.post("/campaigns/:runId/refine-page", isAuthorized, async (req, res) => {
+app.post("/campaigns/:runId/refine-page", async (req, res) => {
   const instructions = req.body?.instructions;
   console.log(`POST /campaigns/${req.params.runId}/refine-page — ${(instructions ?? "").slice(0, 80)}`);
   try {
@@ -335,7 +337,7 @@ app.post("/campaigns/:runId/refine-page", isAuthorized, async (req, res) => {
   }
 });
 
-app.post("/campaigns/:runId/color-scheme", isAuthorized, async (req, res) => {
+app.post("/campaigns/:runId/color-scheme", async (req, res) => {
   console.log(`POST /campaigns/${req.params.runId}/color-scheme`);
   try {
     const result = await recolorDraft(req.params.runId, req.body?.colorScheme);
@@ -362,7 +364,7 @@ function handlePlanError(err, res, fallback) {
   res.status(500).json({ error: fallback, message: err.message });
 }
 
-app.get("/campaigns/:runId/plan", isAuthorized, async (req, res) => {
+app.get("/campaigns/:runId/plan", async (req, res) => {
   try {
     res.json(await getPlan(req.params.runId));
   } catch (err) {
@@ -370,7 +372,7 @@ app.get("/campaigns/:runId/plan", isAuthorized, async (req, res) => {
   }
 });
 
-app.patch("/campaigns/:runId/plan", isAuthorized, async (req, res) => {
+app.patch("/campaigns/:runId/plan", async (req, res) => {
   console.log(`PATCH /campaigns/${req.params.runId}/plan`);
   try {
     res.json({ ok: true, guide: await savePlan(req.params.runId, req.body) });
@@ -379,7 +381,7 @@ app.patch("/campaigns/:runId/plan", isAuthorized, async (req, res) => {
   }
 });
 
-app.post("/campaigns/:runId/plan/approve", isAuthorized, async (req, res) => {
+app.post("/campaigns/:runId/plan/approve", async (req, res) => {
   console.log(`POST /campaigns/${req.params.runId}/plan/approve`);
   try {
     // An edited plan may ride along, so "save then approve" is one atomic
@@ -390,7 +392,7 @@ app.post("/campaigns/:runId/plan/approve", isAuthorized, async (req, res) => {
   }
 });
 
-app.post("/campaigns/:runId/plan/abandon", isAuthorized, async (req, res) => {
+app.post("/campaigns/:runId/plan/abandon", async (req, res) => {
   console.log(`POST /campaigns/${req.params.runId}/plan/abandon`);
   try {
     res.json(await abandonAtPlan(req.params.runId));
@@ -401,7 +403,7 @@ app.post("/campaigns/:runId/plan/abandon", isAuthorized, async (req, res) => {
 
 // Phase 7 (new_plan.md §6/§9.9) — the human approval gate. Nothing this
 // service generates reaches git before one of these two is called.
-app.post("/campaigns/:runId/approve", isAuthorized, async (req, res) => {
+app.post("/campaigns/:runId/approve", async (req, res) => {
   console.log(`POST /campaigns/${req.params.runId}/approve`);
   try {
     const result = await approveRun(req.params.runId);
@@ -415,7 +417,7 @@ app.post("/campaigns/:runId/approve", isAuthorized, async (req, res) => {
   }
 });
 
-app.post("/campaigns/:runId/abandon", isAuthorized, async (req, res) => {
+app.post("/campaigns/:runId/abandon", async (req, res) => {
   console.log(`POST /campaigns/${req.params.runId}/abandon`);
   try {
     const result = await abandonRun(req.params.runId);
@@ -429,7 +431,7 @@ app.post("/campaigns/:runId/abandon", isAuthorized, async (req, res) => {
   }
 });
 
-app.delete("/campaigns/:runId", isAuthorized, async (req, res) => {
+app.delete("/campaigns/:runId", async (req, res) => {
   const existing = await runStore.getRun(req.params.runId);
   const result = await runStore.deleteRun(req.params.runId);
   if (!result.ok && result.reason === "not_found") {

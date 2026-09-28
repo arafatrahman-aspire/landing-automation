@@ -662,6 +662,7 @@ function AssignedPhotos({
 }) {
   const [uploading, setUploading] = useState<Record<string, boolean>>({});
   const [uploadErrors, setUploadErrors] = useState<Record<string, string>>({});
+  const [downloading, setDownloading] = useState<Record<string, boolean>>({});
   const fileInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
   const SLOTS = ["hero", "details", "timeline"];
@@ -683,11 +684,36 @@ function AssignedPhotos({
     }
   }
 
+  async function handleDownload(slot: string, img: CampaignImage) {
+    setUploadErrors((prev) => ({ ...prev, [slot]: "" }));
+    setDownloading((prev) => ({ ...prev, [slot]: true }));
+    try {
+      const res = await fetch(img.publicUrl);
+      if (!res.ok) throw new Error(`Download failed (${res.status})`);
+      const blob = await res.blob();
+      const type = blob.type || "image/jpeg";
+      const ext = type.includes("png") ? "png" : type.includes("webp") ? "webp" : "jpg";
+      const objectUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = objectUrl;
+      a.download = `${slot}.${ext}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(objectUrl);
+    } catch {
+      window.open(img.publicUrl, "_blank", "noopener,noreferrer");
+    } finally {
+      setDownloading((prev) => ({ ...prev, [slot]: false }));
+    }
+  }
+
   return (
     <ul className="research-photos">
       {SLOTS.map((slot) => {
         const img = images.find((i) => i.slot === slot);
         const isUploading = uploading[slot] ?? false;
+        const isDownloading = downloading[slot] ?? false;
         const error = uploadErrors[slot];
         return (
           <li key={slot} className="research-photo">
@@ -711,13 +737,26 @@ function AssignedPhotos({
               style={{ display: "none" }}
               onChange={(e) => handleFileChange(slot, e)}
             />
-            <button
-              className="button button-secondary research-photo-upload-btn"
-              disabled={isUploading}
-              onClick={() => fileInputRefs.current[slot]?.click()}
-            >
-              {isUploading ? "Uploading\u2026" : img ? "Replace photo" : "Upload photo"}
-            </button>
+            <div className="research-photo-actions">
+              {img ? (
+                <button
+                  type="button"
+                  className="button button-secondary research-photo-upload-btn"
+                  disabled={isDownloading || isUploading}
+                  onClick={() => handleDownload(slot, img)}
+                >
+                  {isDownloading ? "Downloading\u2026" : "Download"}
+                </button>
+              ) : null}
+              <button
+                type="button"
+                className="button button-secondary research-photo-upload-btn"
+                disabled={isUploading || !runId}
+                onClick={() => fileInputRefs.current[slot]?.click()}
+              >
+                {isUploading ? "Uploading\u2026" : img ? "Replace" : "Upload photo"}
+              </button>
+            </div>
           </li>
         );
       })}
@@ -758,9 +797,9 @@ function ResearchInsightsCard({
           </p>
           {runId && onImageUploaded ? (
             <div className="insight-block insight-block-wide" style={{ marginTop: 16 }}>
-              <h4>Campaign photos</h4>
+              <h4>Campaign images</h4>
               <p className="insight-hint">
-                Upload your own images for each section slot. They will be stored and applied to the draft instantly.
+                Upload your own images for each section slot. Download an assigned image, edit it locally, then Replace to apply the modified version — it uploads to storage and updates the draft instantly.
               </p>
               <AssignedPhotos runId={runId} images={[]} onImageUploaded={onImageUploaded} />
             </div>
@@ -809,16 +848,16 @@ function ResearchInsightsCard({
         ) : null}
         {runId && onImageUploaded ? (
           <div className="insight-block insight-block-wide">
-            <h4>Campaign photos</h4>
+            <h4>Campaign images</h4>
             <p className="insight-hint">
-              Stock photos fetched for this campaign. Click "Replace photo" or "Upload photo" to swap any slot with your own image — it uploads to storage and updates the draft instantly.
+              Images generated for this campaign. Download a slot, edit it yourself, then click Replace to upload the modified file — it updates storage and the draft instantly.
             </p>
             <AssignedPhotos runId={runId} images={notes?.images ?? []} onImageUploaded={onImageUploaded} />
           </div>
         ) : notes?.images && notes.images.length > 0 ? (
           <div className="insight-block insight-block-wide">
-            <h4>Assigned photos</h4>
-            <p className="insight-hint">Stock photos searched for this campaign (Pexels, then Google Images).</p>
+            <h4>Campaign images</h4>
+            <p className="insight-hint">Images assigned for this campaign (generated first, then Pexels / Google Images if generation failed).</p>
             <AssignedPhotos runId="" images={notes.images} onImageUploaded={() => {}} />
           </div>
         ) : null}
@@ -1921,17 +1960,20 @@ export default function RunDetailPage() {
 
     async function pollSideChannels() {
       try {
-        const [draftData, previewData] = await Promise.all([getRunDraft(runId!), getPreview(runId!)]);
+        const current = runRef.current;
+        // A plan-review run has neither generated files nor a preview yet.
+        // Wait for the existing draft version marker published by the run stream.
+        const hasDraft = (current?.currentDraftVersion ?? 0) > 0;
+        const [draftData, previewData, planData] = await Promise.all([
+          hasDraft ? getRunDraft(runId!) : Promise.resolve(null),
+          hasDraft ? getPreview(runId!) : Promise.resolve(null),
+          current?.guide ? getPlan(runId!) : Promise.resolve(null),
+        ]);
         if (cancelled) return;
         setDraft(draftData);
         setPreview(previewData);
+        setPlan(planData);
 
-        // The plan only exists from the guide stage onward, and 404s before
-        // that — not an error, just "not yet". Refetched on every tick while
-        // the run is live so the gate appears the moment it's reached.
-        getPlan(runId!)
-          .then((p) => !cancelled && setPlan(p))
-          .catch(() => {});
         // A preview can still be alive well after the run itself finishes
         // (that's the point) — keep polling until both the run AND any
         // preview are done, not just the run. runRef, not `run` state, since

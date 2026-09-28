@@ -52,6 +52,10 @@ export function cleanEnvForChildProcess(overrides = {}) {
   const env = { ...process.env, ...overrides };
 
   for (const name of WATCH_ENV_VARS) delete env[name];
+  // Generated projects and build scripts must never inherit login credentials.
+  for (const name of Object.keys(env)) {
+    if (name.startsWith("SSO_") || name === "HANDOFF_SECRET" || name === "LANDING_PAGE_SECRET") delete env[name];
+  }
 
   if (typeof env.NODE_OPTIONS === "string") {
     const stripped = env.NODE_OPTIONS.replace(WATCH_FLAG_RE, " ").replace(/\s+/g, " ").trim();

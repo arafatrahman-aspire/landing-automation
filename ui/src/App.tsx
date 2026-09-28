@@ -1,74 +1,66 @@
-import { useState } from "react";
-import { NavLink, Outlet } from "react-router-dom";
-import { hasSecret, setSecret } from "./api";
-import "./App.css";
-
-function BrandMark() {
-  return <span className="brand-mark">CC</span>;
-}
-
-function SecretPrompt({ onSaved }: { onSaved: () => void }) {
-  const [value, setValue] = useState("");
-
-  function submit(e: React.FormEvent) {
-    e.preventDefault();
-    if (!value.trim()) return;
-    setSecret(value.trim());
-    onSaved();
-  }
-
-  return (
-    <div className="secret-gate">
-      <div className="secret-card">
-        <div className="brand">
-          <BrandMark />
-          <h1>Campaign Codegen</h1>
-        </div>
-        <p>
-          Enter the API shared secret (matches <code>API_SHARED_SECRET</code> in the server's <code>.env</code>) to
-          continue.
-        </p>
-        <form onSubmit={submit} className="secret-form">
-          <input
-            type="password"
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-            placeholder="Shared secret"
-            autoFocus
-          />
-          <button type="submit">Continue</button>
-        </form>
-      </div>
-    </div>
-  );
-}
+import { useEffect, useState } from 'react';
+import { NavLink, Outlet } from 'react-router-dom';
+import { setCsrfToken } from './api';
+import './App.css';
 
 export default function App() {
-  const [unlocked, setUnlocked] = useState(hasSecret());
-
-  if (!unlocked) {
-    return <SecretPrompt onSaved={() => setUnlocked(true)} />;
+  const [signedOut] = useState(() => new URLSearchParams(window.location.search).has('signedout'));
+  const [user, setUser] = useState<{ email: string; role: string } | null>(null);
+  const [message, setMessage] = useState('Checking your session…');
+  const [csrf, setCsrf] = useState('');
+  const [canLogin, setCanLogin] = useState(false);
+  function login() {
+    const next = window.location.pathname + window.location.search + window.location.hash;
+    window.location.assign(`/api/auth/start?next=${encodeURIComponent(next)}`);
   }
-
-  return (
-    <div className="shell">
-      <header className="topbar">
-        <NavLink to="/" className="brand" end>
-          <BrandMark />
-          Campaign Codegen
-        </NavLink>
-        <nav>
-          <NavLink to="/" end className={({ isActive }) => (isActive ? "active" : "")}>
-            Campaigns
-          </NavLink>
-          <NavLink to="/new" className={({ isActive }) => (isActive ? "active" : "")}>
-            New campaign
-          </NavLink>
-        </nav>
-      </header>
-      <main className="content">
-        <Outlet />
-      </main>
-    </div>
-  );
+  useEffect(() => {
+    sessionStorage.removeItem('campaignCodegenApiSecret');
+    let alive = true;
+    async function check(redirect: boolean) {
+      try {
+        const response = await fetch('/api/auth/me', { credentials: 'same-origin', cache: 'no-store' });
+        if (!alive) return;
+        if (response.ok) {
+          const data = await response.json();
+          if (!alive) return;
+          setUser(data.user); setCsrfToken(data.csrfToken); setCsrf(data.csrfToken); setCanLogin(false);
+        } else {
+          setUser(null); setCanLogin(response.status === 401);
+          if (response.status === 401 && redirect) { login(); return; }
+          setMessage(response.status === 403 ? 'Your account does not have access to this application.' : response.status === 401 ? 'Sign in through CMS to continue.' : 'Cannot verify access right now. Please reload to retry.');
+        }
+      } catch { if (alive) { setUser(null); setMessage('Cannot reach the authentication service. Please reload to retry.'); } }
+    }
+    if (signedOut) {
+      window.history.replaceState(null, '', '/');
+      setMessage('You are signed out.'); setCanLogin(true);
+    } else void check(true);
+    const onExpired = () => { setUser(null); setCanLogin(true); setMessage('Your session ended. Sign in through CMS to continue.'); };
+    const onCheck = () => { void check(false); };
+    window.addEventListener('session-expired', onExpired);
+    window.addEventListener('session-check', onCheck);
+    return () => { alive = false; window.removeEventListener('session-expired', onExpired); window.removeEventListener('session-check', onCheck); };
+  }, []);
+  useEffect(() => {
+    if (!user) return;
+    let last = 0;
+    const activity = () => {
+      if (Date.now() - last < 60_000) return;
+      last = Date.now();
+      void fetch('/api/auth/activity', { method: 'POST', headers: { 'X-CSRF-Token': csrf }, credentials: 'same-origin' }).then(r => {
+        if (r.status === 401 || r.status === 403) window.dispatchEvent(new Event('session-check'));
+      }).catch(() => {});
+    };
+    window.addEventListener('pointerdown', activity); window.addEventListener('keydown', activity);
+    return () => { window.removeEventListener('pointerdown', activity); window.removeEventListener('keydown', activity); };
+  }, [user, csrf]);
+  async function logout() {
+    try {
+      const response = await fetch('/api/auth/logout', { method: 'POST', headers: { 'X-CSRF-Token': csrf }, credentials: 'same-origin' });
+      if (!response.ok) throw new Error();
+      setCsrfToken(''); window.location.assign('/?signedout=1');
+    } catch { window.alert('Sign out failed. Please retry.'); }
+  }
+  if (!user) return <div className="secret-gate"><div className="secret-card"><h1>Campaign Codegen</h1><p role="status">{message}</p>{canLogin && <button onClick={login}>Sign in through CMS</button>}</div></div>;
+  return <div className="shell"><header className="topbar"><NavLink to="/" className="brand" end><span className="brand-mark">CC</span>Campaign Codegen</NavLink><nav><NavLink to="/" end>Campaigns</NavLink><NavLink to="/new">New campaign</NavLink><span>{user.email}</span><button onClick={() => void logout()}>Sign out</button></nav></header><main className="content"><Outlet /></main></div>;
 }

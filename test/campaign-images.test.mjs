@@ -4,11 +4,13 @@ import http from "node:http";
 import {
   buildImageQueries,
   isImageSearchConfigured,
+  isImagePipelineConfigured,
   assignCampaignImages,
   searchPexels,
   searchSerpApi,
   imageForSlot,
   ipv4Fetch,
+  uploadManualImage,
 } from "../src/assets/campaign-images.mjs";
 
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xd9, ...Buffer.alloc(120, 1)]);
@@ -17,17 +19,18 @@ function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
 
-test("buildImageQueries uses short cached stock terms, not campaign copy", () => {
+test("buildImageQueries prefers campaign context then slot stock terms", () => {
   const queries = buildImageQueries({
     campaignName: "AI Workflow Automation Masterclass",
     offer: "Learn to automate client work with AI workflows in 6 weeks",
     keywords: ["agency operations"],
     slot: "details",
   });
-  assert.ok(queries.length >= 2 && queries.length <= 3);
-  assert.ok(queries.every((q) => /^\w+$/.test(q)));
-  assert.ok(queries.every((q) => ["office", "laptop", "chair"].includes(q)));
-  assert.ok(queries.every((q) => !/no people|no faces|Masterclass|automate/i.test(q)));
+  assert.ok(queries.includes("AI Workflow Automation Masterclass"));
+  assert.ok(queries.includes("agency operations"));
+  assert.ok(queries.includes("technology"));
+  assert.ok(queries.length >= 3 && queries.length <= 8);
+  assert.ok(queries.every((q) => !/no people|no faces/i.test(q)));
 });
 
 test("isImageSearchConfigured requires a search key and supabase upload creds", () => {
@@ -40,6 +43,25 @@ test("isImageSearchConfigured requires a search key and supabase upload creds", 
   assert.equal(
     isImageSearchConfigured({ serpApiKey: "s", supabaseUrl: "https://x.supabase.co", supabaseServiceRoleKey: "k" }),
     true
+  );
+});
+
+test("isImagePipelineConfigured accepts a configured generator instead of stock search", () => {
+  assert.equal(
+    isImagePipelineConfigured({
+      supabaseUrl: "https://x.supabase.co",
+      supabaseServiceRoleKey: "k",
+      imageGenerator: { configured: true },
+    }),
+    true
+  );
+  assert.equal(
+    isImagePipelineConfigured({
+      supabaseUrl: "https://x.supabase.co",
+      supabaseServiceRoleKey: "k",
+      imageGenerator: { configured: false },
+    }),
+    false
   );
 });
 
@@ -218,4 +240,90 @@ test("imageForSlot picks the matching assignment", () => {
   ];
   assert.equal(imageForSlot(images, "timeline").publicUrl, "https://x/t.jpg");
   assert.equal(imageForSlot(images, "hero"), null);
+});
+
+test("successful generation uploads without calling Pexels", async () => {
+  const calls = [];
+  const fetchImpl = async (url, opts = {}) => {
+    calls.push({ url: String(url), method: opts.method ?? "GET" });
+    if (String(url).includes("supabase.co/storage")) return jsonResponse({ Key: "ok" });
+    return new Response("unexpected", { status: 500 });
+  };
+  const imageGenerator = {
+    configured: true,
+    async generate() {
+      return { bytes: JPEG, mime: "image/jpeg", ext: "jpg", provider: "cloudflare" };
+    },
+  };
+
+  const images = await assignCampaignImages({
+    slug: "gen-course",
+    campaignName: "Generated Course",
+    offer: "Weekend workshop",
+    videoUrl: "https://example.com/video.mp4",
+    supabaseUrl: "https://abc.supabase.co",
+    supabaseServiceRoleKey: "service-role",
+    imageGenerator,
+    fetchImpl,
+  });
+
+  assert.ok(images.length >= 1);
+  assert.equal(images.every((i) => i.source === "cloudflare"), true);
+  assert.ok(images.every((i) => i.slot !== "hero"));
+  assert.ok(calls.every((c) => !c.url.includes("api.pexels.com")));
+  assert.ok(calls.some((c) => c.method === "POST" && c.url.includes("/storage/v1/object/")));
+});
+
+test("failed generation falls back to Pexels", async () => {
+  const calls = [];
+  const fetchImpl = async (url, opts = {}) => {
+    calls.push(String(url));
+    if (String(url).includes("api.pexels.com")) {
+      return jsonResponse({
+        photos: [{ width: 800, height: 600, alt: "desk", src: { large: "https://images.pexels.com/photo.jpg" } }],
+      });
+    }
+    if (String(url).includes("images.pexels.com")) {
+      return new Response(JPEG, { status: 200, headers: { "content-type": "image/jpeg" } });
+    }
+    if (String(url).includes("supabase.co/storage")) return jsonResponse({ Key: "ok" });
+    return new Response("unexpected", { status: 500 });
+  };
+  const logs = [];
+  const images = await assignCampaignImages({
+    slug: "fallback-course",
+    campaignName: "Fallback Course",
+    offer: "Weekend workshop",
+    videoUrl: "https://example.com/video.mp4",
+    pexelsApiKey: "pexels-key",
+    supabaseUrl: "https://abc.supabase.co",
+    supabaseServiceRoleKey: "service-role",
+    imageGenerator: {
+      configured: true,
+      async generate() {
+        throw new Error("All image generators failed. Last error: boom");
+      },
+    },
+    logger: (m) => logs.push(m),
+    fetchImpl,
+  });
+
+  assert.ok(images.length >= 1);
+  assert.equal(images[0].source, "pexels");
+  assert.ok(calls.some((u) => u.includes("api.pexels.com")));
+  assert.ok(logs.some((m) => /generation failed/i.test(m)));
+});
+
+
+test("manual image upload explains an unresolvable storage project without exposing credentials", async () => {
+  await assert.rejects(uploadManualImage({
+    bytes: JPEG, mime: "image/jpeg", slug: "test", slot: "hero",
+    supabaseUrl: "https://missing-project.supabase.co", supabaseServiceRoleKey: "private-service-key",
+    fetchImpl: async () => { throw Object.assign(new Error("getaddrinfo ENOTFOUND"), { code: "ENOTFOUND" }); },
+  }), (error) => {
+    assert.match(error.message, /Cannot resolve the image storage host/);
+    assert.match(error.message, /SUPABASE_URL/);
+    assert.doesNotMatch(error.message, /private-service-key/);
+    return true;
+  });
 });

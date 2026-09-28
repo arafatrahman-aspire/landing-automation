@@ -43,8 +43,8 @@ test("stageNewVersion also bumps runs.current_draft_version", async () => {
   await makeRun(runId);
   await draftStore.stageNewVersion({ runId, files: [{ path: "a.tsx", content: "a" }] });
   await draftStore.stageNewVersion({ runId, files: [{ path: "a.tsx", content: "a2" }] });
-  // current_draft_version is a resume-state column (unused by sqlite-repository's
-  // getRun shape until Phase 6) — check it directly on the underlying row.
+  // The UI uses this existing marker to avoid requesting resources before generation.
+  assert.equal((await repo.getRun(runId)).currentDraftVersion, 2);
   const row = getDb().prepare("SELECT current_draft_version FROM runs WHERE run_id = ?").get(runId);
   assert.equal(row.current_draft_version, 2);
 });
@@ -53,6 +53,7 @@ test("getLatestVersion returns null when nothing has been staged yet", async () 
   const runId = "draft-run-3";
   await makeRun(runId);
   assert.equal(await draftStore.getLatestVersion(runId), null);
+  assert.equal((await repo.getRun(runId)).currentDraftVersion, null);
 });
 
 test("diffFromPrevious returns null with only one staged version", async () => {

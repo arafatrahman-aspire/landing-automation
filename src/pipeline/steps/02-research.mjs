@@ -12,16 +12,19 @@ async function attachCampaignImages(state, researchNotes) {
     slug: state.request.slug,
     campaignName: state.request.campaignName,
     offer: state.request.offer,
+    audience: state.request.audience,
     videoUrl: state.request.videoUrl,
     keywords: notes.keywords,
-    // LLM-suggested visual queries per slot — far more Pexels-relevant than
-    // raw brand names / acronyms from the keyword list.
+    // LLM-suggested visual queries per slot — used for stock-search fallback
+    // and as a seed when imagePrompts is missing (older runs).
     imageQueries: notes.imageQueries ?? null,
+    imagePrompts: notes.imagePrompts ?? null,
     pexelsApiKey: config.pexelsApiKey,
     serpApiKey: config.serpApiKey,
     supabaseUrl: config.supabaseUrl,
     supabaseServiceRoleKey: config.supabaseServiceRoleKey,
     supabaseStorageBucket: config.supabaseStorageBucket,
+    imageGenEnv: config.imageGen,
     logger: (msg) => logStage(state.runId, `research: ${msg}`),
   });
 
@@ -67,13 +70,18 @@ export async function research(state) {
       "All string values must use standard ASCII double-quotes. " +
       "Never include unescaped double-quotes, newlines, or backslashes inside string values.",
     prompt:
-      `Research this marketing campaign and suggest stock photo search queries for it.\n` +
+      `Research this marketing campaign and suggest images for it.\n` +
       `Return exactly this JSON shape (no extra fields):\n` +
       `{\n` +
       `  "keywords": ["keyword1", "keyword2", ...],\n` +
       `  "painPoints": ["pain point 1", ...],\n` +
       `  "faqQuestions": ["Question 1?", ...],\n` +
       `  "notes": "one paragraph of research notes",\n` +
+      `  "imagePrompts": {\n` +
+      `    "hero": "one or two sentences describing a photorealistic landscape image",\n` +
+      `    "details": "one or two sentences describing a photorealistic landscape image",\n` +
+      `    "timeline": "one or two sentences describing a photorealistic landscape image"\n` +
+      `  },\n` +
       `  "imageQueries": {\n` +
       `    "hero": ["visually descriptive 2-3 word phrase for Pexels", "another phrase"],\n` +
       `    "details": ["phrase that shows the benefit or skill", "another phrase"],\n` +
@@ -81,14 +89,16 @@ export async function research(state) {
       `  }\n` +
       `}\n` +
       `\n` +
-      `For imageQueries: suggest SHORT (2-4 word), visually descriptive Pexels stock photo search terms\n` +
-      `that would return RELEVANT, professional images for this campaign. Rules:\n` +
-      `- Use concrete visual descriptions, NOT brand names, acronyms or jargon (e.g. NOT "Splunk" or "SIEM"\n` +
-      `  but YES "security analyst workstation" or "cybersecurity dashboard")\n` +
-      `- Each slot needs 2-3 different query options (Pexels may have limited results for some)\n` +
+      `For imagePrompts: write ONE 1-2 sentence visual description per slot for an image model.\n` +
+      `Rules:\n` +
+      `- Concrete visual scene, NOT brand names, acronyms, jargon, or any text-in-image\n` +
+      `- No people, faces, logos, watermarks, or readable UI\n` +
       `- hero: the main visual that represents the campaign's outcome or aspiration\n` +
       `- details: shows the skill, tool, or benefit being taught/offered\n` +
       `- timeline: shows learning, process, or progression\n` +
+      `\n` +
+      `For imageQueries: suggest SHORT (2-4 word), visually descriptive Pexels stock photo search terms\n` +
+      `used only if image generation fails. Same visual rules as imagePrompts. Each slot needs 2-3 options.\n` +
       `\n` +
       `Campaign: ${request.campaignName}\n` +
       `Offer: ${request.offer}\n` +

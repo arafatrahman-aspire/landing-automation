@@ -2041,6 +2041,16 @@ button:disabled {
   margin-top: 2px;
 }
 
+.research-photo-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.research-photo-actions .research-photo-upload-btn {
+  flex: 1;
+  margin-top: 0;
+}
+
 .research-photo-error {
   font-size: 0.75rem;
   color: var(--status-bad, #c0392b);

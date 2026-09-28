@@ -1,0 +1,48 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:${PORT:-4300}:4300"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      # Overrides whatever's in .env — deliberate. VERIFY_DISABLE_DOCKER=false
+      # would try to run `docker build`/`docker run` FROM INSIDE this
+      # container, which needs the host's Docker socket mounted in (not done
+      # here) — see runbook.md §7. Leave it disabled; verify/preview already
+      # fall back to a host-process path automatically when Docker isn't
+      # reachable, so nothing breaks either way, but this keeps it explicit.
+      VERIFY_DISABLE_DOCKER: "true"
+    volumes:
+      # Both DB_PATH (./data/campaigns.db) and WORKDIR_ROOT (./data/.scratch —
+      # the shared base git clone + per-run worktrees) default under ./data,
+      # so one named volume covers both. Losing the scratch half just costs
+      # one slow re-clone; losing the DB half loses all run history/drafts.
+      - codegen-data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:4300/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    environment:
+      API_PROXY_TARGET: ${DOCKER_API_PROXY_TARGET:-http://backend:4300}
+    ports:
+      - "${UI_PORT:-5183}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  codegen-data:

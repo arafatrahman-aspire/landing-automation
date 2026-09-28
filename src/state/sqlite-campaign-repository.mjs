@@ -58,6 +58,7 @@ function rowToRun(campaignRow, runRow, logTail) {
     heartbeatAt: runRow.heartbeat_at,
     codeAttempts: runRow.code_attempts,
     verifyAttempts: runRow.verify_attempts,
+    currentDraftVersion: runRow.current_draft_version ?? null,
     branchName: runRow.branch_name,
     prUrl: runRow.pr_url,
     prNumber: runRow.pr_number,

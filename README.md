@@ -49,7 +49,7 @@ Fill in `.env`:
 
 | Var | Notes |
 |---|---|
-| `API_SHARED_SECRET` | any long random string — required on every request |
+| CMS authentication | Set the origin, client credential, and proxy variables in [the authentication guide](docs/cms-auth.md). |
 | `AI_PROVIDER` | `gemini` \| `claude` \| `omniroute` — for the research/guide/file-manifest stages. If `omniroute`, pin `OMNIROUTE_MODEL` to a dashboard model that actually works — `auto` often dies on free Felo/OpenCode (HTTP 400/401) |
 | `CODING_AGENT_PROVIDER` | `gemini` \| `claude` \| `omniroute` — for the agentic coding loop. **Independent of `AI_PROVIDER` above** — run research on one provider and coding on the other if you like. Only the API key for whichever provider(s) you actually select are required (OmniRoute needs the local gateway at `OMNIROUTE_BASE_URL`) |
 | `GITHUB_TOKEN` | a token scoped to the **target** repo only (fine-grained PAT: contents + pull-requests, that one repo). Not required if `DRY_RUN_NO_PR=true` |
@@ -64,7 +64,7 @@ npm start   # http://localhost:4300
 
 ## API
 
-All `/campaigns*` routes require `Authorization: Bearer <API_SHARED_SECRET>`.
+All `/campaigns*` routes require a CMS-linked landing session cookie. Mutations also require the session CSRF token and exact Origin. The browser uses the same-origin `/api` proxy. Shared API keys are no longer accepted.
 
 ```
 POST /campaigns
@@ -164,9 +164,7 @@ DRY_RUN_NO_PR=true                       # skips the real GitHub API call
 GITHUB_TOKEN=                            # not needed in this mode
 
 npm start
-curl -X POST http://localhost:4300/campaigns \
-  -H "Authorization: Bearer $API_SHARED_SECRET" -H "Content-Type: application/json" \
-  -d '{"slug":"test-campaign","campaignName":"Test","offer":"...","audience":"...","cta":"..."}'
+# Open the configured UI, sign in through CMS, and create a test campaign.
 ```
 
 Research, the file plan, the full agentic coding loop, real `npm install` +
@@ -194,3 +192,10 @@ a real production repo once that's worked cleanly.
 - True multi-provider tool-use *within a single run* — the coding agent
   calls one provider's tool-use API per run (whichever `CODING_AGENT_PROVIDER`
   selects), not both at once.
+
+### CMS authentication
+
+The UI now signs in through CMS and uses an HttpOnly server session. Shared API
+keys are no longer accepted. Configure both services' `.env` files as described
+in [CMS authentication setup](docs/cms-auth.md). No database schema changes are
+required; existing CMS roles authorize access. Use one worker per backend.

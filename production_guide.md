@@ -214,14 +214,30 @@ All vars are loaded and validated in `src/config.mjs` at process start. Modules 
 
 ### Campaign images (optional)
 
-Stock photos for campaign pages. **All of these are optional** — if any required piece is missing, research skips images and the campaign still generates (static frames fall back to dummy assets in the target repo).
+AI-generated images for campaign pages, with stock search as a last resort. **All of these are optional** — if any required piece is missing, research skips images and the campaign still generates (static frames fall back to dummy assets in the target repo).
 
-Search order is **Pexels first**, then **SerpAPI Google Images** if Pexels returns nothing usable. Bytes are downloaded and uploaded to a **public** Supabase Storage bucket; only the public URL is written into campaign source under `src/app/campaigns/{slug}/`. Image binaries are never committed to the target repo.
+Per slot the order is **configured image generators** (see `IMAGE_GENERATOR_ORDER`, default Cloudflare → Nano Banana → Leonardo → PromptGone → Journey), then **Pexels**, then **SerpAPI Google Images**. Providers whose API keys are absent are skipped at startup. Bytes are uploaded to a **public** Supabase Storage bucket; only the public URL is written into campaign source under `src/app/campaigns/{slug}/`. Image binaries are never committed to the target repo.
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `PEXELS_API_KEY` | for photos | — | [Pexels API](https://www.pexels.com/api/) key (`Authorization` header) |
-| `SERPAPI_API_KEY` | fallback | — | [SerpAPI](https://serpapi.com/) key for `engine=google_images` |
+| `IMAGE_GENERATOR_ORDER` | no | `cloudflare,nanobanana,leonardo,promptgone,journey` | Comma-separated provider order |
+| `CLOUDFLARE_ACCOUNT_ID` | for Cloudflare | — | Cloudflare account id |
+| `CLOUDFLARE_API_TOKEN` | for Cloudflare | — | Workers AI token |
+| `CLOUDFLARE_MODEL` | no | `@cf/black-forest-labs/flux-1-schnell` | Workers AI model |
+| `CLOUDFLARE_BASE_URL` | no | `https://api.cloudflare.com/client/v4` | Cloudflare API base |
+| `GOOGLE_API_KEY` | for Nano Banana | falls back to `GEMINI_API_KEY` | Gemini image (Nano Banana) key |
+| `NANO_BANANA_MODEL` | no | `gemini-2.5-flash-image` | Gemini image model id |
+| `LEONARDO_API_KEY` | for Leonardo | — | Leonardo AI key |
+| `LEONARDO_BASE_URL` | no | `https://cloud.leonardo.ai/api/rest/v1` | Leonardo API base |
+| `PROMPTGONE_API_KEY` | for PromptGone | — | PromptGone API key |
+| `PROMPTGONE_APP_KEY` | for PromptGone | — | PromptGone app key |
+| `PROMPTGONE_MODEL` | no | `flux` | PromptGone model id |
+| `PROMPTGONE_BASE_URL` | no | `https://api.promptgone.ai` | PromptGone API base |
+| `JOURNEY_API_KEY` | for JourneyAPI | — | JourneyAPI key |
+| `JOURNEY_MODEL` | no | `flux` | JourneyAPI model id |
+| `JOURNEY_BASE_URL` | no | `https://api.journeyapi.io` | JourneyAPI base |
+| `PEXELS_API_KEY` | stock fallback | — | [Pexels API](https://www.pexels.com/api/) key (`Authorization` header) |
+| `SERPAPI_API_KEY` | last-resort fallback | — | [SerpAPI](https://serpapi.com/) key for `engine=google_images` |
 | `SUPABASE_URL` | for photos | — | Project URL, e.g. `https://xxxx.supabase.co` |
 | `SUPABASE_SERVICE_ROLE_KEY` | for photos | — | Service role key (server-side upload only; never expose to the UI) |
 | `SUPABASE_STORAGE_BUCKET` | no | `campaign-images` | Bucket name. Create it in Supabase Storage and set it **public** so `next/image` can fetch the objects |
@@ -230,12 +246,14 @@ Setup:
 
 1. Create a Supabase project. In Storage, create bucket `campaign-images` (or your `SUPABASE_STORAGE_BUCKET` value) and mark it **public**.
 2. Set `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` from Project Settings → API.
-3. Set `PEXELS_API_KEY`. Optionally set `SERPAPI_API_KEY` so Google Images can fill gaps.
+3. Set keys for at least one image generator (Cloudflare, Nano Banana / Gemini, Leonardo, PromptGone, or JourneyAPI). Optionally keep `PEXELS_API_KEY` and `SERPAPI_API_KEY` so stock search can fill gaps if generation fails.
 4. Restart the API — config is validated at process start.
 
-Copyright: Pexels photos are licensed for free use (attribution appreciated). SerpAPI Google Images results may include copyrighted photos — prefer Pexels hits, and review assigned URLs on the Plan tab before you publish. This service does not clear rights for you.
+Copyright: generated images are preferred. Pexels photos are licensed for free use (attribution appreciated). SerpAPI Google Images results may include copyrighted photos — review assigned URLs on the Plan tab before you publish. This service does not clear rights for you.
 
-Slots (one photo each, skipped independently if search/upload fails): `details`, `timeline`, and `hero` only when the brief has no `videoUrl`. Testimonials and instructor sections never receive stock faces.
+Slots (one photo each, skipped independently if generation/search/upload fails): `details`, `timeline`, and `hero` only when the brief has no `videoUrl`. Testimonials and instructor sections never receive generated or stock faces.
+
+On the Plan tab, download a slot's image, edit it locally, then **Replace** to upload the modified file.
 
 ### UI
 
@@ -253,7 +271,7 @@ The UI also needs the same `API_SHARED_SECRET` entered in the browser (Authoriza
 
 1. Generate a strong `API_SHARED_SECRET` (≥16 chars; use a long random string).
 2. Set `SERVICE_PUBLIC_BASE_URL` to the **public HTTPS** origin of the API (not localhost). Preview lead forms POST to `{SERVICE_PUBLIC_BASE_URL}/internal/preview-lead-sink`.
-3. Put `GITHUB_TOKEN`, AI keys, and the shared secret in your secret manager — not in git. If campaign photos are enabled, also store `PEXELS_API_KEY`, optional `SERPAPI_API_KEY`, and `SUPABASE_SERVICE_ROLE_KEY` there.
+3. Put `GITHUB_TOKEN`, AI keys, and the shared secret in your secret manager — not in git. If campaign photos are enabled, also store generator keys (Cloudflare / Gemini / Leonardo / PromptGone / Journey as you use them), optional `PEXELS_API_KEY` / `SERPAPI_API_KEY`, and `SUPABASE_SERVICE_ROLE_KEY` there.
 4. Build the UI with `VITE_API_BASE_URL=https://api.your-domain.example`.
 
 ### B. Process model
@@ -283,7 +301,7 @@ Use a process manager (systemd, PM2, Kubernetes) that:
 - Expose the API only over HTTPS.
 - Require `Authorization: Bearer <API_SHARED_SECRET>` on all campaign routes.
 - The preview lead sink (`POST /internal/preview-lead-sink`) is intentionally **unauthenticated** (called from the previewed page). It is a no-op logger — do not treat it as production lead intake.
-- Restrict egress if your environment requires it: GitHub API, Gemini/Anthropic APIs, clone URLs, and (if campaign photos are enabled) Pexels, SerpAPI, and your Supabase project must remain reachable.
+- Restrict egress if your environment requires it: GitHub API, Gemini/Anthropic APIs, clone URLs, and (if campaign photos are enabled) the configured image-generation providers, Pexels, SerpAPI, and your Supabase project must remain reachable.
 - Preview servers bind to local ports on the API host; put them behind the frameable proxy the service already starts, or firewall them from the public internet.
 
 ### D. Production-safe flags

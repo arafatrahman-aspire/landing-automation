@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { buildImageGenEnv } from "./assets/image-gen/fallback-generator.mjs";
 
 /* Loads and validates every env var this service needs, once, at import
  * time — fail loudly on startup rather than lazily mid-run (mirrors the
@@ -27,7 +28,6 @@ const intFromEnv = (def) =>
 const envSchema = z
   .object({
     PORT: intFromEnv(4300),
-    API_SHARED_SECRET: z.string().min(16, "API_SHARED_SECRET must be set to a real secret (>=16 chars)"),
 
     // One-shot stages (research/guide/file-manifest)
     AI_PROVIDER: z.enum(["gemini", "claude", "omniroute"]).default("gemini"),
@@ -168,8 +168,26 @@ const envSchema = z
     // which only works for local dev; set explicitly for any real deployment.
     SERVICE_PUBLIC_BASE_URL: z.string().url().optional(),
 
-    // Campaign stock photos (optional). Missing any of these skips image
-    // search/upload and the campaign still generates with dummy frame assets.
+    // Campaign images (optional). Missing any required piece skips image
+    // generation/search/upload and the campaign still generates with dummy
+    // frame assets. Generation providers are skipped individually when their
+    // keys are absent; Pexels then SerpAPI remain the stock fallback.
+    IMAGE_GENERATOR_ORDER: z.string().default("cloudflare,nanobanana,leonardo,promptgone,journey"),
+    CLOUDFLARE_ACCOUNT_ID: z.string().optional(),
+    CLOUDFLARE_API_TOKEN: z.string().optional(),
+    CLOUDFLARE_MODEL: z.string().default("@cf/black-forest-labs/flux-1-schnell"),
+    CLOUDFLARE_BASE_URL: z.string().default("https://api.cloudflare.com/client/v4"),
+    GOOGLE_API_KEY: z.string().optional(),
+    NANO_BANANA_MODEL: z.string().default("gemini-2.5-flash-image"),
+    LEONARDO_API_KEY: z.string().optional(),
+    LEONARDO_BASE_URL: z.string().default("https://cloud.leonardo.ai/api/rest/v1"),
+    PROMPTGONE_API_KEY: z.string().optional(),
+    PROMPTGONE_APP_KEY: z.string().optional(),
+    PROMPTGONE_MODEL: z.string().default("flux"),
+    PROMPTGONE_BASE_URL: z.string().default("https://api.promptgone.ai"),
+    JOURNEY_API_KEY: z.string().optional(),
+    JOURNEY_MODEL: z.string().default("flux"),
+    JOURNEY_BASE_URL: z.string().default("https://api.journeyapi.io"),
     PEXELS_API_KEY: z.string().optional(),
     SERPAPI_API_KEY: z.string().optional(),
     SUPABASE_URL: z.string().url().optional(),
@@ -216,7 +234,6 @@ function loadConfig() {
 
   return {
     port: env.PORT,
-    apiSharedSecret: env.API_SHARED_SECRET,
 
     aiProvider: env.AI_PROVIDER,
     codingAgentProvider: env.CODING_AGENT_PROVIDER,
@@ -276,6 +293,7 @@ function loadConfig() {
     supabaseUrl: env.SUPABASE_URL || null,
     supabaseServiceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY || null,
     supabaseStorageBucket: env.SUPABASE_STORAGE_BUCKET,
+    imageGen: buildImageGenEnv(env),
   };
 }
 

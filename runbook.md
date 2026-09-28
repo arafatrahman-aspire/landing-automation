@@ -95,7 +95,7 @@ in comments) — read them before changing anything.
 | Frontend UI | `ui/` | React + Vite SPA — campaign creation, plan editing, section refine gallery, live preview iframe, approve/abandon. | Working |
 | GitHub integration | `src/github/open-pull-request.mjs` | Opens the final PR via the GitHub REST API. | Working |
 | Lead form contract | `src/leadform/contract.mjs` | Shared hero lead-form field contract + honeypot + no-op preview sink. | Working; real delivery to a parent lead pipeline is an external dependency, not built |
-| Campaign images | `src/assets/campaign-images.mjs` | Pexels/SerpAPI stock photo sourcing + Supabase storage, with manual-upload override. | Working, fully optional |
+| Campaign images | `src/assets/campaign-images.mjs` | AI image generation (Cloudflare / Nano Banana / Leonardo / PromptGone / Journey) with Pexels then SerpAPI fallback, Supabase storage, manual upload/replace. | Working, fully optional |
 | Observability | — | `token_usage` table exists; nothing writes to it. `/healthz` is liveness-only. | Not built (Phase 10) |
 
 ---
@@ -295,9 +295,10 @@ from run/log.
   checking; runs already waiting on a human are left untouched.
 
 ### 5.9 Campaign imagery (optional subsystem)
-- Automatic stock-photo sourcing (Pexels, falling back to SerpAPI) per
-  image slot, uploaded to Supabase Storage.
-- Manual image upload/override per slot from the review UI, which also
+- Automatic image generation (Cloudflare, Nano Banana, Leonardo, PromptGone,
+  Journey — ordered by `IMAGE_GENERATOR_ORDER`) per image slot, uploaded to
+  Supabase Storage. Pexels then SerpAPI are used only when generation fails.
+- Manual image download + replace per slot from the review UI, which also
   live-patches the already-staged draft files with the new URL.
 - Entirely optional — missing keys mean the campaign still generates, just
   with the frame catalog's dummy assets.
@@ -398,14 +399,29 @@ instead of failing mysteriously mid-run. Every other module reads from
 
 | Variable | Default | What it controls |
 |---|---|---|
-| `PEXELS_API_KEY` | *(optional)* | Stock photo search, primary source. |
-| `SERPAPI_API_KEY` | *(optional)* | Stock photo search fallback. |
+| `IMAGE_GENERATOR_ORDER` | `cloudflare,nanobanana,leonardo,promptgone,journey` | Provider fallback order. Missing keys skip that provider. |
+| `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` | *(optional)* | Cloudflare Workers AI (FLUX.1 schnell). |
+| `CLOUDFLARE_MODEL` | `@cf/black-forest-labs/flux-1-schnell` | Workers AI model id. |
+| `CLOUDFLARE_BASE_URL` | `https://api.cloudflare.com/client/v4` | Cloudflare API base. |
+| `GOOGLE_API_KEY` | falls back to `GEMINI_API_KEY` | Gemini image / Nano Banana. |
+| `NANO_BANANA_MODEL` | `gemini-2.5-flash-image` | Gemini image model id. |
+| `LEONARDO_API_KEY` | *(optional)* | Leonardo AI. |
+| `LEONARDO_BASE_URL` | `https://cloud.leonardo.ai/api/rest/v1` | Leonardo API base. |
+| `PROMPTGONE_API_KEY` / `PROMPTGONE_APP_KEY` | *(optional)* | PromptGone proxy. |
+| `PROMPTGONE_MODEL` | `flux` | PromptGone model id. |
+| `PROMPTGONE_BASE_URL` | `https://api.promptgone.ai` | PromptGone API base. |
+| `JOURNEY_API_KEY` | *(optional)* | JourneyAPI proxy. |
+| `JOURNEY_MODEL` | `flux` | JourneyAPI model id. |
+| `JOURNEY_BASE_URL` | `https://api.journeyapi.io` | JourneyAPI base. |
+| `PEXELS_API_KEY` | *(optional)* | Stock photo search fallback after generation fails. |
+| `SERPAPI_API_KEY` | *(optional)* | Google Images last-resort fallback. |
 | `SUPABASE_URL` | *(optional)* | Where sourced/uploaded campaign images are stored. |
 | `SUPABASE_SERVICE_ROLE_KEY` | *(optional)* | Supabase auth for the storage write. |
 | `SUPABASE_STORAGE_BUCKET` | `campaign-images` | Bucket name. |
 
-Missing any of the imagery vars simply skips image search/upload — the
-campaign still generates, using the frame catalog's dummy assets.
+Missing any of the imagery vars simply skips that provider (or all images if
+nothing is configured and Supabase is missing) — the campaign still generates,
+using the frame catalog's dummy assets.
 
 > **Note:** `.env.example` in the repo predates several of the vars above
 > (`REVIEW_PLAN_BEFORE_GENERATING`, `SERVICE_PUBLIC_BASE_URL`, and the
@@ -795,7 +811,7 @@ verified identical on an unmodified checkout via `git stash`:
 
 | Test file | Failing test | Likely cause (not yet root-caused) |
 |---|---|---|
-| `test/campaign-images.test.mjs` | `buildImageQueries uses short cached stock terms, not campaign copy` | Query-count assertion (`2` to `3`) failing — behavior of `buildImageQueries` has likely drifted from the test's expectation. |
+| `test/campaign-images.test.mjs` | `buildImageQueries uses short cached stock terms, not campaign copy` | **Fixed** — assertion now matches `buildImageQueries` (campaign context + slot stock terms, max 8). |
 | `test/fill-static-frame.test.mjs` | `risk-list-with-image uses a remote details URL instead of DummyImage` | Expected `width={800}` prop not present in generated output — a `next/image` prop the frame template stopped emitting. |
 | `test/omniroute.test.mjs` | `one-shot chat body folds system and omits OpenAI-only fields` | `response_format: {type:"json_object"}` present when the test expects it absent. |
 | `test/omniroute.test.mjs` | `omnirouteGenerate posts a Felo-safe one-shot body` | Same `response_format` mismatch. |

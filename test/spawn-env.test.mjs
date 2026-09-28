@@ -94,3 +94,13 @@ test("a real spawned child genuinely cannot see it", async () => {
     assert.equal(await spawnAndReadEnv(cleanEnvForChildProcess()), "undefined");
   });
 });
+
+test('never passes SSO credentials into generated project processes', () => {
+  withEnv({ SSO_CLIENT_SECRET: 'secret', SSO_CLIENTS_JSON: '[secret]', HANDOFF_SECRET: 'secret', LANDING_PAGE_SECRET: 'secret' }, () => {
+    const env = cleanEnvForChildProcess();
+    assert.equal(env.SSO_CLIENT_SECRET, undefined);
+    assert.equal(env.SSO_CLIENTS_JSON, undefined);
+    assert.equal(env.HANDOFF_SECRET, undefined);
+    assert.equal(env.LANDING_PAGE_SECRET, undefined);
+  });
+});

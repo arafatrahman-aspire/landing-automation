@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { getDb } from "../state/database-connection.mjs";
 import { findPackageJsonDir, detectPackageManager, RUN_SCRIPT_CMD } from "../verify/detect-package-manager.mjs";
 import { getFreePort, waitForReady, SERVE_SCRIPT_PREFERENCE } from "../verify/ephemeral-server.mjs";
@@ -225,7 +226,8 @@ export async function startPreview({ runId, workdir, pageUrlPath = null, ttlMs, 
 
   const port = await getFreePort();
   const baseUrl = `http://127.0.0.1:${port}`;
-  const url = pageUrlPath ? `${baseUrl}${pageUrlPath}` : baseUrl;
+  const publicBase = `http://${process.env.PREVIEW_PUBLIC_HOST || "127.0.0.1"}:${port}`;
+  const url = pageUrlPath ? `${publicBase}${pageUrlPath}` : publicBase;
   const expiresAt = new Date(Date.now() + ttlMs).toISOString();
 
   if (dockerUsable) {
@@ -245,7 +247,7 @@ export async function startPreview({ runId, workdir, pageUrlPath = null, ttlMs, 
       "-w",
       "/app",
       "-p",
-      `${port}:${port}`,
+      `127.0.0.1:${port}:${port}`,
       "-e",
       `PORT=${port}`,
       "-e",
@@ -292,12 +294,18 @@ export async function startPreview({ runId, workdir, pageUrlPath = null, ttlMs, 
   const pm = await detectPackageManager(pkgDir);
   const candidates = await readServeScripts(pkgDir);
   const attemptReports = [];
+  const scripts = JSON.parse(await readFile(path.join(pkgDir, "package.json"), "utf8")).scripts ?? {};
 
   for (const candidate of candidates) {
     const [cmd, args] = RUN_SCRIPT_CMD[pm](candidate);
+    // These servers otherwise bind all interfaces even when HOST is set.
+    const script = scripts[candidate] || "";
+    if (/\bnext\s+(start|dev)\b/.test(script)) args.push(...(pm === "npm" ? ["--"] : []), "--hostname", "127.0.0.1");
+    else if (/\bvite\b/.test(script)) args.push(...(pm === "npm" ? ["--"] : []), "--host", "127.0.0.1");
     const child = spawn(cmd, args, {
       cwd: pkgDir,
-      env: cleanEnvForChildProcess({ PORT: String(port), HOST: "0.0.0.0" }),
+      env: cleanEnvForChildProcess({ PORT: String(port), HOST: "127.0.0.1", HOSTNAME: "127.0.0.1",
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require ${JSON.stringify(fileURLToPath(new URL("./loopback-only.cjs", import.meta.url)))}` }),
       detached: true,
     });
 

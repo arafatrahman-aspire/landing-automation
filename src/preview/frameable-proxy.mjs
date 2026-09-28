@@ -31,6 +31,7 @@ import { getFreePort } from "../verify/ephemeral-server.mjs";
 // not block but does spam the console with violations for the frame we just
 // deliberately allowed.
 const STRIPPED_RESPONSE_HEADERS = new Set([
+  "set-cookie",
   "x-frame-options",
   "content-security-policy",
   "content-security-policy-report-only",
@@ -56,7 +57,7 @@ export async function startFrameableProxy({ targetBaseUrl }) {
         method: req.method,
         path: req.url,
         headers: {
-          ...req.headers,
+          ...Object.fromEntries(Object.entries(req.headers).filter(([name]) => !["cookie", "authorization", "proxy-authorization", "x-csrf-token"].includes(name.toLowerCase()))),
           // The upstream is addressed by its own host:port — passing the
           // proxy's Host through makes Next generate self-links pointing at
           // the proxy, which then loop back through here forever.
@@ -114,7 +115,7 @@ export async function startFrameableProxy({ targetBaseUrl }) {
 
   return {
     port,
-    baseUrl: `http://127.0.0.1:${port}`,
+    baseUrl: `http://${process.env.PREVIEW_PUBLIC_HOST || "127.0.0.1"}:${port}`,
     close: () =>
       new Promise((resolve) => {
         server.closeAllConnections?.();

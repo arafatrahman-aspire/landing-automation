@@ -163,3 +163,18 @@ test("only ever talks to its configured upstream", async () => {
     await other.stop();
   }
 });
+
+test('preview proxy strips authentication request headers and Set-Cookie responses', async () => {
+  const upstream = await startUpstream((req, res) => {
+    assert.equal(req.headers.cookie, undefined);
+    assert.equal(req.headers.authorization, undefined);
+    assert.equal(req.headers['x-csrf-token'], undefined);
+    res.setHeader('Set-Cookie', 'injected=1'); res.end('ok');
+  });
+  const proxy = await startFrameableProxy({ targetBaseUrl: upstream.origin });
+  try {
+    const response = await fetch(proxy.baseUrl, { headers: { Cookie: 'session=secret', Authorization: 'Bearer secret', 'X-CSRF-Token': 'secret' } });
+    assert.equal(response.headers.get('set-cookie'), null);
+    assert.equal(await response.text(), 'ok');
+  } finally { await proxy.close(); await upstream.stop(); }
+});

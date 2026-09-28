@@ -1,20 +1,18 @@
-const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:4300";
-const SECRET_KEY = "campaignCodegenApiSecret";
-
-export function getSecret(): string {
-  return sessionStorage.getItem(SECRET_KEY) ?? "";
+// Browser traffic stays on this origin; the server proxy target comes from .env.
+const BASE_URL = "/api";
+let csrfToken = "";
+export function setCsrfToken(value: string) { csrfToken = value; }
+export function clearSession() {
+  csrfToken = "";
+  window.dispatchEvent(new Event("session-expired"));
 }
-
-export function setSecret(secret: string) {
-  sessionStorage.setItem(SECRET_KEY, secret);
-}
-
-export function clearSecret() {
-  sessionStorage.removeItem(SECRET_KEY);
-}
-
-export function hasSecret(): boolean {
-  return getSecret().length > 0;
+const nativeFetch = window.fetch.bind(window);
+async function sessionFetch(input: string, init: RequestInit = {}) {
+  const response = await nativeFetch(input, { ...init, credentials: "same-origin" });
+  if (response.status === 401 || response.status === 403) {
+    window.dispatchEvent(new CustomEvent("session-check", { detail: response.status }));
+  }
+  return response;
 }
 
 class ApiError extends Error {
@@ -26,18 +24,18 @@ class ApiError extends Error {
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const res = await fetch(`${BASE_URL}${path}`, {
+  const res = await sessionFetch(`${BASE_URL}${path}`, {
     ...options,
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${getSecret()}`,
+      "X-CSRF-Token": csrfToken,
       ...(options.headers ?? {}),
     },
   });
 
   if (res.status === 401) {
-    clearSecret();
-    throw new ApiError("Unauthorized — the shared secret was rejected. Reload and re-enter it.", 401);
+    clearSession();
+    throw new ApiError("Session expired. Sign in through CMS again.", 401);
   }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}) as Record<string, unknown>);
@@ -119,6 +117,8 @@ export interface ResearchNotes {
   images?: CampaignImage[];
   /** LLM-suggested visual search queries per image slot (hero/details/timeline). */
   imageQueries?: { hero?: string[]; details?: string[]; timeline?: string[] };
+  /** LLM-suggested image-generation prompts per slot. */
+  imagePrompts?: { hero?: string; details?: string; timeline?: string };
 }
 
 export interface RunSummary {
@@ -138,6 +138,7 @@ export interface RunSummary {
   sectionReferences?: SectionReference[] | null;
   verifyChecks?: VerifyChecks | null;
   verifyAttempts?: number;
+  currentDraftVersion?: number | null;
   /** True when the draft was staged despite a FAILING build
    *  (CONTINUE_ON_VERIFY_FAILURE) — the page is not known to compile. */
   verifyBypassed?: boolean;
@@ -160,7 +161,7 @@ export interface Draft {
   files: DraftFile[];
 }
 
-/** Returns null once a run has no staged draft yet (404) — normal before
+/** Returns null when a run has no staged draft yet — normal before
  *  `verify` first passes, not an error condition for the caller to surface. */
 export async function getRunDraft(runId: string): Promise<Draft | null> {
   try {
@@ -234,9 +235,8 @@ export interface RunEventHandlers {
  * Opens a real-time event stream for one run (GET /campaigns/:runId/events —
  * see src/state/run-events-sse.mjs) using `fetch` and a hand-rolled SSE
  * parser rather than the browser's native `EventSource`: EventSource can't
- * set the `Authorization` header this API requires on every route, and this
- * keeps a single auth mechanism instead of adding a second, weaker one
- * (e.g. a token query param) just for this endpoint.
+ * retain explicit stream lifecycle control. Authentication uses the same
+ * HttpOnly session cookie as ordinary API requests.
  *
  * Returns a function that closes the stream. Safe to call multiple times.
  */
@@ -245,12 +245,12 @@ export function watchRunEvents(runId: string, handlers: RunEventHandlers): () =>
 
   (async () => {
     try {
-      const res = await fetch(`${BASE_URL}/campaigns/${runId}/events`, {
-        headers: { Authorization: `Bearer ${getSecret()}` },
+      const res = await sessionFetch(`${BASE_URL}/campaigns/${runId}/events`, {
+        headers: { "X-CSRF-Token": csrfToken },
         signal: controller.signal,
       });
       if (res.status === 401) {
-        clearSecret();
+        clearSession();
         throw new ApiError("Unauthorized", 401);
       }
       if (!res.ok || !res.body) {
@@ -296,11 +296,11 @@ export function watchRunEvents(runId: string, handlers: RunEventHandlers): () =>
 }
 
 export async function getRunLog(runId: string): Promise<string> {
-  const res = await fetch(`${BASE_URL}/campaigns/${runId}/log`, {
-    headers: { Authorization: `Bearer ${getSecret()}` },
+  const res = await sessionFetch(`${BASE_URL}/campaigns/${runId}/log`, {
+    headers: { "X-CSRF-Token": csrfToken },
   });
   if (res.status === 401) {
-    clearSecret();
+    clearSession();
     throw new ApiError("Unauthorized", 401);
   }
   if (!res.ok) throw new ApiError(`Failed to fetch log (${res.status})`, res.status);
@@ -494,16 +494,16 @@ export interface UploadedImage {
  * Sends raw bytes — no multipart encoding.
  */
 export async function uploadCampaignImage(runId: string, slot: string, file: File): Promise<UploadedImage> {
-  const res = await fetch(`${BASE_URL}/campaigns/${runId}/images/${slot}`, {
+  const res = await sessionFetch(`${BASE_URL}/campaigns/${runId}/images/${slot}`, {
     method: "POST",
     headers: {
       "Content-Type": file.type,
-      Authorization: `Bearer ${getSecret()}`,
+      "X-CSRF-Token": csrfToken,
     },
     body: file,
   });
   if (res.status === 401) {
-    clearSecret();
+    clearSession();
     throw new ApiError("Unauthorized", 401);
   }
   if (!res.ok) {

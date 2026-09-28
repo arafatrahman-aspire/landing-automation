@@ -1,0 +1,19 @@
+# Keeps the build context small and fast to send to the Docker daemon —
+# most importantly data/, which holds the SQLite DB and every git worktree
+# this service has ever created (can easily reach gigabytes).
+node_modules
+ui
+data
+.git
+.claude
+.puku
+*.log
+
+.env
+.env.*
+!.env.example
+
+*.md
+screenshots
+test
+dev
