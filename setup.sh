@@ -1,345 +1,171 @@
 #!/usr/bin/env bash
-# Sets up the landing-page automation service (new_approach) on a fresh
-# device or VPS, WITHOUT Docker:
+# One-command setup for the landing-page automation service (no Docker).
 #
-#   1. system packages (git, curl, build tools) + Node.js >= 22 + corepack
-#   2. clone (or update) this service's own repo
-#   3. .env — copied from the old machine, or seeded from .env.example
-#   4. backend deps (npm ci) + optional Playwright Chromium for the browser checks
-#   5. UI deps (npm ci) + production build (ui/dist)
-#   6. data/ dirs, optional import of the old campaigns.db
-#   7. the shared target-repo clone at WORKDIR_ROOT/_base + its node_modules
-#      (exactly what src/pipeline/steps/04-clone-target-repo.mjs would do on
-#      the first run — done up front so the first campaign isn't slow)
-#   8. validates .env against src/config.mjs
+#   bash setup.sh
 #
-# Never runs `docker build` / `docker compose`.
+# Put your .env (and campaigns.db, if you want the old run history) in the
+# same folder as this script first — both are picked up automatically.
 #
-# Usage:
-#   ./setup.sh [options]
-#   curl -fsSL <raw url>/setup.sh | bash -s -- [options]
-#
-# Options:
-#   --dir PATH            install location          (default: ~/landing-automation)
-#   --repo URL            this service's git repo   (default: $APP_REPO_URL below)
-#   --branch NAME         branch of that repo       (default: main)
-#   --env PATH            .env to copy in (e.g. scp'd from the old machine)
-#   --db PATH             campaigns.db to import (its -wal/-shm are copied too)
-#   --fresh-base          delete and re-clone data/.scratch/_base
-#   --skip-system         don't apt/dnf install anything or touch Node
-#   --skip-playwright     don't install Chromium (hero-fit/SEO/a11y checks report SKIPPED)
-#   --skip-base           don't pre-clone the target repo (first run will do it)
-#   --skip-ui             don't install/build the UI
-#   -h, --help
-#
-# Private repos: export GITHUB_TOKEN (or APP_REPO_TOKEN for the service repo
-# only) before running. The token is passed to git via an HTTP header in the
-# environment — never on the command line and never written to .git/config.
+# Installs to ~/landing-automation (override: INSTALL_DIR=/some/path bash setup.sh).
+# Safe to re-run: it updates what's there instead of starting over.
 set -euo pipefail
 
-APP_REPO_URL="https://github.com/arafatrahman-aspire/landing-automation.git"
-APP_BRANCH="main"
-INSTALL_DIR="$HOME/landing-automation"
-ENV_SRC=""
-DB_SRC=""
-FRESH_BASE=false
-SKIP_SYSTEM=false
-SKIP_PLAYWRIGHT=false
-SKIP_BASE=false
-SKIP_UI=false
-NODE_MAJOR_MIN=22
+REPO_URL="${REPO_URL:-https://github.com/arafatrahman-aspire/landing-automation.git}"
+REPO_BRANCH="main"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/landing-automation}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" && pwd)"
 
-# --- output helpers ---
-if [[ -t 1 ]]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; N=$'\e[0m'; else B=""; G=""; Y=""; R=""; N=""; fi
-step() { echo; echo "${B}==> $*${N}"; }
-ok()   { echo "${G}  ✓${N} $*"; }
-warn() { echo "${Y}  ! $*${N}" >&2; WARNINGS+=("$*"); }
-die()  { echo "${R}  ✗ $*${N}" >&2; exit 1; }
+step() { echo; echo -e "\e[1m==> $*\e[0m"; }
+ok()   { echo -e "  \e[32m✓\e[0m $*"; }
+warn() { echo -e "  \e[33m! $*\e[0m"; WARNINGS+=("$*"); }
+die()  { echo -e "  \e[31m✗ $*\e[0m" >&2; exit 1; }
 WARNINGS=()
 
-usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0; }
+SUDO=""; [[ $EUID -ne 0 ]] && SUDO="sudo"
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --dir) INSTALL_DIR="$2"; shift 2 ;;
-    --repo) APP_REPO_URL="$2"; shift 2 ;;
-    --branch) APP_BRANCH="$2"; shift 2 ;;
-    --env) ENV_SRC="$(realpath "$2")"; shift 2 ;;
-    --db) DB_SRC="$(realpath "$2")"; shift 2 ;;
-    --fresh-base) FRESH_BASE=true; shift ;;
-    --skip-system) SKIP_SYSTEM=true; shift ;;
-    --skip-playwright) SKIP_PLAYWRIGHT=true; shift ;;
-    --skip-base) SKIP_BASE=true; shift ;;
-    --skip-ui) SKIP_UI=true; shift ;;
-    -h|--help) usage ;;
-    *) die "unknown option: $1 (see --help)" ;;
-  esac
-done
-
-[[ -n "$ENV_SRC" && ! -f "$ENV_SRC" ]] && die "--env file not found: $ENV_SRC"
-[[ -n "$DB_SRC" && ! -f "$DB_SRC" ]] && die "--db file not found: $DB_SRC"
-
-SUDO=""
-if [[ $EUID -ne 0 ]]; then
-  command -v sudo >/dev/null && SUDO="sudo" || SUDO="__nosudo__"
-fi
-as_root() {
-  [[ "$SUDO" == "__nosudo__" ]] && die "need root for: $* (install sudo or run as root, or pass --skip-system)"
-  $SUDO "$@"
+# Read KEY from a .env without sourcing it.
+env_get() {
+  local line; line="$(grep -E "^${1}=" "$2" | tail -n1 || true)"
+  line="${line#*=}"; line="${line%\"}"; line="${line#\"}"
+  printf '%s' "$line"
 }
-
-# Runs git with a GitHub token supplied as an HTTP header via env vars, so it
-# never shows up in `ps` or gets persisted in the clone's remote URL.
-git_auth() {
-  local token="$1"; shift
-  if [[ -n "$token" ]]; then
-    local basic
-    basic="$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')"
-    GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 \
-      GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
-      GIT_CONFIG_VALUE_0="Authorization: Basic $basic" \
-      git "$@"
+# git with a GitHub token passed as a header (never saved to disk or shown in `ps`).
+git_tok() {
+  local tok="$1"; shift
+  if [[ -n "$tok" ]]; then
+    GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+      GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'x-access-token:%s' "$tok" | base64 | tr -d '\n')" git "$@"
   else
     GIT_TERMINAL_PROMPT=0 git "$@"
   fi
 }
 
-# Reads KEY from a dotenv file without sourcing/exporting it (so secrets never
-# leak into the env of npm installs run inside the target repo).
-env_get() {
-  local key="$1" file="$2" line val
-  line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" | tail -n1 || true)"
-  [[ -z "$line" ]] && return 0
-  val="${line#*=}"
-  val="${val%%[[:space:]]#*}"                      # trailing " # comment"
-  val="$(printf '%s' "$val" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
-  [[ "$val" =~ ^\"(.*)\"$ || "$val" =~ ^\'(.*)\'$ ]] && val="${BASH_REMATCH[1]}"
-  printf '%s' "$val"
-}
+# Already inside a checkout (git clone ... && bash setup.sh)? Use it in place.
+if [[ -f "$HERE/src/server.mjs" ]]; then INSTALL_DIR="$HERE"; fi
 
-node_major() { command -v node >/dev/null && node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0; }
+OLD_ENV=""; [[ -f "$HERE/.env" && "$HERE" != "$INSTALL_DIR" ]] && OLD_ENV="$HERE/.env"
+OLD_DB="";  [[ -f "$HERE/campaigns.db" ]] && OLD_DB="$HERE/campaigns.db"
+
+if [[ -n "$OLD_ENV" ]]; then ENV_FILE="$OLD_ENV"
+elif [[ -f "$INSTALL_DIR/.env" ]]; then ENV_FILE="$INSTALL_DIR/.env"
+else die "no .env found — paste your .env into $HERE (next to setup.sh) and re-run"; fi
+TOKEN="$(env_get GITHUB_TOKEN "$ENV_FILE")"
+ok "using $ENV_FILE"
+[[ -n "$OLD_DB" ]] && ok "will import run history from $OLD_DB"
 
 # ---------------------------------------------------------------------------
-step "1/8  System prerequisites"
-if $SKIP_SYSTEM; then
-  ok "skipped (--skip-system)"
-else
-  if command -v apt-get >/dev/null; then
-    as_root apt-get update -y
-    as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      git curl ca-certificates gnupg build-essential python3
-  elif command -v dnf >/dev/null; then
-    as_root dnf install -y git curl ca-certificates gcc-c++ make python3
-  elif command -v yum >/dev/null; then
-    as_root yum install -y git curl ca-certificates gcc-c++ make python3
-  else
-    warn "unknown package manager — make sure git, curl and a C/C++ toolchain are installed"
+step "Installing system packages + Node.js 22"
+if command -v apt-get >/dev/null; then
+  $SUDO apt-get update -qq
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git curl ca-certificates build-essential python3 >/dev/null
+  if ! command -v node >/dev/null || (( $(node -p 'process.versions.node.split(".")[0]') < 22 )); then
+    curl -fsSL https://deb.nodesource.com/setup_22.x | $SUDO bash - >/dev/null
+    $SUDO apt-get install -y -qq nodejs >/dev/null
   fi
-
-  if (( $(node_major) < NODE_MAJOR_MIN )); then
-    echo "  Node $(node -v 2>/dev/null || echo 'not installed') found; installing Node 22 LTS (needs node:sqlite + --env-file)"
-    if command -v apt-get >/dev/null; then
-      curl -fsSL https://deb.nodesource.com/setup_22.x | as_root bash -
-      as_root apt-get install -y nodejs
-    elif command -v dnf >/dev/null || command -v yum >/dev/null; then
-      curl -fsSL https://rpm.nodesource.com/setup_22.x | as_root bash -
-      as_root "$(command -v dnf || command -v yum)" install -y nodejs
-    else
-      die "install Node.js >= $NODE_MAJOR_MIN manually, then re-run with --skip-system"
-    fi
-  fi
-  # Target repos may pin yarn/pnpm via packageManager; the service runs them through corepack.
-  if command -v corepack >/dev/null; then
-    corepack enable 2>/dev/null || as_root corepack enable || warn "corepack enable failed — yarn/pnpm target repos won't install"
+elif command -v dnf >/dev/null; then
+  $SUDO dnf install -y -q git curl ca-certificates gcc-c++ make python3
+  if ! command -v node >/dev/null || (( $(node -p 'process.versions.node.split(".")[0]') < 22 )); then
+    curl -fsSL https://rpm.nodesource.com/setup_22.x | $SUDO bash - >/dev/null
+    $SUDO dnf install -y -q nodejs
   fi
 fi
-command -v git >/dev/null || die "git is not installed"
-(( $(node_major) >= NODE_MAJOR_MIN )) || die "Node.js >= $NODE_MAJOR_MIN required, found $(node -v 2>/dev/null || echo none)"
-ok "git $(git --version | awk '{print $3}'), node $(node -v), npm $(npm -v)"
+command -v node >/dev/null && (( $(node -p 'process.versions.node.split(".")[0]') >= 22 )) \
+  || die "Node.js 22+ is required — install it and re-run"
+$SUDO corepack enable 2>/dev/null || true
+ok "node $(node -v), git $(git --version | awk '{print $3}')"
 
 # ---------------------------------------------------------------------------
-step "2/8  Service repo → $INSTALL_DIR"
-APP_TOKEN="${APP_REPO_TOKEN:-${GITHUB_TOKEN:-}}"
+step "Getting the code → $INSTALL_DIR"
 if [[ -d "$INSTALL_DIR/.git" ]]; then
-  echo "  existing checkout found — fast-forwarding $APP_BRANCH"
-  git_auth "$APP_TOKEN" -C "$INSTALL_DIR" fetch origin "$APP_BRANCH"
-  git -C "$INSTALL_DIR" checkout "$APP_BRANCH"
-  git -C "$INSTALL_DIR" merge --ff-only "origin/$APP_BRANCH" \
-    || warn "local changes/divergence in $INSTALL_DIR — left as is, not updated"
-elif [[ -e "$INSTALL_DIR" && -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]]; then
-  die "$INSTALL_DIR exists and is not an empty git checkout — pick another --dir"
+  git_tok "$TOKEN" -C "$INSTALL_DIR" pull --ff-only origin "$REPO_BRANCH" \
+    || warn "couldn't update the code (local changes?) — kept what's there"
 else
-  git_auth "$APP_TOKEN" clone --branch "$APP_BRANCH" "$APP_REPO_URL" "$INSTALL_DIR" \
-    || die "clone failed — for a private repo, export GITHUB_TOKEN (or APP_REPO_TOKEN) first"
+  git_tok "$TOKEN" clone -q --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR" \
+    || die "clone failed — is the GitHub token right, and does it have access to the repo?"
 fi
 cd "$INSTALL_DIR"
-[[ -f package.json && -f src/server.mjs ]] || die "$INSTALL_DIR doesn't look like the new_approach service (no src/server.mjs)"
-ok "at $(git rev-parse --short HEAD) — $(git log -1 --format=%s)"
+ok "$(git log -1 --format='%h %s')"
 
 # ---------------------------------------------------------------------------
-step "3/8  .env"
-if [[ -n "$ENV_SRC" ]]; then
-  if [[ -f .env ]] && ! cmp -s "$ENV_SRC" .env; then
-    cp .env ".env.bak.$(date +%Y%m%d%H%M%S)"
-    ok "backed up existing .env"
-  fi
-  cp "$ENV_SRC" .env
-  ok "copied $ENV_SRC"
-elif [[ -f .env ]]; then
-  ok "keeping existing .env"
+step "Configuring .env"
+if [[ -n "$OLD_ENV" ]]; then
+  [[ -f .env ]] && ! cmp -s "$OLD_ENV" .env && cp .env ".env.bak.$(date +%s)"
+  cp "$OLD_ENV" .env
+  ok "copied your .env"
 else
-  cp .env.example .env
-  warn ".env created from .env.example — fill in the API keys/secrets, then re-run (or run 'npm start')"
+  ok "kept existing .env"
 fi
+# Empty optional settings (Supabase, Pexels, …) must be unset, not "".
+sed -i -E 's/^([A-Z_]+)=$/# \1=/' .env
 chmod 600 .env
 
-DB_PATH="$(env_get DB_PATH .env)";                 DB_PATH="${DB_PATH:-./data/campaigns.db}"
-WORKDIR_ROOT="$(env_get WORKDIR_ROOT .env)";       WORKDIR_ROOT="${WORKDIR_ROOT:-./data/.scratch}"
-OWNER="$(env_get GITHUB_TARGET_OWNER .env)"
-REPO="$(env_get GITHUB_TARGET_REPO .env)"
-BASE_BRANCH="$(env_get GITHUB_BASE_BRANCH .env)";  BASE_BRANCH="${BASE_BRANCH:-main}"
-CLONE_URL="$(env_get TARGET_REPO_CLONE_URL .env)"
-TARGET_TOKEN="$(env_get GITHUB_TOKEN .env)";       TARGET_TOKEN="${TARGET_TOKEN:-${GITHUB_TOKEN:-}}"
-PM_OVERRIDE="$(env_get PACKAGE_MANAGER_OVERRIDE .env)"
-APP_PUBLIC_URL="$(env_get APP_PUBLIC_URL .env)"
-PORT="$(env_get PORT .env)";                       PORT="${PORT:-4300}"
-[[ -z "$CLONE_URL" && -n "$OWNER" && -n "$REPO" ]] && CLONE_URL="https://github.com/$OWNER/$REPO.git"
-
 # ---------------------------------------------------------------------------
-step "4/8  Backend dependencies"
-# Browsers are installed explicitly below (or not at all), never as a side effect of npm ci.
-PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --no-audit --no-fund
-ok "node_modules installed"
-
-if $SKIP_PLAYWRIGHT; then
-  ok "Playwright Chromium skipped — hero-fit/SEO/a11y checks will report SKIPPED"
+step "Installing backend packages"
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --no-audit --no-fund --loglevel=error
+ok "done"
+if $SUDO ./node_modules/.bin/playwright install-deps chromium >/dev/null 2>&1 \
+   && ./node_modules/.bin/playwright install chromium >/dev/null 2>&1; then
+  ok "Chromium installed (for the page checks)"
 else
-  if ! $SKIP_SYSTEM && [[ "$SUDO" != "__nosudo__" ]]; then
-    as_root "$PWD/node_modules/.bin/playwright" install-deps chromium \
-      || warn "playwright install-deps failed — Chromium may be missing system libraries"
-  fi
-  ./node_modules/.bin/playwright install chromium && ok "Chromium installed for Playwright" \
-    || warn "Chromium install failed — browser checks will report SKIPPED (build/lint still gate runs)"
+  warn "Chromium not installed — page checks will be skipped, builds still work"
 fi
 
-# ---------------------------------------------------------------------------
-step "5/8  UI"
-if $SKIP_UI; then
-  ok "skipped (--skip-ui)"
-else
-  (cd ui && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --no-audit --no-fund && npm run build)
-  ok "ui/dist built"
-fi
+step "Building the UI"
+(cd ui && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --no-audit --no-fund --loglevel=error && npm run build >/dev/null)
+ok "ui/dist ready"
 
 # ---------------------------------------------------------------------------
-step "6/8  Data directories"
-mkdir -p "$(dirname "$DB_PATH")" "$WORKDIR_ROOT" data/runs
-if [[ -n "$DB_SRC" ]]; then
-  if [[ -f "$DB_PATH" ]]; then
-    cp "$DB_PATH" "$DB_PATH.bak.$(date +%Y%m%d%H%M%S)"
-    ok "backed up existing $DB_PATH"
-  fi
-  # A WAL-mode DB is only complete together with its -wal file; stop the old
-  # service before copying so the three files are consistent.
+step "Preparing data + target repo"
+DB_PATH="$(env_get DB_PATH .env)";           DB_PATH="${DB_PATH:-./data/campaigns.db}"
+SCRATCH="$(env_get WORKDIR_ROOT .env)";      SCRATCH="${SCRATCH:-./data/.scratch}"
+mkdir -p "$(dirname "$DB_PATH")" "$SCRATCH" data/runs
+
+if [[ -n "$OLD_DB" ]]; then
+  [[ -f "$DB_PATH" ]] && mv "$DB_PATH" "$DB_PATH.bak.$(date +%s)"
   rm -f "$DB_PATH-wal" "$DB_PATH-shm"
-  cp "$DB_SRC" "$DB_PATH"
-  for ext in -wal -shm; do [[ -f "$DB_SRC$ext" ]] && cp "$DB_SRC$ext" "$DB_PATH$ext"; done
-  ok "imported $DB_SRC → $DB_PATH"
-  warn "imported runs still reference the OLD machine's worktree paths — those drafts' previews/approvals may need re-running"
+  cp "$OLD_DB" "$DB_PATH"
+  for x in -wal -shm; do [[ -f "$OLD_DB$x" ]] && cp "$OLD_DB$x" "$DB_PATH$x"; done
+  ok "imported run history"
 fi
-ok "DB_PATH=$DB_PATH, WORKDIR_ROOT=$WORKDIR_ROOT"
 
-# ---------------------------------------------------------------------------
-step "7/8  Target repo base clone ($WORKDIR_ROOT/_base)"
-BASE_DIR="$WORKDIR_ROOT/_base"
-if $SKIP_BASE; then
-  ok "skipped (--skip-base) — the first campaign run will clone it"
-elif [[ -z "$CLONE_URL" ]]; then
-  warn "GITHUB_TARGET_OWNER/GITHUB_TARGET_REPO not set in .env — base clone skipped"
+OWNER="$(env_get GITHUB_TARGET_OWNER .env)"; REPO="$(env_get GITHUB_TARGET_REPO .env)"
+BRANCH="$(env_get GITHUB_BASE_BRANCH .env)"; BRANCH="${BRANCH:-main}"
+URL="$(env_get TARGET_REPO_CLONE_URL .env)"; URL="${URL:-https://github.com/$OWNER/$REPO.git}"
+TTOKEN="$(env_get GITHUB_TOKEN .env)";       TTOKEN="${TTOKEN:-$TOKEN}"
+BASE="$SCRATCH/_base"
+if [[ -d "$BASE/.git" ]]; then
+  ok "target repo already cloned (the service syncs it each run)"
+elif git_tok "$TTOKEN" clone -q --depth 1 --branch "$BRANCH" "$URL" "$BASE"; then
+  ok "cloned $OWNER/$REPO@$BRANCH"
 else
-  if $FRESH_BASE && [[ -d "$BASE_DIR" ]]; then
-    # Per-run worktrees hang off _base; they're useless without it.
-    find "$WORKDIR_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-    ok "removed old $WORKDIR_ROOT contents (--fresh-base)"
+  warn "couldn't clone $URL — check GITHUB_TOKEN / GITHUB_BASE_BRANCH; the first run will retry"
+fi
+if [[ -f "$BASE/package.json" && ! -d "$BASE/node_modules" ]]; then
+  PM="$(env_get PACKAGE_MANAGER_OVERRIDE .env)"
+  if [[ -z "$PM" ]]; then
+    if [[ -f "$BASE/pnpm-lock.yaml" ]]; then PM=pnpm; elif [[ -f "$BASE/yarn.lock" ]]; then PM=yarn; else PM=npm; fi
   fi
-  if [[ -d "$BASE_DIR/.git" ]]; then
-    echo "  existing base clone — syncing $BASE_BRANCH"
-    git_auth "$TARGET_TOKEN" -C "$BASE_DIR" fetch --depth 1 origin "$BASE_BRANCH" \
-      && git -C "$BASE_DIR" checkout -q "$BASE_BRANCH" \
-      && git -C "$BASE_DIR" reset -q --hard "origin/$BASE_BRANCH" \
-      || warn "base sync failed — the service will retry on its next run"
-  else
-    # Same shape as cloneShallow() in src/git/clone-and-commit.mjs. The
-    # service rewrites origin with its own auth (setRemoteAuth) on each run.
-    git_auth "$TARGET_TOKEN" clone --depth 1 --branch "$BASE_BRANCH" "$CLONE_URL" "$BASE_DIR" \
-      || die "could not clone $CLONE_URL@$BASE_BRANCH — check GITHUB_TOKEN / GITHUB_BASE_BRANCH in .env"
-  fi
-  ok "$(git -C "$BASE_DIR" log -1 --format='%h %s')"
-
-  # Mirror ensureSharedNodeModules() (src/verify/reuse-base-install.mjs):
-  # one install in _base that every run's worktree symlinks.
-  PKG_DIR="$BASE_DIR"
-  if [[ ! -f "$PKG_DIR/package.json" ]]; then
-    PKG_DIR="$(find "$BASE_DIR" -mindepth 2 -maxdepth 2 -name package.json -not -path '*/node_modules/*' -printf '%h\n' | head -n1)"
-  fi
-  if [[ -z "$PKG_DIR" ]]; then
-    warn "no package.json in the target repo — skipping its dependency install"
-  elif [[ -d "$PKG_DIR/node_modules" ]] && ! $FRESH_BASE; then
-    ok "target repo node_modules already present"
-  else
-    PM="$PM_OVERRIDE"
-    if [[ -z "$PM" ]]; then
-      PM="$(node -p "(require('$PKG_DIR/package.json').packageManager||'').split('@')[0]" 2>/dev/null || true)"
-      if [[ -z "$PM" ]]; then
-        if   [[ -f "$PKG_DIR/pnpm-lock.yaml" ]]; then PM=pnpm
-        elif [[ -f "$PKG_DIR/yarn.lock" ]];      then PM=yarn
-        else PM=npm; fi
-      fi
-    fi
-    echo "  installing target repo deps with $PM (this can take several minutes)"
-    # Clean env: no NODE_ENV=production (would drop devDeps needed by next build).
-    case "$PM" in
-      npm)  (cd "$PKG_DIR" && env -u NODE_ENV npm install --no-audit --no-fund) ;;
-      yarn) (cd "$PKG_DIR" && env -u NODE_ENV corepack yarn install) ;;
-      pnpm) (cd "$PKG_DIR" && env -u NODE_ENV corepack pnpm install) ;;
-      *)    warn "unknown package manager '$PM' — skipping"; false ;;
-    esac && ok "target repo node_modules installed ($PM)" \
-      || warn "target repo install failed — each run will install inside its own worktree instead (slower)"
-  fi
+  echo "  installing the target repo's packages with $PM (a few minutes)…"
+  [[ "$PM" == npm ]] && CMD=(npm install --no-audit --no-fund --loglevel=error) || CMD=(corepack "$PM" install)
+  (cd "$BASE" && env -u NODE_ENV "${CMD[@]}" >/dev/null) && ok "done" \
+    || warn "target repo install failed — each run will install on its own (slower)"
 fi
 
 # ---------------------------------------------------------------------------
-step "8/8  Validate configuration"
-CHECK_OUT="$(mktemp)"
-if node --env-file=.env --input-type=module -e "await import('./src/config.mjs')" >"$CHECK_OUT" 2>&1; then
-  ok ".env passes src/config.mjs validation"
+step "Checking .env"
+if CHECK="$(node --env-file=.env --input-type=module -e "await import('./src/config.mjs')" 2>&1)"; then
+  ok "config is valid"
 else
-  sed 's/^/    /' "$CHECK_OUT" >&2
-  warn ".env does not validate yet — fix the fields above before 'npm start'"
+  echo "$CHECK" | sed 's/^/    /'
+  warn "fix the settings above in $INSTALL_DIR/.env"
 fi
-rm -f "$CHECK_OUT"
-for k in SSO_CLIENT_SECRET APP_PUBLIC_URL CMS_PUBLIC_URL; do
-  [[ -z "$(env_get "$k" .env)" ]] && warn "$k is empty — CMS login won't work (see docs/cms-auth.md)"
-done
-[[ -n "$APP_PUBLIC_URL" && "$APP_PUBLIC_URL" == *localhost* ]] && \
-  warn "APP_PUBLIC_URL still points at localhost — set it to this server's public origin"
 
-# ---------------------------------------------------------------------------
 echo
-echo "${B}${G}Setup finished${N} in $INSTALL_DIR"
-if (( ${#WARNINGS[@]} )); then
-  echo "${Y}${#WARNINGS[@]} warning(s):${N}"
-  for w in "${WARNINGS[@]}"; do echo "  - $w"; done
-fi
+echo -e "\e[1;32mSetup finished.\e[0m"
+for w in "${WARNINGS[@]}"; do echo -e "  \e[33m! $w\e[0m"; done
 cat <<EOF
 
-Next steps:
-  cd $INSTALL_DIR
-  npm start                                  # backend on :$PORT  (not 'npm run dev' during real runs)
-  curl localhost:$PORT/healthz               # {"ok":true}
-  npm test                                   # optional: full test suite
-
-  UI: ui/dist is a static build. Serve it with nginx (see ui/nginx.conf — proxy
-  /api/ → http://127.0.0.1:$PORT/ with the /api prefix stripped), or for a quick
-  look run 'cd ui && npm run dev' (binds to APP_PUBLIC_URL's host/port).
+Start it:
+  cd $INSTALL_DIR && npm start
+  (UI for a quick look: cd $INSTALL_DIR/ui && npm run dev)
 EOF
