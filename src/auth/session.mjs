@@ -81,26 +81,28 @@ export function createSessionAuth(config, { fetcher = fetch, now = () => Date.no
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.secret}` },
         body: JSON.stringify({ ...body, client_id: config.clientId }), signal: AbortSignal.timeout(5000) });
     } catch { throw Object.assign(new Error('CMS unavailable'), { status: 503 }); }
-    if (!result.ok) throw Object.assign(new Error('CMS rejected authentication'), { status: result.status === 403 ? 403 : result.status === 400 ? 401 : 503 });
+    if (!result.ok) throw Object.assign(new Error('CMS rejected authentication'), { status: result.status === 403 ? 403 : [400, 401].includes(result.status) ? 401 : 503 });
     return result.json();
   }
   function csrf(req, session) {
     return req.headers.origin === config.app && equal(req.headers['x-csrf-token'], session.csrf);
   }
+  // fresh: true forces a CMS check; a number forces one if the last is older than that many ms.
   async function validate(req, touch = true, fresh = false) {
     const key = hash(cookies(req)[cookieName] || '');
     const session = sessions.get(key);
     if (!session || session.expires <= now() || session.lastSeen + config.idleTtl <= now()) {
       sessions.delete(key); throw Object.assign(new Error('Sign in required'), { status: 401 });
     }
-    if (fresh || session.checked + config.roleTtl <= now()) {
+    if (fresh === true || session.checked + (typeof fresh === 'number' ? Math.min(fresh, config.roleTtl) : config.roleTtl) <= now()) {
       // Share pending checks across requests/streams; never reuse stale permissions after failure.
-      session.checking ||= cms('role', { user_id: session.user.id }).then(({ role }) => {
+      // issued_at lets CMS revoke this grant when the user signs out of CMS (401).
+      session.checking ||= cms('role', { user_id: session.user.id, issued_at: session.issuedAt }).then(({ role }) => {
         if (!['admin', 'marketing', 'intern'].includes(role)) throw Object.assign(new Error('Denied'), { status: 403 });
         session.user.role = role; session.checked = now();
       }).finally(() => { session.checking = null; });
       try { await session.checking; } catch (err) {
-        if (err.status === 403) sessions.delete(key);
+        if (err.status === 403 || err.status === 401) sessions.delete(key);
         throw err;
       }
     }
@@ -150,20 +152,21 @@ export function createSessionAuth(config, { fetcher = fetch, now = () => Date.no
     res.clearCookie(transactionName, options);
     if (!transaction || transaction.expires <= now() || !equal(req.query.state, transaction.state) || typeof req.query.code !== 'string' || !/^[A-Za-z0-9_-]{43,128}$/.test(req.query.code)) return res.status(400).send('Invalid or expired login. Return to the application and try again.');
     try {
-      const { user } = await cms('exchange', { code: req.query.code, code_verifier: transaction.verifier, redirect_uri: `${config.app}/api/auth/callback` });
-      if (!user || typeof user.id !== 'string' || !['admin', 'marketing', 'intern'].includes(user.role)) throw new Error('Invalid identity');
+      const { user, issued_at: issuedAt } = await cms('exchange', { code: req.query.code, code_verifier: transaction.verifier, redirect_uri: `${config.app}/api/auth/callback` });
+      if (!user || typeof user.id !== 'string' || !['admin', 'marketing', 'intern'].includes(user.role) || typeof issuedAt !== 'number') throw new Error('Invalid identity');
       if (sessions.size >= maxRecords) return res.status(503).send('Session capacity reached. Retry later.');
       // Rotate any previous session to prevent fixation and orphaned sessions.
       sessions.delete(hash(cookies(req)[cookieName] || ''));
       const token = random();
-      sessions.set(hash(token), { user, csrf: random(), expires: now() + config.sessionTtl, lastSeen: now(), checked: now() });
+      sessions.set(hash(token), { user, issuedAt, csrf: random(), expires: now() + config.sessionTtl, lastSeen: now(), checked: now() });
       res.cookie(cookieName, token, { ...options, maxAge: config.sessionTtl });
       res.redirect(303, transaction.next);
     } catch (err) { res.status(err.status || 503).send('Sign-in could not complete. Return to the application and try again.'); }
   });
   router.get('/me', async (req, res) => {
     try {
-      const { session } = await validate(req, false);
+      // ?fresh=1 (tab regained focus): re-check CMS so a CMS sign-out applies at once.
+      const { session } = await validate(req, false, req.query.fresh === '1' ? 5000 : false);
       res.json({ user: session.user, csrfToken: session.csrf });
     } catch (err) { res.status(err.status || 503).json({ error: err.status === 403 ? 'access_denied' : err.status === 401 ? 'unauthorized' : 'authorization_unavailable' }); }
   });
@@ -172,7 +175,18 @@ export function createSessionAuth(config, { fetcher = fetch, now = () => Date.no
     // Logout must work locally even when the CMS is down or a grant was revoked.
     const key = hash(cookies(req)[cookieName] || ''), session = sessions.get(key);
     if (req.headers.origin !== config.app || (session && !csrf(req, session))) return res.status(403).json({ error: 'invalid_csrf' });
-    sessions.delete(key); res.clearCookie(cookieName, options); res.status(204).end();
+    sessions.delete(key); res.clearCookie(cookieName, options);
+    // Then end the CMS session too (front-channel). The ticket lets CMS skip its
+    // confirmation prompt; without one (CMS down, no session) CMS asks first.
+    const redirect = new URL('/logout', config.cms);
+    redirect.searchParams.set('client_id', config.clientId);
+    if (session) {
+      try {
+        const { ticket } = await cms('logout-ticket', { user_id: session.user.id });
+        if (typeof ticket === 'string' && /^[A-Za-z0-9_-]{43,128}$/.test(ticket)) redirect.searchParams.set('ticket', ticket);
+      } catch { /* local logout already done */ }
+    }
+    res.json({ redirect: redirect.href });
   });
   return { router, requireSession, close: () => clearInterval(timer) };
 }

@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { createSessionAuth, localPath, readAuthConfig } from '../src/auth/session.mjs';
 const config = { app: 'https://landing.test', cms: 'https://cms.test', api: 'https://cms-api.test', clientId: 'landing-page', secret: 's'.repeat(40), secure: true, transactionTtl: 300000, sessionTtl: 28800000, idleTtl: 1800000, roleTtl: 60000 };
 async function fixture(t, options = {}) {
-  let time = 1000, role = 'admin', available = true, exchanges = 0;
+  let time = 1000, role = 'admin', available = true, exchanges = 0, roleChecks = 0;
   const auth = createSessionAuth(config, { ...options, now: () => time, fetcher: async (url, options) => {
     assert.equal(options.headers.Authorization, `Bearer ${config.secret}`);
     assert.equal(options.redirect, 'error');
@@ -13,7 +13,9 @@ async function fixture(t, options = {}) {
     const body = JSON.parse(options.body);
     assert.equal(body.client_id, 'landing-page');
     if (url.endsWith('/exchange')) { exchanges++; assert.equal(createHash('sha256').update(body.code_verifier).digest('base64url'), challenge); }
-    return new Response(JSON.stringify(url.endsWith('/exchange') ? { user: { id: 'user', email: 'test@test.test', role } } : { role }), { status: role === 'removed' ? 403 : 200 });
+    if (url.endsWith('/role')) { roleChecks++; assert.equal(body.issued_at, 1234.5); }
+    if (url.endsWith('/logout-ticket')) { assert.equal(body.user_id, 'user'); return new Response(JSON.stringify({ ticket: 't'.repeat(43) })); }
+    return new Response(JSON.stringify(url.endsWith('/exchange') ? { user: { id: 'user', email: 'test@test.test', role }, issued_at: 1234.5 } : { role }), { status: role === 'removed' ? 403 : role === 'signedout' ? 401 : 200 });
   }});
   const app = express(); app.use(express.json()); app.use('/api/auth', auth.router);
   app.use('/api/campaigns', auth.requireSession);
@@ -38,7 +40,7 @@ async function fixture(t, options = {}) {
     const { csrfToken } = await me.json();
     return { cookie, csrfToken, response: r };
   }
-  return { request, start, login, advance: ms => time += ms, role: value => role = value, offline: () => available = false, exchanges: () => exchanges };
+  return { request, start, login, advance: ms => time += ms, role: value => role = value, offline: () => available = false, exchanges: () => exchanges, roleChecks: () => roleChecks };
 }
 
 test('browser binding, secure cookies, CSRF, logout, old key rejection', async t => {
@@ -54,8 +56,19 @@ test('browser binding, secure cookies, CSRF, logout, old key rejection', async t
   const headers = { Cookie: cookie, Origin: config.app, 'X-CSRF-Token': csrfToken };
   assert.equal((await f.request('/api/campaigns', { method: 'POST', headers })).status, 200);
   assert.equal((await f.request('/api/campaigns', { method: 'POST', headers: { ...headers, Origin: 'https://evil.test' } })).status, 403);
-  assert.equal((await f.request('/api/auth/logout', { method: 'POST', headers })).status, 204);
+  const logout = await f.request('/api/auth/logout', { method: 'POST', headers });
+  assert.equal(logout.status, 200);
+  assert.equal((await logout.json()).redirect, `${config.cms}/logout?client_id=landing-page&ticket=${'t'.repeat(43)}`);
   assert.equal((await f.request('/api/campaigns', { headers })).status, 401);
+});
+
+test('logout ends the local session even when CMS is down, and still hands off to CMS', async t => {
+  const f = await fixture(t); const { cookie, csrfToken } = await f.login(); f.offline();
+  const headers = { Cookie: cookie, Origin: config.app, 'X-CSRF-Token': csrfToken };
+  const logout = await f.request('/api/auth/logout', { method: 'POST', headers });
+  assert.equal(logout.status, 200);
+  assert.equal((await logout.json()).redirect, `${config.cms}/logout?client_id=landing-page`);
+  assert.equal((await f.request('/api/auth/me', { headers })).status, 401);
 });
 
 test('role revocation, outage, expiry and no passive idle extension', async t => {
@@ -109,7 +122,7 @@ test('active streams close after role removal', async t => {
   // Use a short real interval to verify the stream timer, not only ordinary requests.
   const short = { ...config, roleTtl: 100 };
   let revoked = false;
-  const auth = createSessionAuth(short, { fetcher: async url => new Response(JSON.stringify(url.endsWith('/exchange') ? { user: { id: 'u', role: 'admin' } } : { role: 'admin' }), { status: revoked ? 403 : 200 }) });
+  const auth = createSessionAuth(short, { fetcher: async url => new Response(JSON.stringify(url.endsWith('/exchange') ? { user: { id: 'u', role: 'admin' }, issued_at: 1 } : { role: 'admin' }), { status: revoked ? 403 : 200 }) });
   const app = express(); app.use(express.json()); app.use('/api/auth', auth.router);
   app.get('/api/campaigns/r/events', auth.requireSession, (_req, res) => { res.type('text/event-stream'); res.write(': connected\n\n'); });
   const server = app.listen(0, '127.0.0.1'); await new Promise(r => server.once('listening', r));
@@ -160,4 +173,29 @@ test('minimal local setup works natively and in Docker without weakening public 
 test('advanced API overrides remain explicit and are not rewritten', () => {
   const env = { APP_PUBLIC_URL: 'https://landing.test', CMS_PUBLIC_URL: 'https://cms.test', SSO_CLIENT_SECRET: 's'.repeat(40), CMS_API_BASE_URL: 'https://internal.test/custom' };
   assert.equal(readAuthConfig(env, { inDocker: true }).api, 'https://internal.test/custom');
+});
+
+test('signing out of CMS ends the landing session; tab focus re-checks at once', async t => {
+  const f = await fixture(t); const { cookie } = await f.login(); const headers = { Cookie: cookie };
+  f.role('signedout');
+  // Within the role cache window a plain request is still served from cache...
+  assert.equal((await f.request('/api/auth/me', { headers })).status, 200);
+  assert.equal(f.roleChecks(), 0);
+  // ...but a focus re-check (older than 5s) asks CMS and drops the revoked session.
+  f.advance(5001);
+  assert.equal((await f.request('/api/auth/me?fresh=1', { headers })).status, 401);
+  f.role('admin');
+  assert.equal((await f.request('/api/campaigns', { headers })).status, 401);
+  // Background checks also revoke once the cache expires.
+  const second = await f.login(); f.role('signedout'); f.advance(60001);
+  assert.equal((await f.request('/api/campaigns', { headers: { Cookie: second.cookie } })).status, 401);
+});
+
+test('focus re-checks are throttled', async t => {
+  const f = await fixture(t); const { cookie } = await f.login();
+  for (let i = 0; i < 3; i++) assert.equal((await f.request('/api/auth/me?fresh=1', { headers: { Cookie: cookie } })).status, 200);
+  assert.equal(f.roleChecks(), 0);
+  f.advance(5001);
+  assert.equal((await f.request('/api/auth/me?fresh=1', { headers: { Cookie: cookie } })).status, 200);
+  assert.equal(f.roleChecks(), 1);
 });
