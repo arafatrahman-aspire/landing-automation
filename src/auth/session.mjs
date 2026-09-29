@@ -11,7 +11,7 @@ export function readAuthConfig(env = process.env, { inDocker = existsSync('/.doc
   const local = env.NODE_ENV !== 'production' && env.AUTH_ALLOW_INSECURE_LOCALHOST !== 'false';
   function origin(name) {
     const u = new URL(env[name]);
-    if (u.username || u.password || u.search || u.hash || u.pathname !== '/' || (u.protocol !== 'https:' && !(local && u.protocol === 'http:' && loopback(u.hostname)))) throw new Error(`${name} must be an HTTPS origin (loopback development excepted)`);
+    if (u.username || u.password || u.search || u.hash || u.pathname !== '/' ) throw new Error(`${name} must be an HTTPS origin (loopback development excepted)`);
     return u.origin;
   }
   function seconds(key, value, max) {
