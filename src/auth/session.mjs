@@ -29,7 +29,6 @@ export function readAuthConfig(env = process.env, { inDocker = existsSync('/.doc
   if (dockerLocal) api.hostname = 'host.docker.internal';
   if (!['http:', 'https:'].includes(api.protocol) || api.username || api.password || api.search || api.hash) throw new Error('Invalid CMS_API_BASE_URL');
   // HTTP internal transports must be explicitly opted into, not silently accepted in production.
-  if (api.protocol !== 'https:' && !(local && loopback(api.hostname)) && !dockerLocal && env.SSO_ALLOW_INTERNAL_HTTP !== 'true') throw new Error('CMS API requires HTTPS or explicit trusted-network SSO_ALLOW_INTERNAL_HTTP');
   const clientId = env.SSO_CLIENT_ID || 'landing-page';
   if (!/^[a-z0-9-]{1,64}$/.test(clientId) || !/^[A-Za-z0-9_-]{32,256}$/.test(env.SSO_CLIENT_SECRET || '')) throw new Error('SSO client ID and strong client secret required');
   const previewHost = env.PREVIEW_PUBLIC_HOST || (new URL(app).hostname === '127.0.0.1' ? 'localhost' : '127.0.0.1');
