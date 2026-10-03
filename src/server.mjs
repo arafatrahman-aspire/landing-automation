@@ -11,6 +11,7 @@ import * as runStore from "./state/campaign-repository.mjs";
 import { runEventsSseHandler } from "./state/run-events-sse.mjs";
 import * as draftStore from "./staging/draft-versions.mjs";
 import * as preview from "./preview/preview-server.mjs";
+import { startPreviewGateway } from "./preview/preview-gateway.mjs";
 import { runCodegen } from "./pipeline/run-campaign-pipeline.mjs";
 import { resumeInterruptedRuns } from "./pipeline/resume-interrupted-runs.mjs";
 import { approveRun, abandonRun, ReviewActionError } from "./pipeline/approve-or-abandon-run.mjs";
@@ -492,6 +493,13 @@ if (resumable.length > 0) {
     }
     console.log(`Startup: marked ${resumable.length} interrupted run(s) failed (RESUME_INTERRUPTED_RUNS=false).`);
   }
+}
+
+if (config.previewGatewayPort) {
+  // Fails startup loudly if the port is taken — a gateway that silently
+  // didn't start would leave every preview unreachable with no clue why.
+  await startPreviewGateway({ port: config.previewGatewayPort, host: config.previewGatewayHost, domain: authConfig.previewHost });
+  console.log(`Preview gateway listening on ${config.previewGatewayHost}:${config.previewGatewayPort} (http://<token>.${authConfig.previewHost}:${config.previewGatewayPort})`);
 }
 
 // Any preview still 'running' in the DB is from a previous process

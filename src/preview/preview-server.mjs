@@ -7,6 +7,7 @@ import { findPackageJsonDir, detectPackageManager, RUN_SCRIPT_CMD } from "../ver
 import { getFreePort, waitForReady, SERVE_SCRIPT_PREFERENCE } from "../verify/ephemeral-server.mjs";
 import { hasDocker, parseDockerBuildStage } from "../verify/docker-build.mjs";
 import { startFrameableProxy } from "./frameable-proxy.mjs";
+import { addGatewayRoute, removeGatewayRoute } from "./preview-gateway.mjs";
 import { cleanEnvForChildProcess } from "../spawn-env.mjs";
 import { removeWorktree } from "../git/clone-and-commit.mjs";
 import { isTerminal } from "../state/campaign-repository.mjs";
@@ -108,14 +109,19 @@ function insertPreviewRow(db, { runId, kind, port, pid, containerName, url, expi
 const liveProxies = new Map();
 
 async function closeProxyFor(previewId) {
-  const proxy = liveProxies.get(previewId);
-  if (!proxy) return;
+  const live = liveProxies.get(previewId);
+  if (!live) return;
   liveProxies.delete(previewId);
-  await proxy.close().catch(() => {});
+  removeGatewayRoute(live.gatewayToken);
+  await live.proxy.close().catch(() => {});
 }
 
 /** Fronts an already-running preview server with a proxy that strips
  *  X-Frame-Options so the review UI can embed the real page.
+ *
+ *  When the preview gateway is running (remote hosting), the proxy is also
+ *  registered there and `publicUrl` is its gateway URL — the only address a
+ *  remote browser can reach — used for both the embed and "open in a new tab".
  *
  *  Best-effort: if the proxy can't start, the preview is still perfectly
  *  usable via "open in a new tab" — losing the embed is a downgrade in
@@ -123,9 +129,12 @@ async function closeProxyFor(previewId) {
 async function attachFrameableProxy({ baseUrl, pageUrlPath }) {
   try {
     const proxy = await startFrameableProxy({ targetBaseUrl: baseUrl });
-    return { proxy, embedUrl: pageUrlPath ? `${proxy.baseUrl}${pageUrlPath}` : proxy.baseUrl };
+    const route = addGatewayRoute(proxy.port);
+    const base = route?.baseUrl ?? proxy.baseUrl;
+    const embedUrl = pageUrlPath ? `${base}${pageUrlPath}` : base;
+    return { live: { proxy, gatewayToken: route?.token ?? null }, embedUrl, publicUrl: route ? embedUrl : null };
   } catch {
-    return { proxy: null, embedUrl: null };
+    return { live: null, embedUrl: null, publicUrl: null };
   }
 }
 
@@ -271,20 +280,20 @@ export async function startPreview({ runId, workdir, pageUrlPath = null, ttlMs, 
       return { ok: false, report: `docker preview server did not respond at ${baseUrl} within 60s:\n${stderr.slice(-1500)}` };
     }
 
-    const { proxy, embedUrl } = await attachFrameableProxy({ baseUrl, pageUrlPath });
+    const { live, embedUrl, publicUrl } = await attachFrameableProxy({ baseUrl, pageUrlPath });
     const previewId = insertPreviewRow(db, {
       runId,
       kind: "docker",
       port,
       pid: null,
       containerName,
-      url,
+      url: publicUrl ?? url,
       expiresAt,
-      proxyPort: proxy?.port ?? null,
+      proxyPort: live?.proxy.port ?? null,
       embedUrl,
     });
-    if (proxy) liveProxies.set(previewId, proxy);
-    return { ok: true, previewId, url, embedUrl, kind: "docker", expiresAt };
+    if (live) liveProxies.set(previewId, live);
+    return { ok: true, previewId, url: publicUrl ?? url, embedUrl, kind: "docker", expiresAt };
   }
 
   // Process-based fallback — same detached/process-group pattern as
@@ -321,20 +330,20 @@ export async function startPreview({ runId, workdir, pageUrlPath = null, ttlMs, 
     const readyTimeoutMs = candidate === "dev" ? 120_000 : 60_000;
     const ready = await waitForReady(baseUrl, readyTimeoutMs);
     if (ready && !exited) {
-      const { proxy, embedUrl } = await attachFrameableProxy({ baseUrl, pageUrlPath });
+      const { live, embedUrl, publicUrl } = await attachFrameableProxy({ baseUrl, pageUrlPath });
       const previewId = insertPreviewRow(db, {
         runId,
         kind: "process",
         port,
         pid: child.pid,
         containerName: null,
-        url,
+        url: publicUrl ?? url,
         expiresAt,
-        proxyPort: proxy?.port ?? null,
+        proxyPort: live?.proxy.port ?? null,
         embedUrl,
       });
-      if (proxy) liveProxies.set(previewId, proxy);
-      return { ok: true, previewId, url, embedUrl, kind: "process", script: candidate, expiresAt };
+      if (live) liveProxies.set(previewId, live);
+      return { ok: true, previewId, url: publicUrl ?? url, embedUrl, kind: "process", script: candidate, expiresAt };
     }
 
     if (child.pid) killGroupOrPid(child.pid, "SIGKILL");

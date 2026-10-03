@@ -114,6 +114,11 @@ const envSchema = z
     MAX_CONCURRENT_PREVIEWS: intFromEnv(3),
     // How often the idle-preview sweep runs.
     PREVIEW_SWEEP_INTERVAL_MS: intFromEnv(60_000),
+    // Remote hosting: one public port that routes <token>.<PREVIEW_PUBLIC_HOST>
+    // to each preview (src/preview/preview-gateway.mjs). Unset = off, and
+    // previews stay loopback-only, which is all local development needs.
+    PREVIEW_GATEWAY_PORT: intFromEnv(null),
+    PREVIEW_GATEWAY_HOST: z.string().default("0.0.0.0"),
 
     // --- Target repo ---
     GITHUB_TOKEN: z.string().optional(),
@@ -261,6 +266,8 @@ function loadConfig() {
     previewTtlMs: env.PREVIEW_TTL_MS,
     maxConcurrentPreviews: env.MAX_CONCURRENT_PREVIEWS,
     previewSweepIntervalMs: env.PREVIEW_SWEEP_INTERVAL_MS,
+    previewGatewayPort: env.PREVIEW_GATEWAY_PORT,
+    previewGatewayHost: env.PREVIEW_GATEWAY_HOST,
 
     github: {
       token: env.GITHUB_TOKEN,
